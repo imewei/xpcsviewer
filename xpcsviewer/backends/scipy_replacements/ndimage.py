@@ -327,19 +327,25 @@ def zoom(
             y_new = jnp.linspace(0, arr.shape[0] - 1, new_shape[0])
             x_new = jnp.linspace(0, arr.shape[1] - 1, new_shape[1])
 
-            # Create meshgrid for query points
+            # Create meshgrid and flatten for interpax (expects 1D query points)
             xq, yq = jnp.meshgrid(x_new, y_new)
+            xq_flat = xq.ravel()
+            yq_flat = yq.ravel()
 
             method = "linear" if order == 1 else ("nearest" if order == 0 else "cubic")
-            result = interpax.interp2d(
-                yq, xq, y_old, x_old, arr, method=method, extrap=cval
+            result_flat = interpax.interp2d(
+                yq_flat, xq_flat, y_old, x_old, arr, method=method, extrap=cval
             )
+            # Reshape back to 2D
+            result = result_flat.reshape(new_shape)
 
         else:
             # For higher dimensions, fall back to scipy
             from scipy.ndimage import zoom as scipy_zoom
 
-            return scipy_zoom(input_array, zoom_factor, order=order, mode=mode, cval=cval)
+            return scipy_zoom(
+                input_array, zoom_factor, order=order, mode=mode, cval=cval
+            )
 
         from xpcsviewer.backends import ensure_numpy
 
