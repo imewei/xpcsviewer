@@ -25,6 +25,7 @@ from xpcsviewer.gui.qt_compat import (
 
 # Import async components
 from .constants import MIN_AVERAGING_FILES
+from .gui.layout_helpers import apply_all_layout_improvements
 from .gui.shortcuts.shortcut_manager import ShortcutManager
 
 # Import GUI components
@@ -36,11 +37,13 @@ from .gui.state.session_manager import (
     SessionState,
     WindowGeometry,
 )
-from .gui.layout_helpers import apply_all_layout_improvements
 from .gui.theme.manager import ThemeManager
 from .gui.widgets.command_palette import CommandPalette
 from .gui.widgets.drag_drop_list import DragDropListView
 from .gui.widgets.toast_notification import ToastManager
+
+# Import PlotWidgetDev for dynamic tab creation
+from .plothandler import PlotWidgetDev
 
 # Local imports
 from .simplemask import SimpleMaskWindow
@@ -52,9 +55,6 @@ from .utils import get_logger, log_system_info, sanitize_path, setup_exception_l
 from .utils.log_utils import RateLimitedLogger
 from .viewer_kernel import ViewerKernel
 from .viewer_ui import Ui_mainWindow as Ui
-
-# Import PlotWidgetDev for dynamic tab creation
-from .plothandler import PlotWidgetDev
 
 # Initialize centralized logging and get logger
 logger = get_logger(__name__)
@@ -280,6 +280,7 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         self.btn_export_diffusion.clicked.connect(self.export_diffusion)
 
         self.comboBox_qmap_target.currentIndexChanged.connect(self.update_plot)
+        self.cb_qmap_cmap.currentIndexChanged.connect(self.update_plot)
         self.update_g2_fitting_function()
 
         self.pg_saxs.getView().scene().sigMouseMoved.connect(self.saxs2d_mouseMoved)
@@ -1497,7 +1498,9 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
                 "stability": self.mp_stab if hasattr(self, "mp_stab") else None,
                 "intensity_t": self.pg_intt if hasattr(self, "pg_intt") else None,
                 "g2": self.mp_g2 if hasattr(self, "mp_g2") else None,
-                "g2_fitting": self.mp_g2_fitting if hasattr(self, "mp_g2_fitting") else None,
+                "g2_fitting": self.mp_g2_fitting
+                if hasattr(self, "mp_g2_fitting")
+                else None,
                 "twotime": self.mp_2t_hdls if hasattr(self, "mp_2t_hdls") else None,
                 "qmap": self.pg_qmap if hasattr(self, "pg_qmap") else None,
                 "g2_map": self.pg_g2map if hasattr(self, "pg_g2map") else None,
@@ -2241,6 +2244,7 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         kwargs = {
             "rows": self.get_selected_rows(),
             "target": self.comboBox_qmap_target.currentText(),
+            "cmap": self.cb_qmap_cmap.currentText(),
         }
         if not dryrun and not self._guard_no_data("qmap"):
             return None
@@ -3242,7 +3246,12 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         diffusion_tab_index = 7
         twotime_tab_index = 8
 
-        multitau_tabs = [g2_tab_index, g2_fitting_tab_index, g2_map_tab_index, diffusion_tab_index]
+        multitau_tabs = [
+            g2_tab_index,
+            g2_fitting_tab_index,
+            g2_map_tab_index,
+            diffusion_tab_index,
+        ]
 
         for tab_index in multitau_tabs:
             self.tabWidget.setTabEnabled(tab_index, False)

@@ -469,8 +469,11 @@ class QMap:
         qmap, qmap_units = self.qmap, self.qmap_units
         result = ""
         for key in self.qmap:
-            if key in ["q", "qx", "qy", "phi", "alpha"]:
+            if key in ["q", "qy", "phi", "alpha", "x", "y"]:
                 result += f" {key}={qmap[key][y, x]:.3f} {qmap_units[key]},"
+            elif key in ["qx", "qr"]:
+                # GIXPCS values need higher precision (6 decimals)
+                result += f" {key}={qmap[key][y, x]:.6f} {qmap_units[key]},"
             else:
                 result += f" {key}={qmap[key][y, x]} {qmap_units[key]},"
         return result[:-1]

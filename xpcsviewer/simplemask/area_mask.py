@@ -463,3 +463,12 @@ class MaskAssemble:
             Current mask from history
         """
         return self.mask_record[self.mask_ptr]
+
+    @property
+    def blemish(self) -> np.ndarray:
+        """Get the blemish mask (pixels marked as bad in blemish file).
+
+        Returns:
+            Boolean array where True = valid pixel, False = blemish pixel
+        """
+        return self.workers["mask_blemish"].get_mask()

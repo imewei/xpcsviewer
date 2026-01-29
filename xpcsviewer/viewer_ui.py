@@ -1699,10 +1699,27 @@ class Ui_mainWindow(object):
 
         self.gridLayout_9.addWidget(self.label_27, 1, 0, 1, 1)
 
+        self.label_qmap_cmap = QLabel(self.tab)
+        self.label_qmap_cmap.setObjectName("label_qmap_cmap")
+
+        self.gridLayout_9.addWidget(self.label_qmap_cmap, 1, 2, 1, 1)
+
+        self.cb_qmap_cmap = QComboBox(self.tab)
+        self.cb_qmap_cmap.addItem("")
+        self.cb_qmap_cmap.addItem("")
+        self.cb_qmap_cmap.addItem("")
+        self.cb_qmap_cmap.addItem("")
+        self.cb_qmap_cmap.addItem("")
+        self.cb_qmap_cmap.addItem("")
+        self.cb_qmap_cmap.addItem("")
+        self.cb_qmap_cmap.setObjectName("cb_qmap_cmap")
+
+        self.gridLayout_9.addWidget(self.cb_qmap_cmap, 1, 3, 1, 1)
+
         self.pg_qmap = ImageView(self.tab)
         self.pg_qmap.setObjectName("pg_qmap")
 
-        self.gridLayout_9.addWidget(self.pg_qmap, 0, 0, 1, 2)
+        self.gridLayout_9.addWidget(self.pg_qmap, 0, 0, 1, 4)
 
         self.tabWidget.addTab(self.tab, "")
         self.tab_5 = QWidget()
@@ -3153,6 +3170,30 @@ class Ui_mainWindow(object):
         )
 
         self.label_27.setText(QCoreApplication.translate("mainWindow", "Target", None))
+        self.label_qmap_cmap.setText(
+            QCoreApplication.translate("mainWindow", "Colormap", None)
+        )
+        self.cb_qmap_cmap.setItemText(
+            0, QCoreApplication.translate("mainWindow", "tab20b", None)
+        )
+        self.cb_qmap_cmap.setItemText(
+            1, QCoreApplication.translate("mainWindow", "jet", None)
+        )
+        self.cb_qmap_cmap.setItemText(
+            2, QCoreApplication.translate("mainWindow", "hot", None)
+        )
+        self.cb_qmap_cmap.setItemText(
+            3, QCoreApplication.translate("mainWindow", "plasma", None)
+        )
+        self.cb_qmap_cmap.setItemText(
+            4, QCoreApplication.translate("mainWindow", "viridis", None)
+        )
+        self.cb_qmap_cmap.setItemText(
+            5, QCoreApplication.translate("mainWindow", "magma", None)
+        )
+        self.cb_qmap_cmap.setItemText(
+            6, QCoreApplication.translate("mainWindow", "gray", None)
+        )
         self.tabWidget.setTabText(
             self.tabWidget.indexOf(self.tab),
             QCoreApplication.translate("mainWindow", "QMap", None),

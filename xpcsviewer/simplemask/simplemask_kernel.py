@@ -429,10 +429,16 @@ class SimpleMaskKernel:
 
         if sl_type == "Ellipse":
             new_roi = pg.EllipseROI(cen, [60, 80], **kwargs)
+            # Midpoint handles (4)
             new_roi.addScaleHandle([0.5, 0], [0.5, 1])
             new_roi.addScaleHandle([0.5, 1], [0.5, 0])
             new_roi.addScaleHandle([0, 0.5], [1, 0.5])
             new_roi.addScaleHandle([1, 0.5], [0, 0.5])
+            # Corner handles (4) - positions adjusted for ellipse geometry
+            new_roi.addScaleHandle([0.1464, 0.1464], [1, 1])
+            new_roi.addScaleHandle([0.1464, 0.8536], [1, 0])
+            new_roi.addScaleHandle([0.8536, 0.1464], [0, 1])
+            new_roi.addScaleHandle([0.8536, 0.8536], [0, 0])
 
         elif sl_type == "Circle":
             cx, cy = cen
@@ -446,6 +452,9 @@ class SimpleMaskKernel:
                 new_roi = pg.CircleROI(
                     pos=[cx - radius, cy - radius], radius=radius, **kwargs
                 )
+                # Add 2 opposite-side handles for uniform scaling
+                new_roi.addScaleHandle([0.5, 0], [0.5, 0.5])
+                new_roi.addScaleHandle([0.5, 1], [0.5, 0.5])
             else:
                 return None
 
@@ -460,8 +469,17 @@ class SimpleMaskKernel:
             new_roi = pg.PolyLineROI(pts, closed=True, **kwargs)
 
         elif sl_type == "Rectangle":
-            new_roi = pg.RectROI(cen, [30, 150], **kwargs)
-            new_roi.addScaleHandle([0, 0], [1, 1])
+            new_roi = pg.RectROI(cen, [200, 150], **kwargs)
+            # Corner handles (4)
+            new_roi.addScaleHandle([0, 0], [1, 1])  # bottom-left
+            new_roi.addScaleHandle([0, 1], [1, 0])  # top-left
+            new_roi.addScaleHandle([1, 0], [0, 1])  # bottom-right
+            new_roi.addScaleHandle([1, 1], [0, 0])  # top-right
+            # Midpoint handles (4)
+            new_roi.addScaleHandle([0, 0.5], [1, 0.5])  # left-mid
+            new_roi.addScaleHandle([1, 0.5], [0, 0.5])  # right-mid
+            new_roi.addScaleHandle([0.5, 0], [0.5, 1])  # bottom-mid
+            new_roi.addScaleHandle([0.5, 1], [0.5, 0])  # top-mid
 
         elif sl_type == "Line":
             if second_point is None or cen[0] is None or cen[1] is None:
@@ -566,6 +584,7 @@ class SimpleMaskKernel:
             "beam_center_y": center[1],
             "pixel_size": self.metadata.get("pix_dim", 0.075),
             "mask": self.mask,
+            "blemish": self.mask_kernel.blemish if self.mask_kernel else self.mask,
             "energy": self.metadata.get("energy", 10.0),
             "detector_distance": self.metadata.get("det_dist", 5000.0),
             "map_names": list(map_names),

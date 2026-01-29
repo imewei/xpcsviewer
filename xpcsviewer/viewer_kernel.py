@@ -447,12 +447,20 @@ class ViewerKernel(FileLocator):
             return
 
         xf_obj = xf_list[0]
+
+        # Safety check: verify g2_partial data is available
+        if xf_obj.g2_partial is None:
+            logger.info("g2_partial data not available for %s", xf_obj.fname)
+            if self.statusbar is not None:
+                self.statusbar.showMessage("g2_partial data not available", 3000)
+            return
+
         g2_module = self.get_module("g2mod")
         g2_module.pg_plot_stability(
             handler, xf_obj, q_range, t_range, y_range, **kwargs
         )
 
-    def plot_qmap(self, hdl, rows=None, target=None):
+    def plot_qmap(self, hdl, rows=None, target=None, cmap="tab20b"):
         xf_list = self.get_xf_list(rows=rows)
         if xf_list:
             if target == "scattering":
@@ -463,6 +471,8 @@ class ViewerKernel(FileLocator):
                 hdl.setImage(xf_list[0].dqmap)
             elif target == "static_roi_map":
                 hdl.setImage(xf_list[0].sqmap)
+            # Apply colormap
+            hdl.setColorMap(pg.colormap.getFromMatplotlib(cmap))
 
     def plot_tauq_pre(self, hdl=None, rows=None):
         # Support both Multitau and Twotime files for diffusion analysis
