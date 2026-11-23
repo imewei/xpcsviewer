@@ -138,7 +138,9 @@ class G2PlotWorker(BaseAsyncWorker):
         self.emit_progress(1, 6, "Loading G2 files")
 
         # Get file list - let g2mod.get_data handle the multitau filtering
-        xf_list = self.viewer_kernel.get_xf_list(rows=rows)
+        xf_list = self.viewer_kernel.get_xf_list(
+            rows=rows, check_cancelled=self.check_cancelled
+        )
         if not xf_list:
             return {
                 "message": "No files selected. Please add files to the target list first.",
@@ -194,6 +196,13 @@ class G2PlotWorker(BaseAsyncWorker):
         plot_data = {
             "q": q,
             "tel": tel,
+            "fit_delay_extent": g2mod.get_positive_delay_extent(
+                [
+                    xf.t_el
+                    for xf in xf_list
+                    if "Multitau" in xf.atype and getattr(xf, "t_el", None) is not None
+                ]
+            ),
             "g2": g2,
             "g2_err": g2_err,
             "labels": labels,

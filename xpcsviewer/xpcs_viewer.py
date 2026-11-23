@@ -209,6 +209,7 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
 
         # Track active async operations
         self.active_plot_operations = {}  # operation_id -> plot_type
+        self._g2_fit_bounds_initialized = False
 
         # list widget models
         self.source_model = None
@@ -1532,6 +1533,7 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
                     not in {"q_range", "t_range", "y_range", "rows", "target_timestamp"}
                 },
             )
+            self._initialize_g2_fit_bounds(result.get("fit_delay_extent"))
             logger.info("G2 plot applied successfully from async worker result")
 
         except Exception as e:
@@ -3235,7 +3237,16 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         self.tree = worker.get_pg_tree()
         self.tree.show()
 
+    def _initialize_g2_fit_bounds(self, extent: tuple[float, float] | None) -> None:
+        if not self._g2_fit_bounds_initialized and extent is not None:
+            self._g2_fit_bounds_initialized = True
+            t_min, t_max = extent
+            self.g2_bmin.setValue(t_min / 20)
+            self.g2_bmax.setValue(t_max * 10)
+
     def init_g2(self, qd_per_file, tel):
+        from .module import g2mod
+
         if qd_per_file is None or tel is None:
             return
         if len(qd_per_file) == 0 or len(tel) == 0:
@@ -3255,23 +3266,13 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         q_auto = self.g2_qauto.isChecked()
         t_auto = self.g2_tauto.isChecked()
 
-        # tel is a list of arrays, which may have diffent shape; drop any empty
-        # arrays so [0]/[-1] indexing cannot raise.
-        tel = [t for t in tel if len(t) > 0]
-        if not tel:
-            return
-        t_min = np.min([t[0] for t in tel])
-        t_max = np.max([t[-1] for t in tel])
+        extent = g2mod.get_positive_delay_extent(tel)
+        self._initialize_g2_fit_bounds(extent)
 
-        def to_e(x):
-            return f"{x:.2e}"
-
-        self.g2_bmin.setValue(t_min / 20)
-        self.g2_bmax.setValue(t_max * 10)
-
-        if t_auto:
-            self.g2_tmin.setText(to_e(t_min / 1.1))
-            self.g2_tmax.setText(to_e(t_max * 1.1))
+        if t_auto and extent is not None:
+            t_min, t_max = extent
+            self.g2_tmin.setText(f"{t_min / 1.1:.2e}")
+            self.g2_tmax.setText(f"{t_max * 1.1:.2e}")
 
         if q_auto:
             # qd_per_file arrays may be ragged (different Q-bin counts); reduce
@@ -3698,6 +3699,7 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         # Normalize to an absolute path so vk.path, work_dir, and any persisted
         # session paths survive a restart from a different working directory.
         folder = os.path.abspath(folder)
+        self._reset_g2_fit_bounds()
         self.work_dir.setText(folder)
         logger.info(f"Loading data from: {sanitize_path(folder)}")
 
@@ -4004,6 +4006,8 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
 
         logger.debug(f"remove_target: Removing {len(rmv_list)} files from target list")
 
+        if len(rmv_list) == len(self.vk.target):
+            self._reset_g2_fit_bounds()
         self.vk.remove_target(rmv_list)
         # clear selection to avoid the bug: when the last one is selected, then
         # the list will out of bounds
@@ -4018,7 +4022,18 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             self.reset_gui()
         self.update_box(self.vk.target, mode="target")
 
+    def _reset_g2_fit_bounds(self) -> None:
+        for operation_id, plot_type in list(self.active_plot_operations.items()):
+            if plot_type != "g2":
+                continue
+            if self.progress_manager.is_operation_active(operation_id):
+                self.progress_manager.cancel_operation_ui(operation_id)
+            else:
+                self.cancel_async_operation(operation_id)
+        self._g2_fit_bounds_initialized = False
+
     def reset_gui(self):
+        self._reset_g2_fit_bounds()
         self.vk.reset_kernel()
         for x in [
             # self.pg_saxs,
