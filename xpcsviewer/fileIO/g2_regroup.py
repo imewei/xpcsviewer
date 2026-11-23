@@ -41,11 +41,11 @@ def _numeric_dataset(source: h5py.File, path: str) -> h5py.Dataset:
 
 def _positive_scalar(
     source: h5py.File, path: str, *, integral: bool = False
-) -> int | float:
+) -> np.integer | np.floating:
     dataset = _numeric_dataset(source, path)
     if dataset.size != 1:
         raise ValueError(f"Expected one timing value at {path}")
-    value = np.asarray(dataset[()]).item()
+    value = np.asarray(dataset[()]).reshape(-1)[0]
     if not np.isfinite(value) or value <= 0 or (integral and value % 1 != 0):
         requirement = "a positive integer" if integral else "a finite positive number"
         raise ValueError(f"Expected {requirement} at {path}")
@@ -70,17 +70,20 @@ def _read_delays(
             "delay_list must be finite and nonnegative with a positive delay"
         )
 
-    frame_time = float(_positive_scalar(source, _NEXUS["t0"]))
+    frame_time = _positive_scalar(source, _NEXUS["t0"])
     stride_path, average_path = _NEXUS["stride_frame"], _NEXUS["avg_frame"]
     if (stride_path in source) != (average_path in source):
         raise ValueError(
             "Incomplete timing metadata: both stride_frame and avg_frame are required together"
         )
+    if stride_path in source:
+        stride = _positive_scalar(source, stride_path, integral=True)
+        average = _positive_scalar(source, average_path, integral=True)
+    else:
+        stride = average = np.int64(1)
+    timing_dtype = np.result_type(np.float64, delays, frame_time, stride, average)
     with np.errstate(over="ignore", invalid="ignore"):
-        if stride_path in source:
-            frame_time *= _positive_scalar(source, stride_path, integral=True)
-            frame_time *= _positive_scalar(source, average_path, integral=True)
-        seconds = delays.astype(np.float64) * frame_time
+        seconds = delays * (timing_dtype.type(frame_time) * stride * average)
     if not np.isfinite(seconds).all():
         raise ValueError("Elapsed delay seconds must be finite")
 

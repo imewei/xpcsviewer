@@ -76,6 +76,7 @@ def test_regroup_reads_bounded_delay_slices(
     assert result.qmap_path == qmap_path
     assert result.delay_unit == "frames"
     assert result.delay_list.dtype == np.int32
+    assert result.delay_seconds.dtype == np.float64
     assert result.dynamic_bin_ids.dtype == DYNAMIC_MAP.dtype
     assert result.static_roi_map.dtype == STATIC_MAP.dtype
     assert result.dynamic_roi_map.dtype == DYNAMIC_MAP.dtype
@@ -171,6 +172,29 @@ def test_regroup_applies_timing_factors_before_converting_delays(
     result = read_g2_regroup(source_path, qmap_path)
 
     np.testing.assert_allclose(result.delay_seconds, [1e-200], rtol=1e-12, atol=0)
+
+
+@pytest.mark.skipif(
+    np.finfo(np.longdouble).minexp >= np.finfo(np.float64).minexp,
+    reason="requires a wider exponent range than float64",
+)
+def test_regroup_preserves_wider_delays_and_timing(source_path, qmap_path):
+    delays = np.array(["1e350"], dtype=np.longdouble)
+    with h5py.File(source_path, "r+") as source:
+        del source[CUBE_PATH]
+        source[CUBE_PATH] = CHANNELS[np.newaxis]
+        del source[DELAY_PATH]
+        source[DELAY_PATH] = delays
+        del source[FRAME_TIME_PATH]
+        source[FRAME_TIME_PATH] = np.longdouble("1e-500")
+        del source[STRIDE_PATH]
+        del source[AVERAGE_PATH]
+
+    result = read_g2_regroup(source_path, qmap_path)
+
+    assert result.delay_list.dtype == result.delay_seconds.dtype == np.longdouble
+    np.testing.assert_array_equal(result.delay_list, delays)
+    np.testing.assert_allclose(result.delay_seconds, [1e-150], rtol=1e-12, atol=0)
 
 
 @pytest.mark.parametrize(
