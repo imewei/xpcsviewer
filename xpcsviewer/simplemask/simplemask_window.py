@@ -1250,8 +1250,8 @@ class SimpleMaskWindow(QMainWindow):
 
     @staticmethod
     def _log_detector_image(image: NDArray) -> NDArray:
-        """Render overflow and nonfinite counts at the zero-count display level."""
-        counts = np.where(np.isfinite(image) & (image >= 0), image, 0.0)
+        """Render nonfinite counts and counts at or below -1 at the zero-count level."""
+        counts = np.where(np.isfinite(image) & (image > -1), image, 0.0)
         return np.log10(counts + 1)
 
     def _create_masked_display(self, image: NDArray, mask: NDArray) -> NDArray:

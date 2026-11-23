@@ -37,8 +37,9 @@ the frames read, stopping at the final frame when necessary. Use **Scattering**
 to return to the opening average.
 
 You can draw and apply masks while browsing. **Masked raw frames** darkens
-the excluded pixels using the current mask. The opening average remains the
-input for mask calculations and beam center calibration.
+the excluded pixels using the current Boolean mask. The mask, Q-map, and
+partition overlay toggles control the **Scattering** view. The opening
+average remains the input for mask calculations and beam center calibration.
 
 Drawing Tools
 =============

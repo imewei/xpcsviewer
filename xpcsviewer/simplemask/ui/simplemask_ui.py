@@ -208,7 +208,7 @@ def setup_ui(window) -> None:
     partition_overlay_layout = QHBoxLayout()
     window.btn_toggle_partition = QPushButton("Show Partition")
     window.btn_toggle_partition.setCheckable(True)
-    window.btn_toggle_partition.setToolTip("Toggle partition overlay display")
+    window.btn_toggle_partition.setToolTip("Toggle the partition overlay in Scattering")
     partition_overlay_layout.addWidget(window.btn_toggle_partition)
     partition_layout.addRow(partition_overlay_layout)
 
@@ -335,7 +335,7 @@ def _setup_toolbar(window) -> None:
     # Toggle Q-Map overlay
     window.action_toggle_qmap = QAction("Show Q-Map", window)
     window.action_toggle_qmap.setCheckable(True)
-    window.action_toggle_qmap.setToolTip("Toggle Q-map overlay display")
+    window.action_toggle_qmap.setToolTip("Toggle the Q-map overlay in Scattering")
     toolbar.addAction(window.action_toggle_qmap)
 
     toolbar.addSeparator()
@@ -343,7 +343,7 @@ def _setup_toolbar(window) -> None:
     # Toggle mask overlay
     window.action_toggle_mask = QAction("Show Mask", window)
     window.action_toggle_mask.setCheckable(True)
-    window.action_toggle_mask.setToolTip("Toggle mask overlay display")
+    window.action_toggle_mask.setToolTip("Toggle the mask overlay in Scattering")
     toolbar.addAction(window.action_toggle_mask)
 
     window.toolbar = toolbar

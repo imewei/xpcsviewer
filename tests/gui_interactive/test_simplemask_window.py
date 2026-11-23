@@ -176,6 +176,23 @@ def test_raw_browse_displays_invalid_detector_counts_without_hiding_valid_pixels
     assert window.image_view.getView().viewRange() == zoom
 
 
+def test_raw_browse_preserves_fractional_negative_detector_counts(qtbot, tmp_path):
+    window = SimpleMaskWindow()
+    qtbot.addWidget(window)
+    path = _write_raw_scan(
+        tmp_path / "scan.h5",
+        np.array([[[-0.5, -2, 1]], [[-0.75, -1, 2]]], dtype=np.float32),
+    )
+    window.load_from_raw_file(path, "APS_8IDI", num_frames=1)
+    qtbot.waitUntil(lambda: window._raw_source_path == path)
+    np.testing.assert_allclose(window.image_view.image, np.log10([[0.5, 1, 2]]))
+
+    window.raw_frame_display.setCurrentIndex(1)
+    window.raw_frame_start.setValue(1)
+    qtbot.waitUntil(lambda: window.raw_frame_range_label.text() == "Frame 1")
+    np.testing.assert_allclose(window.image_view.image, np.log10([[0.25, 1, 3]]))
+
+
 @pytest.mark.parametrize("old_terminal", ["success", "error"])
 def test_raw_browse_discards_stale_work_across_navigation_and_new_load(
     qtbot, tmp_path, old_terminal
