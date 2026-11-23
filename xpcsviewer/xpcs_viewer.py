@@ -28,7 +28,9 @@ from .backends._conversions import ensure_numpy
 
 # Import async components
 from .constants import MIN_AVERAGING_FILES
+from .fileIO.g2_regroup import G2RegroupResult
 from .fileIO.qmap_utils import Q_UNIT_DISPLAY
+from .gui.g2_regroup_dialog import G2RegroupDialog, G2RegroupExportWorker
 from .gui.layout_helpers import apply_all_layout_improvements
 from .gui.shortcuts.shortcut_manager import ShortcutManager
 
@@ -177,6 +179,8 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
 
         self.thread_pool = QtCore.QThreadPool()
         logger.info("Maximal threads: %d", self.thread_pool.maxThreadCount())
+        self._g2_regroup_dialog: G2RegroupDialog | None = None
+        self._g2_regroup_export: G2RegroupExportWorker | None = None
 
         # Initialize async components
         self.progress_manager = ProgressManager(self)
@@ -661,6 +665,10 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         action_reload.triggered.connect(self.reload_source)
         file_menu.addAction(action_reload)
 
+        action_regroup = QAction("Regroup G2…", self)
+        action_regroup.triggered.connect(self._open_g2_regroup)
+        file_menu.addAction(action_regroup)
+
         # Recent directories submenu
         self.recent_menu = file_menu.addMenu("Recent &Directories")
         self._populate_recent_directories_menu()
@@ -1006,6 +1014,8 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         Args:
             event: The close event
         """
+        self._close_g2_regroup()
+
         # Close SimpleMask window if open
         if hasattr(self, "_simplemask_window") and self._simplemask_window is not None:
             self._simplemask_window.close()
@@ -1714,6 +1724,78 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             )
 
         return selected_row
+
+    @QtCore.Slot()
+    def _open_g2_regroup(self) -> None:
+        if self._g2_regroup_dialog is not None:
+            self._g2_regroup_dialog.raise_()
+            self._g2_regroup_dialog.activateWindow()
+            return
+
+        selected = self.list_view_target.selectedIndexes()
+        if self.vk is None or len(selected) != 1:
+            self.statusbar.showMessage(
+                "Select one result in the Target list to regroup G2.", 5000
+            )
+            return
+
+        source = (Path(self.vk.path) / self.vk.target[selected[0].row()]).resolve()
+        dialog = G2RegroupDialog(source, self.thread_pool, self)
+        self._g2_regroup_dialog = dialog
+        dialog.set_export_active(self._g2_regroup_export is not None)
+        dialog.finished.connect(self._g2_regroup_closed)
+        dialog.save_requested.connect(self._start_g2_regroup_export)
+        dialog.open()
+
+    def _close_g2_regroup(self) -> None:
+        if self._g2_regroup_dialog is not None:
+            self._g2_regroup_dialog.reject()
+
+    @QtCore.Slot(int)
+    def _g2_regroup_closed(self, _result: int) -> None:
+        self._g2_regroup_dialog = None
+
+    @QtCore.Slot(object, object)
+    def _start_g2_regroup_export(
+        self, result: G2RegroupResult, destination: Path
+    ) -> None:
+        if self._g2_regroup_export is not None:
+            return
+        worker = G2RegroupExportWorker(result, destination)
+        self._g2_regroup_export = worker
+        if self._g2_regroup_dialog is not None:
+            self._g2_regroup_dialog.set_export_active(True)
+        queued = QtCore.Qt.ConnectionType.QueuedConnection
+        worker.signals.finished.connect(self._g2_regroup_export_finished, queued)
+        worker.signals.error.connect(self._g2_regroup_export_failed, queued)
+        self.thread_pool.start(worker)
+
+    def _release_g2_regroup_export(self, message: str) -> None:
+        self._g2_regroup_export = None
+        if self._g2_regroup_dialog is not None:
+            self._g2_regroup_dialog.set_export_active(False, message)
+
+    @QtCore.Slot(object)
+    def _g2_regroup_export_finished(self, destination: Path) -> None:
+        assert self._g2_regroup_export is not None
+        source = self._g2_regroup_export.result.source_path.name
+        message = f"Saved regrouped G2 from {source} to {destination}"
+        self._release_g2_regroup_export(message)
+        self.toast_manager.show_success(message)
+
+    @QtCore.Slot(str, str, str, int)
+    def _g2_regroup_export_failed(
+        self, worker_id: str, error: str, _traceback: str, _retry: int
+    ) -> None:
+        assert self._g2_regroup_export is not None
+        source = self._g2_regroup_export.result.source_path.name
+        reason = error.removeprefix(f"Error in worker {worker_id}: ")
+        message = (
+            f"Could not save regrouped G2 from {source}. {reason}\n"
+            "Choose a new writable destination to retry."
+        )
+        self._release_g2_regroup_export(message)
+        self.toast_manager.show_error(message)
 
     def update_plot(self):
         """
@@ -3158,7 +3240,8 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
 
         self._reset_g2_fit_bounds()
         self.vk.submit_job(**kwargs)
-        # the target_average has been reset
+        if not self.vk.target:
+            self._close_g2_regroup()
         self.update_box(self.vk.target, mode="target")
 
     def update_avg_info(self):
@@ -3704,6 +3787,7 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         # Normalize to an absolute path so vk.path, work_dir, and any persisted
         # session paths survive a restart from a different working directory.
         folder = os.path.abspath(folder)
+        self._close_g2_regroup()
         self._reset_g2_fit_bounds()
         self.work_dir.setText(folder)
         logger.info(f"Loading data from: {sanitize_path(folder)}")
@@ -4038,6 +4122,7 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         self._g2_fit_bounds_initialized = False
 
     def reset_gui(self):
+        self._close_g2_regroup()
         self._reset_g2_fit_bounds()
         self.vk.reset_kernel()
         for x in [
