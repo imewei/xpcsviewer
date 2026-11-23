@@ -2,6 +2,7 @@
 
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
+from pathlib import Path
 from threading import Event
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -10,7 +11,10 @@ import numpy as np
 import pytest
 
 from xpcsviewer import file_locator
+from xpcsviewer.gui.qt_compat import QtCore, QtWidgets
+from xpcsviewer.gui.widgets.toast_notification import ToastWidget
 from xpcsviewer.module import g2mod
+from xpcsviewer.threading.async_kernel import AsyncViewerKernel
 from xpcsviewer.threading.plot_workers import G2PlotWorker
 from xpcsviewer.viewer_kernel import ViewerKernel
 from xpcsviewer.xpcs_file import XpcsFile
@@ -41,6 +45,18 @@ def viewer(qtbot, monkeypatch, tmp_path):
     window.g2_tauto.setChecked(True)
     window.tabWidget.setCurrentIndex(4)
     return window
+
+
+@pytest.fixture
+def deferred_plot_workers(viewer):
+    workers = []
+    viewer.async_vk = AsyncViewerKernel(
+        viewer.vk, SimpleNamespace(start=workers.append)
+    )
+    queued = QtCore.Qt.ConnectionType.QueuedConnection
+    viewer.async_vk.plot_ready.connect(viewer.on_async_plot_ready, queued)
+    viewer.async_vk.operation_error.connect(viewer.on_async_operation_error, queued)
+    return workers
 
 
 def _bounds(viewer):
@@ -269,6 +285,66 @@ def test_g2_async_bounds_use_native_delays_and_ignore_reset_completion(
     viewer.on_async_plot_ready("current", current_result)
     assert _bounds(viewer) == (0.03, 12.0)
     assert render.call_count == 3
+
+
+def test_g2_reset_discards_queued_plot_error(viewer, deferred_plot_workers):
+    _add_targets(viewer, "old.h5")
+    viewer.update_plot_async("g2")
+    worker = deferred_plot_workers.pop()
+    worker.signals.error.emit(worker.worker_id, "retired plot failed", "", 0)
+    viewer.reset_gui()
+
+    _add_targets(viewer, "current.h5")
+    viewer.update_plot_async("g2")
+    worker = deferred_plot_workers.pop()
+    worker.signals.error.emit(worker.worker_id, "current plot failed", "", 0)
+    viewer.progress_manager.start_operation("load_files_test", "Loading files")
+    viewer.async_vk.operation_error.emit("load_files_test", "load failed", "")
+
+    QtCore.QCoreApplication.sendPostedEvents(viewer, QtCore.QEvent.Type.MetaCall)
+    errors = [
+        toast.findChild(QtWidgets.QLabel).text()
+        for toast in viewer.findChildren(ToastWidget, "toast_error")
+    ]
+    assert errors == [
+        "Operation failed: current plot failed",
+        "Operation failed: load failed",
+    ]
+    assert not viewer.active_plot_operations
+    assert not viewer.progress_manager.get_active_operations()
+
+
+def test_g2_plots_started_in_one_clock_tick_have_distinct_lifetimes(
+    viewer, deferred_plot_workers, monkeypatch
+):
+    monkeypatch.setattr("time.time", lambda: 1000.0)
+    scans = {
+        "old.h5": _scan("old.h5", [0.2, 0.8]),
+        "current.h5": _scan("current.h5", [0.6, 1.2]),
+    }
+    monkeypatch.setattr(
+        file_locator, "create_xpcs_dataset", lambda path, **kw: scans[Path(path).name]
+    )
+    _add_targets(viewer, "old.h5")
+    viewer.update_plot_async("g2")
+    (retired,) = viewer.active_plot_operations
+    deferred_plot_workers.pop().run()
+    viewer.reset_gui()
+
+    _add_targets(viewer, "current.h5")
+    viewer.update_plot_async("g2")
+    (current,) = viewer.active_plot_operations
+    QtCore.QCoreApplication.sendPostedEvents(viewer, QtCore.QEvent.Type.MetaCall)
+
+    assert not viewer._g2_fit_bounds_initialized
+    assert retired != current
+    assert viewer.progress_manager.is_operation_active(current)
+
+    deferred_plot_workers.pop().run()
+    QtCore.QCoreApplication.sendPostedEvents(viewer, QtCore.QEvent.Type.MetaCall)
+    assert _bounds(viewer) == (0.03, 12.0)
+    assert not viewer.active_plot_operations
+    assert not viewer.progress_manager.is_operation_active(current)
 
 
 def test_g2_reset_does_not_cache_an_inflight_file_load(viewer, monkeypatch, tmp_path):

@@ -2,9 +2,9 @@
 import json
 import os
 import shutil
-import time
 from collections import OrderedDict
 from pathlib import Path
+from uuid import uuid4
 
 # Third-party imports
 import numpy as np
@@ -1459,6 +1459,12 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         self, operation_id: str, error_msg: str, traceback_str: str
     ):
         """Handle async operation errors."""
+        if (
+            operation_id.startswith("plot_")
+            and operation_id not in self.active_plot_operations
+        ):
+            return
+
         logger.error(f"Async operation {operation_id} failed: {error_msg}")
         logger.debug(f"Traceback: {traceback_str}")
 
@@ -1995,7 +2001,7 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             self.plot_kwargs_record[tab_name] = kwargs
 
             # Start async plotting
-            operation_id = f"plot_{tab_name}_{int(time.time() * 1000)}"
+            operation_id = f"plot_{tab_name}_{uuid4().hex}"
 
             # Start progress tracking
             description = f"Plotting {tab_name.replace('_', ' ').title()}"
