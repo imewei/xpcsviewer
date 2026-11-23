@@ -153,6 +153,7 @@ class SimpleMaskWindow(QMainWindow):
         self._pending_viewer_load: (
             tuple[NDArray[np.float64] | None, dict[str, Any] | None] | None
         ) = None
+        self._close_after_raw_open = False
         self._raw_source_path: str | None = None
         self._raw_source_frame_count: int | None = None
 
@@ -681,8 +682,12 @@ class SimpleMaskWindow(QMainWindow):
             self._raw_open_committing = False
             pending = self._pending_viewer_load
             self._pending_viewer_load = None
+            close_after_install = self._close_after_raw_open
+            self._close_after_raw_open = False
             if pending is not None:
                 self.load_from_viewer(*pending)
+            if close_after_install:
+                self.close()
 
     @Slot(str, str, str, int)
     def _on_raw_file_error(
@@ -1313,6 +1318,11 @@ class SimpleMaskWindow(QMainWindow):
         Args:
             event: Close event
         """
+        if self._raw_open_committing:
+            self._close_after_raw_open = True
+            event.ignore()
+            return
+
         # Skip confirmation dialog in test/headless mode to prevent blocking
         import os
 

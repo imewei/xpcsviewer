@@ -265,6 +265,54 @@ def test_raw_open_close_retires_request(raw_editor, tmp_path):
     np.testing.assert_array_equal(window.kernel.detector_image, np.full((4, 4), 11))
 
 
+@pytest.mark.parametrize("replace_with_viewer", [False, True], ids=["raw", "viewer"])
+def test_raw_open_overlay_close_leaves_coherent_editor_on_reshow(
+    raw_editor, tmp_path, replace_with_viewer
+):
+    window, workers, _ = raw_editor
+    window.show()
+    window._ensure_mask_overlay_visible()
+    image = np.full((3, 5), 22, dtype=np.float32)
+    candidate = _write_raw_scan(tmp_path / "second.h5", image)
+    viewer_image = np.full((2, 6), 33.0)
+    metadata = window.kernel.metadata.copy()
+    visible_during_install = []
+    visible_on_viewer_status = []
+
+    def record_viewer_status(message):
+        if message == "Loaded 6x2 detector image":
+            visible_on_viewer_status.append(window.isVisible())
+
+    def close_on_overlay_change(checked):
+        window.action_toggle_mask.toggled.disconnect(close_on_overlay_change)
+        window.close()
+        visible_during_install.append(window.isVisible())
+        if replace_with_viewer:
+            window.load_from_viewer(viewer_image, metadata)
+
+    window.status_bar.messageChanged.connect(record_viewer_status)
+    window.action_toggle_mask.toggled.connect(close_on_overlay_change)
+    window.load_from_raw_file(candidate, "APS_8IDI")
+    workers.pop().run()
+
+    assert not window.isVisible()
+    window.show()
+    assert window._raw_source_path == (None if replace_with_viewer else candidate)
+    assert window._raw_source_frame_count is None
+    installed_image = viewer_image if replace_with_viewer else image
+    np.testing.assert_array_equal(window.kernel.detector_image, installed_image)
+    np.testing.assert_array_equal(
+        window.image_view.image, np.log10(installed_image + 1)
+    )
+    expected_status = (
+        "Loaded 6x2 detector image" if replace_with_viewer else "Raw file loaded"
+    )
+    assert window.status_bar.currentMessage() == expected_status
+    assert window.action_open_raw_file.isEnabled()
+    assert visible_during_install == [True]
+    assert visible_on_viewer_status == ([True] if replace_with_viewer else [])
+
+
 @pytest.mark.parametrize("notification", ["title", "overlay", "enabled"])
 def test_raw_open_notifications_can_install_viewer_image(
     raw_editor, monkeypatch, tmp_path, notification
