@@ -3,6 +3,22 @@
 import numpy as np
 
 
+def _grouped_mean(
+    indices: np.ndarray, values: np.ndarray, counts: np.ndarray
+) -> np.ndarray:
+    means = np.bincount(indices, weights=values) / counts
+    overflow = ~np.isfinite(means)
+    if np.any(overflow):
+        # Scale by a power of two larger than the group count to keep sums finite.
+        shifts = np.frexp(counts)[1]
+        scaled = np.ldexp(values, -shifts[indices])
+        scaled_means = np.bincount(indices, weights=scaled)[overflow] / counts[overflow]
+        shifts = shifts[overflow]
+        limit = np.ldexp(np.finfo(np.float64).max, -shifts)
+        means[overflow] = np.ldexp(np.clip(scaled_means, -limit, limit), shifts)
+    return means
+
+
 class G2Regrouping:
     """Cache the ROI membership and counts shared by every delay."""
 
@@ -58,14 +74,13 @@ class G2Regrouping:
             if not np.isfinite(pixel_product).all() or np.any(pixel_product <= 0):
                 raise ValueError("Included pixels must have finite, positive IP * IF")
 
-            static_means = (
-                np.array(
-                    [
-                        np.bincount(self._static_index, weights=channel)
-                        for channel in active
-                    ]
-                )
-                / self._static_pixel_counts
+            static_means = np.array(
+                [
+                    _grouped_mean(
+                        self._static_index, channel, self._static_pixel_counts
+                    )
+                    for channel in active
+                ]
             )
             static_product = static_means[1] * static_means[2]
             if not np.isfinite(static_product).all() or np.any(static_product <= 0):
@@ -73,20 +88,28 @@ class G2Regrouping:
                     "Static bins must have finite, positive mean(IP) * mean(IF)"
                 )
             static_g2 = static_means[0] / static_product
-            g2 = (
-                np.bincount(self._static_to_dynamic, weights=static_g2)
-                / self._dynamic_static_counts
+            pixel_g2 = active[0] / pixel_product
+            if not np.isfinite(static_g2).all() or not np.isfinite(pixel_g2).all():
+                raise ValueError("Normalized static-bin and pixel G2 must be finite")
+
+            g2 = _grouped_mean(
+                self._static_to_dynamic, static_g2, self._dynamic_static_counts
             )
 
-            pixel_g2 = active[0] / pixel_product
+            # Center and square in a bounded range before rescaling the error.
+            max_magnitude = np.zeros(self._dynamic_pixel_counts.size)
+            np.maximum.at(max_magnitude, self._dynamic_index, np.abs(pixel_g2))
+            shifts = np.frexp(max_magnitude)[1]
+            scaled_g2 = np.ldexp(pixel_g2, -shifts[self._dynamic_index])
             pixel_means = (
-                np.bincount(self._dynamic_index, weights=pixel_g2)
+                np.bincount(self._dynamic_index, weights=scaled_g2)
                 / self._dynamic_pixel_counts
             )
-            squared_deviations = np.square(pixel_g2 - pixel_means[self._dynamic_index])
-            error = (
+            squared_deviations = np.square(scaled_g2 - pixel_means[self._dynamic_index])
+            error = np.ldexp(
                 np.sqrt(np.bincount(self._dynamic_index, weights=squared_deviations))
-                / self._dynamic_pixel_counts
+                / self._dynamic_pixel_counts,
+                shifts,
             )
 
         if not np.isfinite(g2).all() or not np.isfinite(error).all():

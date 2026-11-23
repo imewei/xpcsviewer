@@ -93,6 +93,49 @@ def test_regroup_rejects_nonfinite_normalized_results():
         grouping.compute_delay(np.array([[[1e308]], [[0.1]], [[1]]]))
 
 
+@pytest.mark.parametrize("amplitude", [1e155, 1e-200])
+def test_regroup_standard_error_preserves_float64_range(amplitude):
+    grouping = G2Regrouping(np.array([[1, 2]]), np.array([[1, 1]]))
+    channels = np.array([[[0, amplitude]], [[1, 1]], [[1, 1]]])
+
+    g2, error = grouping.compute_delay(channels)
+
+    np.testing.assert_allclose(g2, [amplitude / 2], rtol=1e-12, atol=0)
+    np.testing.assert_allclose(
+        error, [amplitude / (2 * np.sqrt(2))], rtol=1e-12, atol=0
+    )
+
+
+def test_regroup_static_mean_survives_sum_overflow():
+    grouping = G2Regrouping(np.array([[1, 1]]), np.array([[1, 1]]))
+    channels = np.array([[[1, 1]], [[1e308, 1e308]], [[1e-308, 1e-308]]])
+
+    g2, error = grouping.compute_delay(channels)
+
+    np.testing.assert_allclose(g2, [1], rtol=1e-12, atol=0)
+    np.testing.assert_array_equal(error, [0])
+
+
+@pytest.mark.parametrize("sign", [1, -1])
+def test_regroup_dynamic_mean_and_error_survive_intermediate_overflow(sign):
+    grouping = G2Regrouping(np.array([[1, 2, 3, 4]]), np.array([[1, 1, 1, 1]]))
+    amplitude = sign * 1.7e308
+    channels = np.array(
+        [
+            [[amplitude, amplitude, amplitude, -amplitude]],
+            [[1, 1, 1, 1]],
+            [[1, 1, 1, 1]],
+        ]
+    )
+
+    g2, error = grouping.compute_delay(channels)
+
+    np.testing.assert_allclose(g2, [amplitude / 2], rtol=1e-12, atol=0)
+    np.testing.assert_allclose(
+        error, [abs(amplitude / 4) * np.sqrt(3)], rtol=1e-12, atol=0
+    )
+
+
 def test_regroup_matches_upstream_positive_domain():
     static = np.array([[1, 1], [2, 3]])
     dynamic = np.array([[1, 1], [1, 2]])
