@@ -3156,6 +3156,7 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             self.statusbar.showMessage("check avg min/max values.", 1000)
             return
 
+        self._reset_g2_fit_bounds()
         self.vk.submit_job(**kwargs)
         # the target_average has been reset
         self.update_box(self.vk.target, mode="target")
@@ -3632,6 +3633,10 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
                     "No data folder loaded. Use File -> Open Directory.", 5000
                 )
                 logger.warning("Reload requested before viewer kernel initialized")
+                return
+
+            if os.path.abspath(path) != os.path.abspath(self.vk.path):
+                self.load_path(path)
                 return
 
             logger.debug(f"reload_source: building from {sanitize_path(path)}")

@@ -12,12 +12,14 @@ import pytest
 from xpcsviewer import file_locator
 from xpcsviewer.module import g2mod
 from xpcsviewer.threading.plot_workers import G2PlotWorker
+from xpcsviewer.viewer_kernel import ViewerKernel
 from xpcsviewer.xpcs_file import XpcsFile
 from xpcsviewer.xpcs_viewer import XpcsViewer
 
 
 class StubKernel(file_locator.FileLocator):
     reset_kernel = file_locator.FileLocator.clear_target
+    submit_job = ViewerKernel.submit_job
 
     def plot_g2(self, **kwargs):
         return [[0.01]], self.delays
@@ -124,6 +126,85 @@ def test_g2_fit_bounds_wait_for_usable_delays_and_reset_with_session(viewer, tmp
     _add_targets(viewer, "scan.h5")
     viewer.plot_g2()
     assert _bounds(viewer) == (0.03, 12.0)
+
+
+def test_g2_fit_bounds_reset_only_when_averaging_is_submitted(viewer, tmp_path):
+    files = ["first.h5", "second.h5"]
+    _add_targets(viewer, *files)
+    viewer.vk.delays = [[0.2, 0.8]]
+    viewer.plot_g2()
+    _edit_bounds(viewer)
+    viewer.avg_save_path.setText(str(tmp_path))
+    viewer.avg_save_name.setText("average.h5")
+    viewer.bx_avg_saxs.setChecked(True)
+
+    targets_at_cancel = []
+    viewer.async_vk = SimpleNamespace(
+        cancel_operation=lambda operation_id: targets_at_cancel.append(
+            (operation_id, list(viewer.vk.target))
+        )
+    )
+    viewer.active_plot_operations["before_submission"] = "g2"
+    viewer.avg_blmin.setValue(1.0)
+    viewer.avg_blmax.setValue(1.0)
+    viewer.btn_submit_job.click()
+    assert viewer.active_plot_operations == {"before_submission": "g2"}
+    assert list(viewer.vk.target) == files
+    assert _bounds(viewer) == (0.03, 2.0)
+    assert viewer._g2_fit_bounds_initialized
+    assert targets_at_cancel == []
+
+    viewer.avg_blmax.setValue(1.1)
+    viewer.btn_submit_job.click()
+    assert viewer.vk.avg_worker.file_list == files
+    assert not viewer.vk.target
+    assert targets_at_cancel == [("before_submission", files)]
+    assert not viewer.active_plot_operations
+    assert not viewer._g2_fit_bounds_initialized
+
+    _add_targets(viewer, "replacement.h5")
+    viewer.vk.delays = [[0.4, 1.6]]
+    viewer.plot_g2()
+    assert _bounds(viewer) == (0.02, 16.0)
+
+
+def test_g2_fit_bounds_reset_only_when_reload_changes_directory(viewer, tmp_path):
+    _add_targets(viewer, "original.h5")
+    viewer.vk.delays = [[0.2, 0.8]]
+    viewer.plot_g2()
+    _edit_bounds(viewer)
+    viewer.work_dir.setText(str(tmp_path))
+
+    paths_at_cancel = []
+    viewer.async_vk = SimpleNamespace(
+        cancel_operation=lambda operation_id: paths_at_cancel.append(
+            (operation_id, viewer.vk.path)
+        )
+    )
+    viewer.active_plot_operations["before_reload"] = "g2"
+    viewer.reload_source()
+    assert list(viewer.vk.target) == ["original.h5"]
+    assert _bounds(viewer) == (0.03, 2.0)
+    assert viewer._g2_fit_bounds_initialized
+    assert viewer.active_plot_operations == {"before_reload": "g2"}
+    assert paths_at_cancel == []
+
+    replacement = tmp_path / "replacement"
+    replacement.mkdir()
+    (replacement / "new.h5").touch()
+    viewer.work_dir.setText(str(replacement))
+    viewer.reload_source()
+    assert viewer.vk.path == str(replacement)
+    assert list(viewer.vk.source) == ["new.h5"]
+    assert not viewer.vk.target
+    assert paths_at_cancel == [("before_reload", str(tmp_path))]
+    assert not viewer.active_plot_operations
+    assert not viewer._g2_fit_bounds_initialized
+
+    _add_targets(viewer, "new.h5")
+    viewer.vk.delays = [[0.4, 1.6]]
+    viewer.plot_g2()
+    assert _bounds(viewer) == (0.02, 16.0)
 
 
 def _scan(path, tau):
