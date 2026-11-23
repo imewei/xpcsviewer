@@ -62,14 +62,16 @@ def delay_slices(monkeypatch):
     return reads
 
 
-@pytest.mark.parametrize("delays_per_chunk", [1, 2, 8])
+@pytest.mark.parametrize(
+    ("delays_per_chunk", "expected_slices"),
+    [(1, [(0, 1), (1, 2), (2, 3)]), (2, [(0, 2), (2, 3)]), (8, [(0, 3)])],
+)
 def test_regroup_reads_bounded_delay_slices(
-    source_path, qmap_path, delay_slices, delays_per_chunk
+    source_path, qmap_path, delay_slices, delays_per_chunk, expected_slices
 ):
     result = read_g2_regroup(source_path, qmap_path, delays_per_chunk=delays_per_chunk)
 
-    assert delay_slices
-    assert all(0 < stop - start <= delays_per_chunk for start, stop in delay_slices)
+    assert delay_slices == expected_slices
     assert result.source_path == source_path
     assert result.qmap_path == qmap_path
     assert result.delay_unit == "frames"
@@ -151,6 +153,24 @@ def test_regroup_accepts_viewer_delay_and_timing_shapes(
     assert result.delay_unit == b"frames"
     np.testing.assert_array_equal(result.delay_list, expected)
     np.testing.assert_array_equal(result.delay_seconds, seconds)
+
+
+def test_regroup_applies_timing_factors_before_converting_delays(
+    source_path, qmap_path
+):
+    with h5py.File(source_path, "r+") as source:
+        del source[CUBE_PATH]
+        source[CUBE_PATH] = CHANNELS[np.newaxis]
+        del source[DELAY_PATH]
+        source[DELAY_PATH] = [1e-100]
+        source[FRAME_TIME_PATH][()] = 1e-250
+        del source[STRIDE_PATH]
+        source[STRIDE_PATH] = 1e150
+        source[AVERAGE_PATH][()] = 1
+
+    result = read_g2_regroup(source_path, qmap_path)
+
+    np.testing.assert_allclose(result.delay_seconds, [1e-200], rtol=1e-12, atol=0)
 
 
 @pytest.mark.parametrize(

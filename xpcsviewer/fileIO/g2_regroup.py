@@ -70,17 +70,17 @@ def _read_delays(
             "delay_list must be finite and nonnegative with a positive delay"
         )
 
-    frame_time = _positive_scalar(source, _NEXUS["t0"])
+    frame_time = float(_positive_scalar(source, _NEXUS["t0"]))
     stride_path, average_path = _NEXUS["stride_frame"], _NEXUS["avg_frame"]
     if (stride_path in source) != (average_path in source):
         raise ValueError(
             "Incomplete timing metadata: both stride_frame and avg_frame are required together"
         )
     with np.errstate(over="ignore", invalid="ignore"):
-        seconds = delays.astype(np.float64) * frame_time
         if stride_path in source:
-            seconds *= _positive_scalar(source, stride_path, integral=True)
-            seconds *= _positive_scalar(source, average_path, integral=True)
+            frame_time *= _positive_scalar(source, stride_path, integral=True)
+            frame_time *= _positive_scalar(source, average_path, integral=True)
+        seconds = delays.astype(np.float64) * frame_time
     if not np.isfinite(seconds).all():
         raise ValueError("Elapsed delay seconds must be finite")
 
