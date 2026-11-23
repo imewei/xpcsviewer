@@ -7,6 +7,7 @@ import h5py
 import numpy as np
 import pytest
 
+from xpcsviewer.simplemask import raw_file_worker
 from xpcsviewer.simplemask.raw_file_worker import RawFileLoadWorker
 from xpcsviewer.simplemask.reader import io_utils
 from xpcsviewer.simplemask.reader.exceptions import RawDataReadError
@@ -41,6 +42,24 @@ class _FakeReader:
 class _FakeFailingReader(_FakeReader):
     def prepare_data(self, **kwargs):
         raise RuntimeError("simulated read failure")
+
+
+def test_preview_worker_reports_effective_range(monkeypatch):
+    image = np.array([[30.0, 40.0]])
+    loader = Mock(spec=hdf.HdfDataset, frame_count=3)
+    loader.get_frames_mean.return_value = image
+    monkeypatch.setattr(
+        raw_file_worker, "get_format_loader", lambda path: loader, raising=False
+    )
+
+    worker = raw_file_worker.RawFramePreviewWorker("scan.h5", 2, 8, 7)
+    result = worker.do_work()
+
+    loader.get_frames_mean.assert_called_once_with(
+        2, 3, check_cancelled=worker.check_cancelled
+    )
+    assert (result["begin_idx"], result["end_idx"], result["request_id"]) == (2, 3, 7)
+    np.testing.assert_array_equal(result["image"], image)
 
 
 def test_do_work_returns_scattering_and_adapted_metadata():

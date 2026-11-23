@@ -80,6 +80,132 @@ def _mask_one_pixel(window):
     window.mark_unsaved()
 
 
+def test_raw_browse_uses_full_stack_and_preserves_calibration_input(qtbot, tmp_path):
+    window = SimpleMaskWindow()
+    qtbot.addWidget(window)
+    path = _write_raw_scan(
+        tmp_path / "scan.h5", np.array([[[10, 10]], [[20, 20]], [[25, 25]], [[30, 40]]])
+    )
+    window.load_from_raw_file(path, "APS_8IDI", begin_idx=0, num_frames=2)
+    qtbot.waitUntil(lambda: window._raw_source_path == path)
+    np.testing.assert_array_equal(window.kernel.detector_image, [[15, 15]])
+
+    display = window.raw_frame_display
+    assert display.isEnabled()
+    assert window.raw_frame_start.maximum() == 3
+    assert (window.raw_frame_start.value(), window.raw_frame_count.value()) == (0, 1)
+    display.setCurrentIndex(1)
+    window.raw_frame_start.setValue(3)
+    window.raw_frame_count.setValue(4)
+    zoom = window.image_view.getView().viewRange()
+    qtbot.waitUntil(lambda: window.raw_frame_range_label.text() == "Frame 3")
+    log_frame = np.log10(np.array([[31, 41]]))
+    np.testing.assert_allclose(window.image_view.image, log_frame)
+    np.testing.assert_array_equal(window.kernel.detector_image, [[15, 15]])
+
+    masked = np.array([[True, False]])
+    window.kernel.mask_kernel.evaluate("mask_draw", arr=~masked)
+    window.kernel.mask_apply("mask_draw")
+    display.setCurrentIndex(2)
+    np.testing.assert_allclose(window.image_view.image, [[0, 0.3]])
+    display.setCurrentIndex(1)
+    np.testing.assert_allclose(window.image_view.image, log_frame)
+    display.setCurrentIndex(2)
+    window.action_undo.trigger()
+    np.testing.assert_allclose(window.image_view.image, [[0, 1]])
+    assert (window.raw_frame_start.value(), window.raw_frame_count.value()) == (3, 4)
+    assert window.raw_frame_range_label.text() == "Frame 3"
+    assert window.image_view.getView().viewRange() == zoom
+    np.testing.assert_array_equal(window.kernel.detector_image, [[15, 15]])
+
+    window.load_from_viewer(np.full((1, 2), 50.0), window.kernel.metadata.copy())
+    assert window._raw_source_path is None
+    assert not display.isEnabled()
+    assert not window.raw_frame_start.isEnabled()
+    assert not window.raw_frame_count.isEnabled()
+    np.testing.assert_allclose(window.image_view.image, np.log10([[51, 51]]))
+
+
+def test_raw_browse_discards_stale_work_across_navigation_and_new_load(qtbot, tmp_path):
+    window = SimpleMaskWindow()
+    qtbot.addWidget(window)
+    workers = []
+    window.thread_pool = SimpleNamespace(start=workers.append)
+    path = _write_raw_scan(tmp_path / "old.h5", np.full((3, 4, 4), 11))
+    window.load_from_raw_file(path, "APS_8IDI")
+    workers.pop().run()
+    original = window.image_view.image.copy()
+
+    window.raw_frame_display.setCurrentIndex(1)
+    qtbot.waitUntil(lambda: len(workers) == 1)
+    first = workers.pop()
+    first_result = first.do_work()
+    first_result["image"] = np.full((4, 4), 15)
+    window.raw_frame_start.setValue(1)
+    qtbot.waitUntil(lambda: not window._raw_preview_timer.isActive())
+    assert not workers
+    window.raw_frame_start.setValue(2)
+    first.signals.finished.emit(first_result)
+    np.testing.assert_array_equal(window.image_view.image, original)
+
+    qtbot.waitUntil(lambda: len(workers) == 1)
+    last = workers.pop()
+    assert last.begin_idx == 2
+    last_result = last.do_work()
+
+    new_path = _write_raw_scan(tmp_path / "new.h5", np.full((1, 4, 4), 22))
+    window.load_from_raw_file(new_path, "APS_8IDI")
+    workers.pop().run()
+    assert window._raw_source_path == new_path
+    assert window.raw_frame_display.isEnabled()
+    assert window.raw_frame_start.maximum() == 0
+    window.raw_frame_display.setCurrentIndex(1)
+    qtbot.waitUntil(lambda: not window._raw_preview_timer.isActive())
+    assert not workers
+    new_image = window.image_view.image.copy()
+    new_status = window.status_bar.currentMessage()
+    last.signals.finished.emit(last_result)
+    last.signals.error.emit(last.worker_id, "stale error", "", 0)
+    np.testing.assert_array_equal(window.image_view.image, new_image)
+    assert window.status_bar.currentMessage() == new_status
+
+    qtbot.waitUntil(lambda: len(workers) == 1)
+    workers.pop().run()
+    assert window.raw_frame_range_label.text() == "Frame 0"
+    np.testing.assert_allclose(window.image_view.image, np.log10(23))
+
+
+@pytest.mark.parametrize("leave_raw_view", ["channel", "close"])
+def test_raw_browse_ignores_pending_results_after_leaving_view(
+    raw_editor, qtbot, leave_raw_view
+):
+    window, workers, _ = raw_editor
+    window.raw_frame_display.setCurrentIndex(1)
+    qtbot.waitUntil(lambda: len(workers) == 1)
+    worker = workers.pop()
+    result = worker.do_work()
+    result["image"] = np.full((4, 4), 15)
+    if leave_raw_view == "close":
+        window.close()
+    else:
+        window.raw_frame_display.setCurrentIndex(0)
+    worker.signals.finished.emit(result)
+    assert window.raw_frame_range_label.text() != "Frame 0"
+    np.testing.assert_allclose(window.image_view.image, np.log10(12))
+
+
+def test_raw_browse_rejects_a_frame_with_changed_detector_dimensions(raw_editor, qtbot):
+    window, workers, source = raw_editor
+    _write_raw_scan(source, np.full((2, 2, 2), 33))
+    window.raw_frame_display.setCurrentIndex(1)
+    qtbot.waitUntil(lambda: len(workers) == 1)
+    workers.pop().run()
+
+    assert "detector dimensions changed" in window.status_bar.currentMessage()
+    assert not window.raw_frame_range_label.text()
+    np.testing.assert_allclose(window.image_view.image, np.full((4, 4), np.log10(12)))
+
+
 @pytest.mark.parametrize(("mode", "expected"), [(0, (0, -1)), (1, (0, 0)), (2, (2, 0))])
 def test_open_raw_range_picker_and_sidecar_filter(
     qtbot, monkeypatch, tmp_path, mode, expected

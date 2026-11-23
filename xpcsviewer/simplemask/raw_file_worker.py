@@ -17,6 +17,7 @@ from xpcsviewer.simplemask.qmap import compute_qmap
 from xpcsviewer.simplemask.reader import get_reader
 from xpcsviewer.simplemask.reader.adapter import to_kernel_metadata
 from xpcsviewer.simplemask.reader.exceptions import RawDataReadError
+from xpcsviewer.simplemask.reader.formats import HdfDataset, get_format_loader
 from xpcsviewer.threading.async_workers import BaseAsyncWorker
 
 
@@ -30,6 +31,45 @@ class RawFileLoadResult(TypedDict):
     frame_count: int | None
     request_id: str
     qmap_result: tuple[dict[str, np.ndarray], dict[str, str]]
+
+
+class RawFramePreviewResult(TypedDict):
+    """Preview pixels and the zero-based, half-open range read from the source."""
+
+    source_path: str
+    request_id: int
+    begin_idx: int
+    end_idx: int
+    image: np.ndarray
+
+
+class RawFramePreviewWorker(BaseAsyncWorker):
+    """Read an average of the requested detector frames without loading geometry."""
+
+    def __init__(self, path: str, begin_idx: int, count: int, request_id: int) -> None:
+        super().__init__(f"raw_preview_{request_id}")
+        self.source_path = path
+        self.begin_idx = begin_idx
+        self.count = count
+        self.request_id = request_id
+
+    def do_work(self) -> RawFramePreviewResult:
+        """Read the requested frames up to the last available frame."""
+        self.check_cancelled()
+        loader = get_format_loader(self.source_path)
+        if not isinstance(loader, HdfDataset) or loader.frame_count is None:
+            raise ValueError("frame preview requires an HDF5 frame stack")
+        end_idx = min(self.begin_idx + self.count, loader.frame_count)
+        image = loader.get_frames_mean(
+            self.begin_idx, end_idx, check_cancelled=self.check_cancelled
+        )
+        return {
+            "source_path": self.source_path,
+            "request_id": self.request_id,
+            "begin_idx": self.begin_idx,
+            "end_idx": end_idx,
+            "image": image,
+        }
 
 
 class RawFileLoadWorker(BaseAsyncWorker):

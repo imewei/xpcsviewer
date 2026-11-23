@@ -47,7 +47,12 @@ from xpcsviewer.simplemask.drawing_tools import (
     get_tool_color,
 )
 from xpcsviewer.simplemask.pyqtgraph_mod import ImageViewROI
-from xpcsviewer.simplemask.raw_file_worker import RawFileLoadResult, RawFileLoadWorker
+from xpcsviewer.simplemask.raw_file_worker import (
+    RawFileLoadResult,
+    RawFileLoadWorker,
+    RawFramePreviewResult,
+    RawFramePreviewWorker,
+)
 from xpcsviewer.simplemask.reader.formats import HDF5_SUFFIXES
 from xpcsviewer.simplemask.simplemask_kernel import SimpleMaskKernel
 from xpcsviewer.simplemask.ui.simplemask_ui import setup_ui
@@ -96,6 +101,10 @@ class SimpleMaskWindow(QMainWindow):
     right_panel: QWidget
     right_layout: QVBoxLayout
     file_menu: QMenu
+    raw_frame_display: QComboBox
+    raw_frame_start: QSpinBox
+    raw_frame_count: QSpinBox
+    raw_frame_range_label: QLabel
 
     # Buttons (partition panel only - other controls are toolbar actions)
     btn_compute_partition: QPushButton
@@ -147,7 +156,8 @@ class SimpleMaskWindow(QMainWindow):
         self._show_qmap_overlay = False
         self._show_partition_overlay = False
         self._last_save_path: str | None = None
-        self.thread_pool = QThreadPool()
+        # Closing the window must not destroy a pool that is still reading frames.
+        self.thread_pool = QThreadPool.globalInstance()
         self._raw_file_worker: RawFileLoadWorker | None = None
         self._raw_open_committing = False
         self._pending_viewer_load: (
@@ -156,6 +166,13 @@ class SimpleMaskWindow(QMainWindow):
         self._close_after_raw_open = False
         self._raw_source_path: str | None = None
         self._raw_source_frame_count: int | None = None
+        self._raw_preview_worker: RawFramePreviewWorker | None = None
+        self._raw_preview_pending: tuple[str, int, int, int] | None = None
+        self._raw_preview_request_id = 0
+        self._raw_preview_image: np.ndarray | None = None
+        self._raw_preview_timer = QtCore.QTimer(self)
+        self._raw_preview_timer.setSingleShot(True)
+        self._raw_preview_timer.setInterval(100)
 
         self.setWindowTitle("Mask Editor")
 
@@ -202,6 +219,10 @@ class SimpleMaskWindow(QMainWindow):
         self.action_open_raw_file.triggered.connect(self._on_open_raw_file)
         self.action_apply_to_viewer.triggered.connect(self.export_mask_to_viewer)
         self.action_close.triggered.connect(self.close)
+        self.raw_frame_display.currentIndexChanged.connect(self._on_raw_display_changed)
+        self.raw_frame_start.valueChanged.connect(self._queue_raw_preview)
+        self.raw_frame_count.valueChanged.connect(self._queue_raw_preview)
+        self._raw_preview_timer.timeout.connect(self._start_raw_preview)
 
         # Toolbar Apply to Viewer button
         self.action_apply_viewer.triggered.connect(self.export_mask_to_viewer)
@@ -668,8 +689,7 @@ class SimpleMaskWindow(QMainWindow):
                 released = self._release_raw_open(request_id)
             if not released or self._pending_viewer_load is not None:
                 return
-            self._raw_source_path = result["source_path"]
-            self._raw_source_frame_count = result["frame_count"]
+            self._set_raw_source(result["source_path"], result["frame_count"])
             if result["metadata_is_placeholder"]:
                 self.status_bar.showMessage(
                     "Loaded with placeholder geometry — the file's metadata "
@@ -705,6 +725,137 @@ class SimpleMaskWindow(QMainWindow):
         if self._owns_raw_open(worker_id):
             self.status_bar.showMessage(f"Raw file load cancelled: {message}", 3000)
             self._release_raw_open(worker_id)
+
+    def _set_raw_source(self, path: str | None, frame_count: int | None) -> None:
+        self._invalidate_raw_preview()
+        self._raw_source_path = path
+        self._raw_source_frame_count = frame_count
+        with (
+            QtCore.QSignalBlocker(self.raw_frame_display),
+            QtCore.QSignalBlocker(self.raw_frame_start),
+            QtCore.QSignalBlocker(self.raw_frame_count),
+        ):
+            self.raw_frame_display.setCurrentIndex(0)
+            self.raw_frame_display.setEnabled(frame_count is not None)
+            self.raw_frame_start.setMaximum(min((frame_count or 1) - 1, 2_147_483_647))
+            self.raw_frame_start.setValue(0)
+            self.raw_frame_count.setValue(1)
+            self.raw_frame_start.setEnabled(False)
+            self.raw_frame_count.setEnabled(False)
+
+    def _invalidate_raw_preview(self) -> None:
+        self._raw_preview_request_id += 1
+        self._raw_preview_timer.stop()
+        self._raw_preview_pending = None
+        self._raw_preview_image = None
+        self.raw_frame_range_label.clear()
+        if self._raw_preview_worker is not None:
+            self._raw_preview_worker.cancel()
+
+    @Slot()
+    def _on_raw_display_changed(self) -> None:
+        raw = self.raw_frame_display.currentData() is not None
+        self.raw_frame_start.setEnabled(raw)
+        self.raw_frame_count.setEnabled(raw)
+        if not raw:
+            self._invalidate_raw_preview()
+        elif (
+            self._raw_preview_image is None
+            and self._raw_preview_pending is None
+            and not self._is_current_raw_preview(self._raw_preview_worker)
+        ):
+            self._queue_raw_preview()
+        self._refresh_display()
+
+    @Slot()
+    def _queue_raw_preview(self) -> None:
+        path = self._raw_source_path
+        if (
+            path is None
+            or self.raw_frame_display.currentData() is None
+            or self._raw_open_committing
+        ):
+            return
+        self._raw_preview_request_id += 1
+        self._raw_preview_pending = (
+            path,
+            self.raw_frame_start.value(),
+            self.raw_frame_count.value(),
+            self._raw_preview_request_id,
+        )
+        self._raw_preview_timer.start()
+        if self._raw_preview_worker is not None:
+            self._raw_preview_worker.cancel()
+
+    @Slot()
+    def _start_raw_preview(self) -> None:
+        if (
+            self._raw_preview_worker is not None
+            or self._raw_preview_pending is None
+            or self._raw_preview_timer.isActive()
+            or self._raw_open_committing
+        ):
+            return
+        worker = RawFramePreviewWorker(*self._raw_preview_pending)
+        self._raw_preview_pending = None
+        self._raw_preview_worker = worker
+        worker.signals.finished.connect(self._on_raw_preview_loaded)
+        worker.signals.error.connect(self._on_raw_preview_error)
+        worker.signals.cancelled.connect(self._on_raw_preview_cancelled)
+        self.thread_pool.start(worker)
+
+    def _is_current_raw_preview(self, worker: RawFramePreviewWorker | None) -> bool:
+        return (
+            worker is not None
+            and worker.source_path == self._raw_source_path
+            and worker.request_id == self._raw_preview_request_id
+            and self.raw_frame_display.currentData() is not None
+            and not self._raw_open_committing
+        )
+
+    @Slot(object)
+    def _on_raw_preview_loaded(self, result: RawFramePreviewResult) -> None:
+        worker = self._raw_preview_worker
+        if (
+            worker is None
+            or result["source_path"] != worker.source_path
+            or result["request_id"] != worker.request_id
+        ):
+            return
+        self._raw_preview_worker = None
+        if self._is_current_raw_preview(worker) and self._detector_image is not None:
+            image = result["image"]
+            if image.shape == self._detector_image.shape:
+                begin, last = result["begin_idx"], result["end_idx"] - 1
+                self._raw_preview_image = image
+                self.raw_frame_range_label.setText(
+                    f"Frame {begin}" if begin == last else f"Frames {begin} to {last}"
+                )
+                self._refresh_display()
+            elif self._raw_file_worker is None:
+                self.status_bar.showMessage(
+                    "Failed to preview frames: detector dimensions changed", 8000
+                )
+        self._start_raw_preview()
+
+    @Slot(str, str, str, int)
+    def _on_raw_preview_error(
+        self, worker_id: str, error_msg: str, tb_str: str, retry_count: int
+    ) -> None:
+        worker = self._raw_preview_worker
+        if worker is None or worker.worker_id != worker_id:
+            return
+        self._raw_preview_worker = None
+        if self._is_current_raw_preview(worker) and self._raw_file_worker is None:
+            self.status_bar.showMessage(f"Failed to preview frames: {error_msg}", 8000)
+        self._start_raw_preview()
+
+    @Slot(str, str)
+    def _on_raw_preview_cancelled(self, worker_id: str, message: str) -> None:
+        worker = self._raw_preview_worker
+        if worker is not None and worker.worker_id == worker_id:
+            self._raw_preview_worker = None
+            self._start_raw_preview()
 
     def _ensure_mask_overlay_visible(self) -> None:
         """Enable mask overlay and sync all toggle states.
@@ -985,6 +1136,22 @@ class SimpleMaskWindow(QMainWindow):
         if self._detector_image is None:
             return
 
+        channel = self.raw_frame_display.currentData()
+        if channel is not None and self._raw_preview_image is not None:
+            display = np.log10(self._raw_preview_image + 1)
+            if (
+                channel == "masked"
+                and self.kernel is not None
+                and self.kernel.mask is not None
+            ):
+                display = self._create_masked_display(display, self.kernel.mask)
+                self.image_view.setImage(
+                    display, autoLevels=False, autoRange=False, levels=(0, 1)
+                )
+            else:
+                self.image_view.setImage(display, autoLevels=True, autoRange=False)
+            return
+
         # Base image (log scale)
         log_image = np.log10(self._detector_image + 1)
 
@@ -1127,7 +1294,7 @@ class SimpleMaskWindow(QMainWindow):
             self._pending_viewer_load = detector_image, metadata
             return
         self._cancel_raw_open()
-        self._raw_source_path = self._raw_source_frame_count = None
+        self._set_raw_source(None, None)
         if detector_image is None:
             if self.kernel is not None:
                 self.kernel.clear_data()
@@ -1344,6 +1511,7 @@ class SimpleMaskWindow(QMainWindow):
                 return
 
         self._cancel_raw_open()
+        self.raw_frame_display.setCurrentIndex(0)
 
         # Clear parent reference to allow garbage collection
         if self.parent_viewer is not None:
