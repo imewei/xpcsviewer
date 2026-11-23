@@ -149,6 +149,10 @@ class SimpleMaskWindow(QMainWindow):
         self._last_save_path: str | None = None
         self.thread_pool = QThreadPool()
         self._raw_file_worker: RawFileLoadWorker | None = None
+        self._raw_open_committing = False
+        self._pending_viewer_load: (
+            tuple[NDArray[np.float64] | None, dict[str, Any] | None] | None
+        ) = None
         self._raw_source_path: str | None = None
         self._raw_source_frame_count: int | None = None
 
@@ -489,7 +493,7 @@ class SimpleMaskWindow(QMainWindow):
 
     def _on_open_raw_file(self) -> None:
         """Choose an HDF5 detector file and its averaging range."""
-        if self._raw_file_worker is not None:
+        if not self._can_start_raw_open():
             return
 
         last_path = self._raw_source_path or self._last_save_path
@@ -573,7 +577,7 @@ class SimpleMaskWindow(QMainWindow):
         self, file_path: str, beamline: str, *, begin_idx: int = 0, num_frames: int = -1
     ) -> None:
         """Read a candidate raw detector image on the thread pool."""
-        if self._raw_file_worker is not None or not self._validate_raw_path(file_path):
+        if not self._can_start_raw_open() or not self._validate_raw_path(file_path):
             return
 
         if self.has_unsaved_changes():
@@ -586,7 +590,7 @@ class SimpleMaskWindow(QMainWindow):
             )
             if (
                 reply != QMessageBox.StandardButton.Yes
-                or self._raw_file_worker is not None
+                or not self._can_start_raw_open()
             ):
                 return
 
@@ -595,15 +599,25 @@ class SimpleMaskWindow(QMainWindow):
         )
         self._raw_file_worker = worker
         self._set_raw_open_busy(True)
+        if not self._owns_raw_open(worker.worker_id):
+            return
         self.status_bar.showMessage(f"Loading {Path(file_path).name}...")
         worker.signals.finished.connect(self._on_raw_file_loaded)
         worker.signals.error.connect(self._on_raw_file_error)
         worker.signals.cancelled.connect(self._on_raw_file_cancelled)
-        self.thread_pool.start(worker)
+        if self._owns_raw_open(worker.worker_id):
+            self.thread_pool.start(worker)
+
+    def _can_start_raw_open(self) -> bool:
+        return (
+            not self._raw_open_committing
+            and self._raw_file_worker is None
+            and self.action_open_raw_file.isEnabled()
+        )
 
     def _set_raw_open_busy(self, busy: bool) -> None:
+        worker = self._raw_file_worker
         for control in (
-            self.action_open_raw_file,
             self.action_load_mask,
             self.action_undo,
             self.action_redo,
@@ -612,7 +626,11 @@ class SimpleMaskWindow(QMainWindow):
             self.action_apply,
             *self.tool_actions.values(),
             self.image_view,
+            # Enabling Open can synchronously start a new request.
+            self.action_open_raw_file,
         ):
+            if self._raw_file_worker is not worker:
+                return
             control.setEnabled(not busy)
 
     def _owns_raw_open(self, request_id: str) -> bool:
@@ -635,15 +653,19 @@ class SimpleMaskWindow(QMainWindow):
     def _on_raw_file_loaded(self, result: RawFileLoadResult) -> None:
         """Handle a completed RawFileLoadWorker result on the GUI thread."""
         request_id = result["request_id"]
-        if not self._owns_raw_open(request_id):
+        if self._raw_open_committing or not self._owns_raw_open(request_id):
             return
+        self._raw_open_committing = True
         try:
-            self._install_detector_image(
-                result["scattering"],
-                result["metadata"],
-                qmap_result=result["qmap_result"],
-            )
-            if not self._owns_raw_open(request_id):
+            try:
+                self._install_detector_image(
+                    result["scattering"],
+                    result["metadata"],
+                    qmap_result=result["qmap_result"],
+                )
+            finally:
+                released = self._release_raw_open(request_id)
+            if not released or self._pending_viewer_load is not None:
                 return
             self._raw_source_path = result["source_path"]
             self._raw_source_frame_count = result["frame_count"]
@@ -656,22 +678,28 @@ class SimpleMaskWindow(QMainWindow):
             else:
                 self.status_bar.showMessage("Raw file loaded", 3000)
         finally:
-            self._release_raw_open(request_id)
+            self._raw_open_committing = False
+            pending = self._pending_viewer_load
+            self._pending_viewer_load = None
+            if pending is not None:
+                self.load_from_viewer(*pending)
 
     @Slot(str, str, str, int)
     def _on_raw_file_error(
         self, worker_id: str, error_msg: str, tb_str: str, retry_count: int
     ) -> None:
         """Handle a failed RawFileLoadWorker on the GUI thread."""
-        if not self._release_raw_open(worker_id):
+        if not self._owns_raw_open(worker_id):
             return
         logger.error(f"Raw file load failed: {error_msg}\n{tb_str}")
         self.status_bar.showMessage(f"Failed to load raw file: {error_msg}", 8000)
+        self._release_raw_open(worker_id)
 
     @Slot(str, str)
     def _on_raw_file_cancelled(self, worker_id: str, message: str) -> None:
-        if self._release_raw_open(worker_id):
+        if self._owns_raw_open(worker_id):
             self.status_bar.showMessage(f"Raw file load cancelled: {message}", 3000)
+            self._release_raw_open(worker_id)
 
     def _ensure_mask_overlay_visible(self) -> None:
         """Enable mask overlay and sync all toggle states.
@@ -1090,6 +1118,9 @@ class SimpleMaskWindow(QMainWindow):
                 - energy: X-ray energy in keV
                 - shape: Detector shape (height, width)
         """
+        if self._raw_open_committing:
+            self._pending_viewer_load = detector_image, metadata
+            return
         self._cancel_raw_open()
         self._raw_source_path = self._raw_source_frame_count = None
         if detector_image is None:

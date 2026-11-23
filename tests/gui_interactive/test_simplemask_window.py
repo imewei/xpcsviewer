@@ -265,8 +265,9 @@ def test_raw_open_close_retires_request(raw_editor, tmp_path):
     np.testing.assert_array_equal(window.kernel.detector_image, np.full((4, 4), 11))
 
 
-def test_raw_open_title_change_can_install_viewer_image(
-    raw_editor, monkeypatch, tmp_path
+@pytest.mark.parametrize("notification", ["title", "overlay", "enabled"])
+def test_raw_open_notifications_can_install_viewer_image(
+    raw_editor, monkeypatch, tmp_path, notification
 ):
     window, workers, _ = raw_editor
     _mask_one_pixel(window)
@@ -275,21 +276,55 @@ def test_raw_open_title_change_can_install_viewer_image(
     viewer_metadata = window.kernel.metadata.copy()
     yes = QtWidgets.QMessageBox.StandardButton.Yes
     monkeypatch.setattr(QtWidgets.QMessageBox, "question", lambda *args: yes)
+    window._ensure_mask_overlay_visible()
+    window.load_from_raw_file(candidate, "APS_8IDI")
+    signal = {
+        "title": window.windowTitleChanged,
+        "overlay": window.action_toggle_mask.toggled,
+        "enabled": window.action_open_raw_file.changed,
+    }[notification]
+    messages = []
+    window.status_bar.messageChanged.connect(messages.append)
 
-    def load_viewer_image(title):
-        window.windowTitleChanged.disconnect(load_viewer_image)
+    def load_viewer_image(*args):
+        signal.disconnect(load_viewer_image)
+        window.load_from_viewer(np.full((2, 2), 7.0), viewer_metadata)
         window.load_from_viewer(viewer_image, viewer_metadata)
 
-    window.windowTitleChanged.connect(load_viewer_image)
-    window.load_from_raw_file(candidate, "APS_8IDI")
+    signal.connect(load_viewer_image)
     workers.pop().run()
 
     np.testing.assert_array_equal(window.kernel.detector_image, viewer_image)
     np.testing.assert_array_equal(window.image_view.image, np.log10(viewer_image + 1))
     assert window._raw_source_path is None
     assert window._raw_source_frame_count is None
+    assert "Raw file loaded" not in messages
+    assert "Loaded 2x2 detector image" not in messages
     assert window.status_bar.currentMessage() == "Loaded 5x3 detector image"
+    assert window.info_label.text().startswith("Image: 5 x 3 pixels")
     assert window.action_open_raw_file.isEnabled()
+    assert window.action_load_mask.isEnabled()
+
+
+def test_raw_open_error_release_can_start_new_request(raw_editor, tmp_path):
+    window, workers, source = raw_editor
+    failed = str(tmp_path / "failed.h5")
+    window.load_from_raw_file(failed, "APS_8IDI")
+    stale = workers.pop()
+
+    def open_new_raw_file():
+        if window.action_open_raw_file.isEnabled():
+            window.action_open_raw_file.changed.disconnect(open_new_raw_file)
+            window.load_from_raw_file(source, "APS_8IDI")
+
+    window.action_open_raw_file.changed.connect(open_new_raw_file)
+    stale.signals.error.emit(stale.worker_id, "read error", "", 0)
+
+    assert window._raw_file_worker is workers.pop()
+    assert not window.action_open_raw_file.isEnabled()
+    assert not window.action_load_mask.isEnabled()
+    assert not window.action_apply.isEnabled()
+    assert window.status_bar.currentMessage() == "Loading first.h5..."
 
 
 def test_raw_open_recognizes_real_unsaved_mask_edits(raw_editor, monkeypatch, tmp_path):
