@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from ..base_reader import FileReader
-from ..formats import get_format_loader
+from ..formats import HdfDataset, get_format_loader
 from ..metadata import read_nexus_metadata
 
 # Metadata key -> NeXus HDF5 path.
@@ -93,6 +93,11 @@ class APS8IDIReader(FileReader):
         # once get_scattering() runs, so this value only matters if
         # something reads .shape before prepare_data() is called.
         self.shape = tuple(self.loader.det_size)  # type: ignore[assignment]
+
+    @property
+    def frame_count(self) -> int | None:
+        """Return the number of frames in an HDF5 stack."""
+        return self.loader.frame_count if isinstance(self.loader, HdfDataset) else None
 
     def get_scattering(self, **kwargs: Any) -> Any:
         """Get scattering data from the loader.

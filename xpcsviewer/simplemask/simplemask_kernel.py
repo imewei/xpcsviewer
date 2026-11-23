@@ -111,6 +111,8 @@ class SimpleMaskKernel:
         self,
         detector_image: np.ndarray,
         metadata: dict[str, Any],
+        *,
+        qmap_result: tuple[dict[str, np.ndarray], dict[str, str]] | None = None,
     ) -> bool:
         """Load detector data and initialize mask.
 
@@ -123,15 +125,15 @@ class SimpleMaskKernel:
                 - pix_dim: Pixel size (mm)
                 - energy: X-ray energy (keV)
                 - shape: Detector shape (height, width)
+            qmap_result: Precomputed Q-map and units for the supplied geometry.
 
         Returns:
             True if successful
         """
-        self.clear_data()
-        self.detector_image = detector_image.copy()
-        self.shape = detector_image.shape
-        self.metadata = metadata.copy()
-        self.metadata["shape"] = self.shape
+        image = detector_image.copy()
+        shape = image.shape
+        metadata = metadata.copy()
+        metadata["shape"] = shape
 
         # Fill in defaults for missing geometry parameters so Q-map
         # computation can proceed even when HDF5 metadata is incomplete.
@@ -140,25 +142,28 @@ class SimpleMaskKernel:
             "pix_dim": 0.075,
             "energy": 10.0,
             "det_dist": 5000.0,
-            "bcx": self.shape[1] / 2.0,
-            "bcy": self.shape[0] / 2.0,
+            "bcx": shape[1] / 2.0,
+            "bcy": shape[0] / 2.0,
         }
         for key, default in _geometry_defaults.items():
-            if self.metadata.get(key) is None:
+            if metadata.get(key) is None:
                 logger.info(
                     f"Geometry parameter '{key}' missing from HDF5 metadata, "
                     f"using default: {default}"
                 )
-                self.metadata[key] = default
+                metadata[key] = default
 
-        # Initialize mask
-        self.mask = np.ones(self.shape, dtype=bool)
+        mask = np.ones(shape, dtype=bool)
+        mask_kernel = MaskAssemble(shape, image)
+        self.clear_data()
+        self.detector_image, self.shape, self.metadata = image, shape, metadata
+        self.mask = mask
+        if qmap_result is None:
+            self._apply_geometry(metadata)
+        else:
+            self.qmap, self.qmap_unit = qmap_result
 
-        # Compute Q-map
-        self._apply_geometry(self.metadata)
-
-        # Initialize mask assembly
-        self.mask_kernel = MaskAssemble(self.shape, self.detector_image)
+        self.mask_kernel = mask_kernel
         self.mask_kernel.update_qmap(self.qmap)
 
         return True

@@ -7,6 +7,7 @@ with XPCS Viewer.
 import logging
 from pathlib import Path
 from typing import Any, Literal
+from uuid import uuid4
 
 import h5py
 import numpy as np
@@ -18,8 +19,11 @@ from xpcsviewer.fileIO.qmap_utils import Q_UNIT_DISPLAY
 # Qt imports via compatibility layer
 from xpcsviewer.gui.qt_compat import (
     QAction,
+    QComboBox,
+    QDialog,
     QDoubleSpinBox,
     QFileDialog,
+    QFormLayout,
     QLabel,
     QMainWindow,
     QMenu,
@@ -28,11 +32,14 @@ from xpcsviewer.gui.qt_compat import (
     QSpinBox,
     QSplitter,
     QStatusBar,
+    QtCore,
     QThreadPool,
     QToolBar,
+    QtWidgets,
     QVBoxLayout,
     QWidget,
     Signal,
+    Slot,
 )
 from xpcsviewer.simplemask.drawing_tools import (
     DRAWING_TOOLS,
@@ -40,11 +47,28 @@ from xpcsviewer.simplemask.drawing_tools import (
     get_tool_color,
 )
 from xpcsviewer.simplemask.pyqtgraph_mod import ImageViewROI
-from xpcsviewer.simplemask.raw_file_worker import RawFileLoadWorker
+from xpcsviewer.simplemask.raw_file_worker import RawFileLoadResult, RawFileLoadWorker
+from xpcsviewer.simplemask.reader.formats import HDF5_SUFFIXES
 from xpcsviewer.simplemask.simplemask_kernel import SimpleMaskKernel
 from xpcsviewer.simplemask.ui.simplemask_ui import setup_ui
 
 logger = logging.getLogger(__name__)
+
+
+def _is_raw_file(filename: str) -> bool:
+    name = Path(filename).name.casefold()
+    return name.endswith(HDF5_SUFFIXES) and not name.endswith("_metadata.hdf")
+
+
+class _RawFileFilter(QtCore.QSortFilterProxyModel):
+    def filterAcceptsRow(
+        self, source_row: int, source_parent: QtCore.QModelIndex
+    ) -> bool:
+        model = self.sourceModel()
+        if not isinstance(model, QtWidgets.QFileSystemModel):
+            return False
+        index = model.index(source_row, 0, source_parent)
+        return model.isDir(index) or _is_raw_file(model.fileName(index))
 
 
 class SimpleMaskWindow(QMainWindow):
@@ -125,6 +149,8 @@ class SimpleMaskWindow(QMainWindow):
         self._last_save_path: str | None = None
         self.thread_pool = QThreadPool()
         self._raw_file_worker: RawFileLoadWorker | None = None
+        self._raw_source_path: str | None = None
+        self._raw_source_frame_count: int | None = None
 
         self.setWindowTitle("Mask Editor")
 
@@ -203,6 +229,8 @@ class SimpleMaskWindow(QMainWindow):
         Args:
             tool_key: Key of selected tool from DRAWING_TOOLS
         """
+        if self._raw_file_worker is not None:
+            return
         if self.kernel is None or not self.kernel.is_ready():
             self.status_bar.showMessage("Load data first before drawing")
             return
@@ -232,6 +260,8 @@ class SimpleMaskWindow(QMainWindow):
 
     def _on_eraser_selected(self) -> None:
         """Handle eraser tool selection."""
+        if self._raw_file_worker is not None:
+            return
         if self.kernel is None or not self.kernel.is_ready():
             self.status_bar.showMessage("Load data first before drawing")
             return
@@ -275,6 +305,8 @@ class SimpleMaskWindow(QMainWindow):
 
     def _on_apply_drawing(self) -> None:
         """Apply all pending drawings to the mask."""
+        if self._raw_file_worker is not None:
+            return
         if self.kernel is None or not self.kernel.is_ready():
             self.status_bar.showMessage("No data loaded")
             return
@@ -299,12 +331,17 @@ class SimpleMaskWindow(QMainWindow):
         Args:
             action: Action type
         """
+        if self._raw_file_worker is not None:
+            return
         if self.kernel is None:
             logger.debug(f"_on_mask_action({action}): No kernel loaded")
             return
 
         logger.debug(f"Mask action: {action}")
+        previous_mask = self.kernel.mask
         self.kernel.mask_action(action)
+        if not np.array_equal(previous_mask, self.kernel.mask):
+            self.mark_unsaved()
 
         if action == "reset":
             # After reset, mask returns to initial (all-True) state;
@@ -312,7 +349,6 @@ class SimpleMaskWindow(QMainWindow):
             self._show_mask_overlay = False
             self.action_toggle_mask.setChecked(False)
             self.action_toggle_mask.setText("Show Mask")
-            self.mark_saved()
             self._refresh_mask_display()
             self.status_bar.showMessage("Mask reset to initial state")
             logger.info("Mask reset to initial state")
@@ -360,6 +396,8 @@ class SimpleMaskWindow(QMainWindow):
 
     def _on_load_mask(self) -> None:
         """Handle load mask action with file dialog and validation."""
+        if self._raw_file_worker is not None:
+            return
         if self.kernel is None or not self.kernel.is_ready():
             self.status_bar.showMessage("Load data first before loading a mask")
             return
@@ -378,12 +416,18 @@ class SimpleMaskWindow(QMainWindow):
             return
 
         # Validate mask dimensions before loading
-        if not self._validate_mask_dimensions(file_path):
+        if (
+            not self._validate_mask_dimensions(file_path)
+            or self._raw_file_worker is not None
+        ):
             return
 
         # Load the mask
+        previous_mask = self.kernel.mask
         success = self.kernel.load_mask(file_path)
         if success:
+            if not np.array_equal(previous_mask, self.kernel.mask):
+                self.mark_unsaved()
             self._last_save_path = file_path
             self._refresh_mask_display()
             self.status_bar.showMessage(f"Loaded mask from {Path(file_path).name}")
@@ -444,63 +488,165 @@ class SimpleMaskWindow(QMainWindow):
         return True
 
     def _on_open_raw_file(self) -> None:
-        """Handle Open Raw File action: file dialog, then background load."""
-        start_path = self._last_save_path or str(Path.home())
-        file_path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Open Raw File",
-            start_path,
-            "HDF5 Files (*.h5 *.hdf5 *.hdf);;All Files (*)",
+        """Choose an HDF5 detector file and its averaging range."""
+        if self._raw_file_worker is not None:
+            return
+
+        last_path = self._raw_source_path or self._last_save_path
+        start_path = Path(last_path).parent if last_path else Path.home()
+        dialog = QFileDialog(self, "Open Raw File", str(start_path))
+        dialog.setOption(QFileDialog.Option.DontUseNativeDialog)
+        dialog.setFileMode(QFileDialog.FileMode.ExistingFile)
+        dialog.setNameFilter(
+            f"HDF5 Files ({' '.join(f'*{suffix}' for suffix in HDF5_SUFFIXES)})"
         )
-        if not file_path:
+        dialog.setProxyModel(_RawFileFilter(dialog))
+        accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        selected = dialog.selectedFiles()
+        dialog.deleteLater()
+        if not accepted or not selected or not self._validate_raw_path(selected[0]):
             return
 
-        # Only APS_8IDI exists in this PR; PR2 adds a beamline selector
-        # once APS_9IDD/xpcs_result exist to choose between.
-        self.load_from_raw_file(file_path, "APS_8IDI")
+        frame_range = self._choose_raw_frame_range()
+        if frame_range is not None:
+            begin_idx, num_frames = frame_range
+            self.load_from_raw_file(
+                selected[0], "APS_8IDI", begin_idx=begin_idx, num_frames=num_frames
+            )
 
-    def load_from_raw_file(self, file_path: str, beamline: str) -> None:
-        """Load a raw detector file directly, independent of the main Viewer.
+    def _validate_raw_path(self, file_path: str) -> bool:
+        if _is_raw_file(file_path):
+            return True
+        self.status_bar.showMessage(
+            f"Failed to load raw file: select an HDF5 detector file ({Path(file_path).name})",
+            8000,
+        )
+        return False
 
-        The public entry point named in the design spec: submits a
-        RawFileLoadWorker to the thread pool for ``file_path``.
+    def _choose_raw_frame_range(self) -> tuple[int, int] | None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Average Detector Frames")
+        form = QFormLayout(dialog)
+        mode = QComboBox(dialog)
+        for label, count in (
+            ("Representative sample", -1),
+            ("All frames", 0),
+            ("Custom", None),
+        ):
+            mode.addItem(label, count)
+        start = QSpinBox(dialog)
+        count = QSpinBox(dialog)
+        for control in (start, count):
+            control.setRange(0, 2_147_483_647)
+            control.setEnabled(False)
+        count.setValue(1)
 
-        No-ops if a load is already in flight (``action_open_raw_file`` is
-        disabled exactly while one is running) rather than tracking and
-        discarding a stale second worker's result -- the simplest way to
-        satisfy the spec's "ignore a stale in-flight request" requirement
-        is to never let a second one start.
-        """
-        if not self.action_open_raw_file.isEnabled():
-            logger.debug("Raw file load already in progress; ignoring new request")
+        def set_custom_enabled() -> None:
+            custom = mode.currentData() is None
+            start.setEnabled(custom)
+            count.setEnabled(custom)
+
+        mode.currentIndexChanged.connect(set_custom_enabled)
+        form.addRow("Frames", mode)
+        form.addRow("Start frame (zero-based)", start)
+        form.addRow("Frame count (0 for remaining)", count)
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok
+            | QtWidgets.QDialogButtonBox.StandardButton.Cancel,
+            parent=dialog,
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        form.addRow(buttons)
+
+        accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        preset_count = mode.currentData()
+        frame_range = (
+            (start.value(), count.value())
+            if preset_count is None
+            else (0, preset_count)
+        )
+        dialog.deleteLater()
+        return frame_range if accepted else None
+
+    def load_from_raw_file(
+        self, file_path: str, beamline: str, *, begin_idx: int = 0, num_frames: int = -1
+    ) -> None:
+        """Read a candidate raw detector image on the thread pool."""
+        if self._raw_file_worker is not None or not self._validate_raw_path(file_path):
             return
 
-        self.action_open_raw_file.setEnabled(False)
-        self.status_bar.showMessage(f"Loading {Path(file_path).name}...")
+        if self.has_unsaved_changes():
+            reply = QMessageBox.question(
+                self,
+                "Unsaved Changes",
+                "You have unsaved mask changes. Replace this image and discard its mask?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if (
+                reply != QMessageBox.StandardButton.Yes
+                or self._raw_file_worker is not None
+            ):
+                return
 
-        worker = RawFileLoadWorker(file_path, beamline)
+        worker = RawFileLoadWorker(
+            file_path, beamline, uuid4().hex, begin_idx=begin_idx, num_frames=num_frames
+        )
         self._raw_file_worker = worker
-
-        # Disconnect any previously connected slot before reconnecting
-        # (matches the guard in xpcs_viewer.py's avg-worker submission,
-        # preventing lambda/slot accumulation on repeated clicks).
-        try:
-            worker.signals.finished.disconnect(self._on_raw_file_loaded)
-        except (RuntimeError, TypeError):
-            pass
-        try:
-            worker.signals.error.disconnect(self._on_raw_file_error)
-        except (RuntimeError, TypeError):
-            pass
+        self._set_raw_open_busy(True)
+        self.status_bar.showMessage(f"Loading {Path(file_path).name}...")
         worker.signals.finished.connect(self._on_raw_file_loaded)
         worker.signals.error.connect(self._on_raw_file_error)
-
+        worker.signals.cancelled.connect(self._on_raw_file_cancelled)
         self.thread_pool.start(worker)
 
-    def _on_raw_file_loaded(self, result: dict[str, Any]) -> None:
+    def _set_raw_open_busy(self, busy: bool) -> None:
+        for control in (
+            self.action_open_raw_file,
+            self.action_load_mask,
+            self.action_undo,
+            self.action_redo,
+            self.action_reset,
+            self.action_eraser,
+            self.action_apply,
+            *self.tool_actions.values(),
+            self.image_view,
+        ):
+            control.setEnabled(not busy)
+
+    def _owns_raw_open(self, request_id: str) -> bool:
+        worker = self._raw_file_worker
+        return worker is not None and worker.worker_id == request_id
+
+    def _release_raw_open(self, request_id: str) -> bool:
+        if not self._owns_raw_open(request_id):
+            return False
+        self._raw_file_worker = None
+        self._set_raw_open_busy(False)
+        return True
+
+    def _cancel_raw_open(self) -> None:
+        worker = self._raw_file_worker
+        if worker is not None and self._release_raw_open(worker.worker_id):
+            worker.cancel()
+
+    @Slot(object)
+    def _on_raw_file_loaded(self, result: RawFileLoadResult) -> None:
         """Handle a completed RawFileLoadWorker result on the GUI thread."""
-        self.action_open_raw_file.setEnabled(True)
-        self.load_from_viewer(result["scattering"], result["metadata"])
+        request_id = result["request_id"]
+        if not self._owns_raw_open(request_id):
+            return
+        try:
+            self._install_detector_image(
+                result["scattering"],
+                result["metadata"],
+                qmap_result=result["qmap_result"],
+            )
+            self._raw_source_path = result["source_path"]
+            self._raw_source_frame_count = result["frame_count"]
+        finally:
+            self._release_raw_open(request_id)
         if result["metadata_is_placeholder"]:
             self.status_bar.showMessage(
                 "Loaded with placeholder geometry — the file's metadata "
@@ -510,13 +656,20 @@ class SimpleMaskWindow(QMainWindow):
         else:
             self.status_bar.showMessage("Raw file loaded", 3000)
 
+    @Slot(str, str, str, int)
     def _on_raw_file_error(
         self, worker_id: str, error_msg: str, tb_str: str, retry_count: int
     ) -> None:
         """Handle a failed RawFileLoadWorker on the GUI thread."""
-        self.action_open_raw_file.setEnabled(True)
+        if not self._release_raw_open(worker_id):
+            return
         logger.error(f"Raw file load failed: {error_msg}\n{tb_str}")
         self.status_bar.showMessage(f"Failed to load raw file: {error_msg}", 8000)
+
+    @Slot(str, str)
+    def _on_raw_file_cancelled(self, worker_id: str, message: str) -> None:
+        if self._release_raw_open(worker_id):
+            self.status_bar.showMessage(f"Raw file load cancelled: {message}", 3000)
 
     def _ensure_mask_overlay_visible(self) -> None:
         """Enable mask overlay and sync all toggle states.
@@ -935,18 +1088,14 @@ class SimpleMaskWindow(QMainWindow):
                 - energy: X-ray energy in keV
                 - shape: Detector shape (height, width)
         """
+        self._cancel_raw_open()
+        self._raw_source_path = self._raw_source_frame_count = None
         if detector_image is None:
             if self.kernel is not None:
                 self.kernel.clear_data()
             self._detector_image = None
             self._committed_geometry.clear()
-            self._current_tool = None
-            self._sync_tool_buttons(None)
-            self._show_mask_overlay = self._show_qmap_overlay = False
-            self.action_toggle_mask.setChecked(False)
-            self.action_toggle_mask.setText("Show Mask")
-            self.action_toggle_qmap.setChecked(False)
-            self.action_toggle_qmap.setText("Show Q-Map")
+            self._reset_image_controls()
             self.btn_compute_partition.setEnabled(False)
             self.btn_find_beam_center.setEnabled(False)
             self._refresh_partition_controls()
@@ -961,8 +1110,15 @@ class SimpleMaskWindow(QMainWindow):
             self.status_bar.showMessage("No data - load file in XPCS Viewer first")
             return
 
-        self._detector_image = detector_image
+        self._install_detector_image(detector_image, metadata or {})
 
+    def _install_detector_image(
+        self,
+        detector_image: NDArray[np.float64],
+        metadata: dict[str, Any],
+        *,
+        qmap_result: tuple[dict[str, np.ndarray], dict[str, str]] | None = None,
+    ) -> None:
         # Initialize kernel with image view handle
         if self.kernel is None:
             self.kernel = SimpleMaskKernel(
@@ -970,12 +1126,17 @@ class SimpleMaskWindow(QMainWindow):
             )
 
         try:
-            success = self.kernel.read_data(detector_image, metadata or {})
+            success = self.kernel.read_data(
+                detector_image, metadata, qmap_result=qmap_result
+            )
         except ValueError as e:
+            if qmap_result is not None:
+                raise
             # Handle missing geometry parameters gracefully
             logger.warning(f"Failed to initialize Q-map: {e}")
 
             # Display the image anyway
+            self._detector_image = detector_image
             self._display_image(detector_image)
 
             # Show info about missing parameters
@@ -1000,7 +1161,10 @@ class SimpleMaskWindow(QMainWindow):
 
         if success:
             logger.info(f"Loaded detector image with shape {detector_image.shape}")
-            self._unsaved_changes = False
+            self._detector_image = detector_image
+            self._reset_image_controls()
+            self.image_view.remove_rois()
+            self.mark_saved()
 
             # Display the image
             self._display_image(detector_image)
@@ -1015,6 +1179,20 @@ class SimpleMaskWindow(QMainWindow):
 
             # Populate geometry spinboxes from metadata
             self._update_geometry_spinboxes()
+
+    def _reset_image_controls(self) -> None:
+        self._current_tool = None
+        self._sync_tool_buttons(None)
+        self._show_mask_overlay = False
+        self._show_qmap_overlay = False
+        self._show_partition_overlay = False
+        for control, label in (
+            (self.action_toggle_mask, "Show Mask"),
+            (self.action_toggle_qmap, "Show Q-Map"),
+            (self.btn_toggle_partition, "Show Partition"),
+        ):
+            control.setChecked(False)
+            control.setText(label)
 
     def _display_image(self, image: NDArray[np.float64]) -> None:
         """Display detector image in the ImageView.
@@ -1118,6 +1296,8 @@ class SimpleMaskWindow(QMainWindow):
             if reply == QMessageBox.StandardButton.No:
                 event.ignore()
                 return
+
+        self._cancel_raw_open()
 
         # Clear parent reference to allow garbage collection
         if self.parent_viewer is not None:

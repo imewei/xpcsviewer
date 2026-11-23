@@ -4,13 +4,16 @@ Tests the SimpleMask window launch, data loading, and basic interactions
 from the XPCS Viewer.
 """
 
+from types import SimpleNamespace
 from unittest.mock import patch
 
+import h5py
 import numpy as np
 import pytest
 from PySide6 import QtCore, QtWidgets
 
 from xpcsviewer.simplemask import SimpleMaskWindow, simplemask_kernel
+from xpcsviewer.simplemask.reader.beamlines.aps_8idi import METADATA_KEYMAPS
 
 
 @pytest.fixture
@@ -35,6 +38,268 @@ def partition_window(qtbot):
     window.btn_compute_partition.click()
     assert window.kernel.new_partition is not None
     return window
+
+
+def _write_raw_scan(path, image, distance=5.0):
+    with h5py.File(path, "w") as file:
+        file["/entry/data/data"] = image
+        for field, value in {
+            "energy": 10.0,
+            "detector_distance": distance,
+            "x_pixel_size": 75e-6,
+            "y_pixel_size": 75e-6,
+            "ccdx": 0.0,
+            "ccdy": 0.0,
+            "ccdx0": 0.0,
+            "ccdy0": 0.0,
+            "bcx0": 1.5,
+            "bcy0": 1.5,
+        }.items():
+            file[METADATA_KEYMAPS[field]] = value
+    return str(path)
+
+
+@pytest.fixture
+def raw_editor(qtbot, tmp_path):
+    window = SimpleMaskWindow()
+    qtbot.addWidget(window)
+    workers = []
+    window.thread_pool = SimpleNamespace(start=workers.append)
+    source = _write_raw_scan(tmp_path / "first.h5", np.full((2, 4, 4), 11))
+    window.load_from_raw_file(source, "APS_8IDI")
+    workers.pop().run()
+    return window, workers, source
+
+
+def _mask_one_pixel(window):
+    invalid = np.zeros((4, 4), dtype=bool)
+    invalid[0, 1] = True
+    window.kernel.mask_kernel.evaluate("mask_draw", arr=invalid)
+    window.kernel.mask_apply("mask_draw")
+    assert not window.kernel.mask[0, 1]
+    window.mark_unsaved()
+
+
+@pytest.mark.parametrize(("mode", "expected"), [(0, (0, -1)), (1, (0, 0)), (2, (2, 0))])
+def test_open_raw_range_picker_and_sidecar_filter(
+    qtbot, monkeypatch, tmp_path, mode, expected
+):
+    window = SimpleMaskWindow()
+    qtbot.addWidget(window)
+    sidecar = str(tmp_path / "scan_metadata.hdf")
+    unsupported = str(tmp_path / "scan.raw")
+    supported = str(tmp_path / "scan.H5")
+    for filename in (sidecar, unsupported, supported):
+        with open(filename, "wb"):
+            pass
+    subdirectory = tmp_path / "subdirectory"
+    subdirectory.mkdir()
+
+    def choose_file(dialog):
+        assert dialog.testOption(QtWidgets.QFileDialog.Option.DontUseNativeDialog)
+        proxy = dialog.proxyModel()
+        model = proxy.sourceModel()
+        dialog.setDirectory(str(tmp_path))
+        qtbot.waitUntil(lambda: model.index(supported).isValid())
+        assert proxy.mapFromSource(model.index(supported)).isValid()
+        assert proxy.mapFromSource(model.index(str(subdirectory))).isValid()
+        assert not proxy.mapFromSource(model.index(sidecar)).isValid()
+        assert not proxy.mapFromSource(model.index(unsupported)).isValid()
+        dialog.selectFile(supported)
+        return QtWidgets.QDialog.DialogCode.Accepted
+
+    def choose_range(dialog):
+        choices = dialog.findChild(QtWidgets.QComboBox)
+        assert [choices.itemText(i) for i in range(choices.count())] == [
+            "Representative sample",
+            "All frames",
+            "Custom",
+        ]
+        assert choices.currentIndex() == 0
+        choices.setCurrentIndex(mode)
+        start, count = dialog.findChildren(QtWidgets.QSpinBox)
+        assert start.isEnabled() == count.isEnabled() == (mode == 2)
+        assert start.minimum() == count.minimum() == 0
+        if mode == 2:
+            start.setValue(2)
+            count.setValue(0)
+        return QtWidgets.QDialog.DialogCode.Accepted
+
+    workers = []
+    window.thread_pool = SimpleNamespace(start=workers.append)
+    for invalid in (sidecar, unsupported):
+        window.load_from_raw_file(invalid, "APS_8IDI")
+        assert not workers
+        assert "Failed to load raw file:" in window.status_bar.currentMessage()
+
+    monkeypatch.setattr(QtWidgets.QFileDialog, "exec", choose_file)
+    monkeypatch.setattr(QtWidgets.QDialog, "exec", choose_range)
+    with patch.object(window, "load_from_raw_file") as submit:
+        window._on_open_raw_file()
+    submit.assert_called_once_with(
+        supported, "APS_8IDI", begin_idx=expected[0], num_frames=expected[1]
+    )
+
+
+def test_open_failure_or_decline_preserves_unsaved_mask(
+    raw_editor, monkeypatch, tmp_path
+):
+    window, workers, source = raw_editor
+    _mask_one_pixel(window)
+    old_mask = window.kernel.mask.copy()
+    candidate = _write_raw_scan(tmp_path / "second.h5", np.full((4, 4), 22))
+    no = QtWidgets.QMessageBox.StandardButton.No
+    yes = QtWidgets.QMessageBox.StandardButton.Yes
+    monkeypatch.setattr(QtWidgets.QMessageBox, "question", lambda *args: no)
+    window.load_from_raw_file(candidate, "APS_8IDI")
+    assert not workers
+
+    monkeypatch.setattr(QtWidgets.QMessageBox, "question", lambda *args: yes)
+    window.load_from_raw_file(candidate, "APS_8IDI")
+    worker = workers.pop()
+    assert not window.action_load_mask.isEnabled()
+    window._on_mask_action("reset")
+    np.testing.assert_array_equal(window.kernel.mask, old_mask)
+    worker.signals.error.emit(worker.worker_id, "simulated read error", "", 0)
+    assert window.has_unsaved_changes()
+    assert window._raw_source_path == source
+    assert window._raw_source_frame_count == 2
+    np.testing.assert_array_equal(window.kernel.detector_image, np.full((4, 4), 11))
+    np.testing.assert_array_equal(window.kernel.mask, old_mask)
+    assert window.action_load_mask.isEnabled()
+
+    window.load_from_raw_file(candidate, "APS_8IDI")
+
+    def unexpected_qmap(*args):
+        pytest.fail("the window must install the worker's Q-map")
+
+    monkeypatch.setattr(simplemask_kernel, "compute_qmap", unexpected_qmap)
+    workers.pop().run()
+    assert not window.has_unsaved_changes()
+    assert not window.windowTitle().endswith("*")
+    assert window._raw_source_path == candidate
+    assert window._raw_source_frame_count is None
+    np.testing.assert_array_equal(window.kernel.detector_image, np.full((4, 4), 22))
+    assert np.all(window.kernel.mask)
+
+
+def test_raw_open_invalid_geometry_leaves_previous_editor_state(
+    raw_editor, monkeypatch, tmp_path
+):
+    window, workers, source = raw_editor
+    _mask_one_pixel(window)
+    window.btn_compute_partition.click()
+    kernel = window.kernel
+    image, mask, metadata, partition = (
+        kernel.detector_image,
+        kernel.mask,
+        kernel.metadata,
+        kernel.new_partition,
+    )
+    assert partition is not None
+    candidate = _write_raw_scan(tmp_path / "bad.h5", np.full((4, 4), 22), distance=0.0)
+    yes = QtWidgets.QMessageBox.StandardButton.Yes
+    monkeypatch.setattr(QtWidgets.QMessageBox, "question", lambda *args: yes)
+
+    window.load_from_raw_file(candidate, "APS_8IDI")
+    workers.pop().run()
+
+    assert kernel.detector_image is image
+    assert kernel.mask is mask
+    assert kernel.metadata is metadata
+    assert kernel.new_partition is partition
+    assert window._raw_source_path == source
+    assert window.has_unsaved_changes()
+    assert window.action_open_raw_file.isEnabled()
+    assert window.action_load_mask.isEnabled()
+    assert window.btn_export_partition.isEnabled()
+    assert "Failed to load raw file:" in window.status_bar.currentMessage()
+    assert "detector_distance" in window.status_bar.currentMessage()
+
+
+@pytest.mark.parametrize("terminal", ["finished", "error", "cancelled"])
+def test_raw_open_ignores_superseded_terminal_signals(raw_editor, tmp_path, terminal):
+    window, workers, source = raw_editor
+    candidate = _write_raw_scan(tmp_path / "second.h5", np.full((4, 4), 22))
+    viewer_metadata = window.kernel.metadata.copy()
+    viewer_image = np.full((4, 4), 33)
+    window.load_from_raw_file(candidate, "APS_8IDI")
+    stale = workers.pop()
+    result = stale.do_work()
+    window.load_from_viewer(viewer_image, viewer_metadata)
+    assert stale.is_cancelled
+    assert window._raw_source_path is None
+    assert window.action_open_raw_file.isEnabled()
+    window.load_from_raw_file(source, "APS_8IDI")
+    current = workers.pop()
+    status = window.status_bar.currentMessage()
+
+    if terminal == "finished":
+        stale.signals.finished.emit(result)
+    elif terminal == "error":
+        stale.signals.error.emit(stale.worker_id, "stale error", "", 0)
+    else:
+        stale.signals.cancelled.emit(stale.worker_id, "stale cancellation")
+
+    np.testing.assert_array_equal(window.kernel.detector_image, viewer_image)
+    assert window._raw_file_worker is current
+    assert not window.action_open_raw_file.isEnabled()
+    assert window.status_bar.currentMessage() == status
+    current.signals.cancelled.emit(current.worker_id, "cancelled")
+    assert window.action_open_raw_file.isEnabled()
+
+
+def test_raw_open_close_retires_request(raw_editor, tmp_path):
+    window, workers, source = raw_editor
+    candidate = _write_raw_scan(tmp_path / "second.h5", np.full((4, 4), 22))
+    window.load_from_raw_file(candidate, "APS_8IDI")
+    pending = workers.pop()
+    result = pending.do_work()
+
+    window.close()
+    pending.signals.finished.emit(result)
+
+    assert pending.is_cancelled
+    assert window._raw_file_worker is None
+    assert window._raw_source_path == source
+    np.testing.assert_array_equal(window.kernel.detector_image, np.full((4, 4), 11))
+
+
+def test_raw_open_recognizes_real_unsaved_mask_edits(raw_editor, monkeypatch, tmp_path):
+    window, workers, source = raw_editor
+    mask_path = str(tmp_path / "mask.h5")
+    mask = np.ones((4, 4), dtype=np.uint8)
+    mask[0, 1] = 0
+    with h5py.File(mask_path, "w") as file:
+        file["mask"] = mask
+    questions = []
+    monkeypatch.setattr(
+        QtWidgets.QFileDialog, "getOpenFileName", lambda *args: (mask_path, "")
+    )
+
+    def decline(*args):
+        questions.append(args)
+        return QtWidgets.QMessageBox.StandardButton.No
+
+    monkeypatch.setattr(QtWidgets.QMessageBox, "question", decline)
+    for edit in (
+        window._on_load_mask,
+        lambda: window._on_mask_action("undo"),
+        lambda: window._on_mask_action("redo"),
+        lambda: window._on_mask_action("reset"),
+    ):
+        window.mark_saved()
+        edit()
+        assert window.has_unsaved_changes()
+        window.load_from_raw_file(source, "APS_8IDI")
+        assert not workers
+    assert len(questions) == 4
+    window.mark_saved()
+    window._on_mask_action("undo")
+    assert not window.has_unsaved_changes()
+    window.load_from_raw_file(source, "APS_8IDI")
+    assert len(questions) == 4
+    assert len(workers) == 1
 
 
 def test_partition_controls_follow_freshness(partition_window):
@@ -430,28 +695,9 @@ class TestSimpleMaskOpenRawFile:
     def test_successful_load_populates_kernel_and_reenables_action(
         self, qapp, qtbot, tmp_path
     ):
-        import h5py
-
-        fname = str(tmp_path / "scan.h5")
-        with h5py.File(fname, "w") as f:
-            data = np.full((2, 3, 3), 5, dtype=np.uint16)
-            f.create_dataset("/entry/data/data", data=data)
-            f.create_dataset(
-                "/entry/instrument/incident_beam/incident_energy", data=10.0
-            )
-            f.create_dataset("/entry/instrument/detector_1/distance", data=5.0)
-            f.create_dataset("/entry/instrument/detector_1/x_pixel_size", data=0.000075)
-            f.create_dataset("/entry/instrument/detector_1/y_pixel_size", data=0.000075)
-            f.create_dataset("/entry/instrument/detector_1/position_x", data=0.0)
-            f.create_dataset("/entry/instrument/detector_1/position_y", data=0.0)
-            f.create_dataset(
-                "/entry/instrument/detector_1/beam_center_position_x", data=0.0
-            )
-            f.create_dataset(
-                "/entry/instrument/detector_1/beam_center_position_y", data=0.0
-            )
-            f.create_dataset("/entry/instrument/detector_1/beam_center_x", data=1.5)
-            f.create_dataset("/entry/instrument/detector_1/beam_center_y", data=1.5)
+        fname = _write_raw_scan(
+            tmp_path / "scan.h5", np.full((2, 3, 3), 5, dtype=np.uint16)
+        )
 
         window = SimpleMaskWindow()
         qtbot.addWidget(window)
@@ -496,8 +742,6 @@ class TestSimpleMaskOpenRawFile:
         # placeholder geometry, and _on_raw_file_loaded must surface that
         # via a distinct status-bar warning rather than the plain
         # "Raw file loaded" message.
-        import h5py
-
         fname = str(tmp_path / "no_metadata.h5")
         with h5py.File(fname, "w") as f:
             f.create_dataset(
@@ -522,8 +766,6 @@ class TestSimpleMaskOpenRawFile:
         # Two rapid loads: the second call must be a no-op while the first
         # is still in flight -- not queue a second worker whose completion
         # could race the first and silently win regardless of click order.
-        import h5py
-
         fname = str(tmp_path / "scan.h5")
         with h5py.File(fname, "w") as f:
             f.create_dataset(
