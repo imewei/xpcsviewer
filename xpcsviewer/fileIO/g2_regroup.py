@@ -1,9 +1,12 @@
-"""Read and regroup multi-tau G2 from APS HDF5 files."""
+"""Read, regroup, and export multi-tau G2 from APS HDF5 files."""
 
+import errno
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from operator import index
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 
 import h5py
 import hdf5plugin  # noqa: F401 - registers HDF5 compression filters
@@ -158,3 +161,47 @@ def read_g2_regroup(
         static_roi_map=static_map,
         dynamic_roi_map=dynamic_map,
     )
+
+
+def export_g2_regroup(result: G2RegroupResult, destination: Path) -> None:
+    """Write a standalone regrouped HDF5 artifact to a new destination."""
+    if os.path.lexists(destination):
+        raise FileExistsError(errno.EEXIST, "Destination already exists", destination)
+
+    temporary = NamedTemporaryFile(
+        dir=destination.parent, prefix=".g2-regroup-", suffix=".tmp", delete=False
+    )
+    temporary_path = Path(temporary.name)
+    try:
+        with temporary, h5py.File(temporary, "w") as artifact:
+            artifact.attrs["xpcsviewer_artifact"] = "g2_regroup"
+            multitau = artifact.create_group("/xpcs/multitau")
+            multitau.attrs["source_filename"] = result.source_path.name
+            multitau.attrs["qmap_filename"] = result.qmap_path.name
+            delay_list = multitau.create_dataset("delay_list", data=result.delay_list)
+            if result.delay_unit is not None:
+                delay_list.attrs["units"] = result.delay_unit
+            delay_seconds = multitau.create_dataset(
+                "delay_seconds", data=result.delay_seconds
+            )
+            delay_seconds.attrs["units"] = "s"
+            multitau["dynamic_bin_ids"] = result.dynamic_bin_ids
+            multitau["normalized_g2"] = result.normalized_g2
+            multitau["normalized_g2_err"] = result.normalized_g2_err
+            qmap = artifact.create_group("/qmap")
+            qmap["static_roi_map"] = result.static_roi_map
+            qmap["dynamic_roi_map"] = result.dynamic_roi_map
+
+        try:
+            os.link(temporary_path, destination)
+        except FileExistsError:
+            raise
+        except OSError as exc:
+            raise OSError(
+                exc.errno,
+                f"Could not publish G2 export atomically ({exc.strerror}). "
+                "Please choose another destination",
+                destination,
+            ) from exc
+    finally:
+        temporary_path.unlink(missing_ok=True)

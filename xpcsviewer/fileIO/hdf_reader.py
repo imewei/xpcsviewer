@@ -843,6 +843,13 @@ def get_analysis_type(fname, ftype="nexus", use_pool=True):
         else h5py.File(fname, "r")
     )
     with context_manager as hdf_result:
+        artifact = getattr(hdf_result, "attrs", {}).get("xpcsviewer_artifact")
+        if isinstance(artifact, (str, bytes)) and artifact in (
+            "g2_regroup",
+            b"g2_regroup",
+        ):
+            raise ValueError(f"{fname} is a derived G2 export for downstream analysis")
+
         # Primary detection: Check for folder presence (more reliable)
         multitau_folder = "/xpcs/multitau"
         twotime_folder = "/xpcs/twotime"

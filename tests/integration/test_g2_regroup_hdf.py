@@ -1,10 +1,15 @@
 """Integration checks for regrouping G2 from APS HDF5 files."""
 
+import errno
+import os
+
 import h5py
 import numpy as np
 import pytest
 
+from xpcsviewer.fileIO import g2_regroup
 from xpcsviewer.fileIO.g2_regroup import read_g2_regroup
+from xpcsviewer.fileIO.hdf_reader import get_analysis_type
 
 pytestmark = pytest.mark.integration
 
@@ -265,3 +270,142 @@ def test_regroup_reports_bad_delay_index_and_honors_cancel(
         read_g2_regroup(source_path, qmap_path, check_cancelled=check_cancelled)
 
     assert delay_slices == [(0, 1)]
+
+
+def test_regroup_export_round_trips_data_and_provenance(
+    tmp_path, source_path, qmap_path
+):
+    input_bytes = source_path.read_bytes(), qmap_path.read_bytes()
+    result = read_g2_regroup(source_path, qmap_path)
+    output = tmp_path / "derived.h5"
+
+    g2_regroup.export_g2_regroup(result, output)
+
+    with h5py.File(output, "r") as derived:
+        multitau = derived["/xpcs/multitau"]
+        for name in (
+            "delay_list",
+            "delay_seconds",
+            "dynamic_bin_ids",
+            "normalized_g2",
+            "normalized_g2_err",
+        ):
+            np.testing.assert_array_equal(multitau[name][()], getattr(result, name))
+        assert multitau["delay_list"].attrs["units"] == "frames"
+        assert multitau["delay_seconds"].attrs["units"] == "s"
+        assert multitau.attrs["source_filename"] == source_path.name
+        assert multitau.attrs["qmap_filename"] == qmap_path.name
+        for name in ("static_roi_map", "dynamic_roi_map"):
+            np.testing.assert_array_equal(
+                derived["/qmap"][name][()], getattr(result, name)
+            )
+
+    assert (source_path.read_bytes(), qmap_path.read_bytes()) == input_bytes
+    assert set(tmp_path.iterdir()) == {source_path, qmap_path, output}
+
+
+def test_regroup_export_is_not_a_viewer_result(tmp_path, source_path, qmap_path):
+    output = tmp_path / "derived.h5"
+    g2_regroup.export_g2_regroup(read_g2_regroup(source_path, qmap_path), output)
+
+    with h5py.File(output, "r") as derived:
+        assert derived.attrs["xpcsviewer_artifact"] == "g2_regroup"
+    with pytest.raises(ValueError, match="derived G2 export"):
+        get_analysis_type(str(output), use_pool=False)
+    assert get_analysis_type(str(source_path), use_pool=False) == ("Multitau",)
+
+
+@pytest.mark.parametrize("marker", ["g2_regroup_preview", [b"g2_regroup", b"other"]])
+def test_regroup_export_detection_keeps_other_marker_values(source_path, marker):
+    with h5py.File(source_path, "r+") as source:
+        source.attrs["xpcsviewer_artifact"] = marker
+        source.create_group("/xpcs/twotime")
+
+    assert get_analysis_type(str(source_path), use_pool=False) == (
+        "Multitau",
+        "Twotime",
+    )
+
+
+@pytest.mark.parametrize(
+    "existing",
+    [
+        "output",
+        "source",
+        "qmap",
+        "source_symlink",
+        "qmap_symlink",
+        "source_hardlink",
+        "qmap_hardlink",
+    ],
+)
+def test_regroup_export_rejects_existing_path_and_aliases(
+    tmp_path, source_path, qmap_path, existing
+):
+    destination = tmp_path / "derived.h5"
+    if existing == "output":
+        destination.write_bytes(b"existing")
+    elif existing in ("source", "qmap"):
+        destination = source_path if existing == "source" else qmap_path
+    else:
+        target = source_path if existing.startswith("source") else qmap_path
+        try:
+            if existing.endswith("symlink"):
+                destination.symlink_to(target)
+            else:
+                os.link(target, destination)
+        except OSError as exc:
+            pytest.skip(f"Filesystem does not support {existing}: {exc}")
+
+    before = {path: path.read_bytes() for path in tmp_path.iterdir()}
+    with pytest.raises(FileExistsError):
+        g2_regroup.export_g2_regroup(
+            read_g2_regroup(source_path, qmap_path), destination
+        )
+
+    assert {path: path.read_bytes() for path in tmp_path.iterdir()} == before
+
+
+def test_regroup_export_refuses_publication_race(
+    tmp_path, source_path, qmap_path, monkeypatch
+):
+    result = read_g2_regroup(source_path, qmap_path)
+    output = tmp_path / "derived.h5"
+    link = os.link
+
+    def competing_writer(temporary, destination):
+        output.write_bytes(b"winner")
+        link(temporary, destination)
+
+    monkeypatch.setattr(os, "link", competing_writer)
+    with pytest.raises(FileExistsError):
+        g2_regroup.export_g2_regroup(result, output)
+
+    assert output.read_bytes() == b"winner"
+    assert set(tmp_path.iterdir()) == {source_path, qmap_path, output}
+
+
+@pytest.mark.parametrize("failure", ["write", "publication"])
+def test_regroup_export_cleans_up_failed_write_or_publication(
+    tmp_path, source_path, qmap_path, monkeypatch, failure
+):
+    result = read_g2_regroup(source_path, qmap_path)
+    output = tmp_path / "derived.h5"
+
+    def fail_write(*args, **kwargs):
+        raise RuntimeError("simulated dataset write failure")
+
+    def fail_link(*args, **kwargs):
+        raise OSError(errno.ENOTSUP, "hard links unavailable")
+
+    if failure == "write":
+        monkeypatch.setattr(h5py.Group, "create_dataset", fail_write)
+        expected = pytest.raises(RuntimeError, match="simulated dataset write failure")
+    else:
+        monkeypatch.setattr(os, "link", fail_link)
+        expected = pytest.raises(OSError, match="choose another destination")
+
+    with expected:
+        g2_regroup.export_g2_regroup(result, output)
+
+    assert set(tmp_path.iterdir()) == {source_path, qmap_path}
