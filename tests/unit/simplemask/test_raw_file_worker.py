@@ -249,3 +249,23 @@ def test_raw_worker_rejects_invalid_geometry_before_qmap(field, value):
         RawFileLoadWorker("bad.h5", "APS_8IDI").do_work()
 
     compute.assert_not_called()
+
+
+def test_raw_worker_rejects_geometry_shape_mismatch_before_qmap():
+    class MismatchedShapeReader(_FakeReader):
+        def prepare_data(self, **kwargs):
+            super().prepare_data(**kwargs)
+            self.metadata["detector_shape_x"] = 3
+
+    with (
+        patch(
+            "xpcsviewer.simplemask.raw_file_worker.get_reader",
+            return_value=MismatchedShapeReader("bad.h5"),
+        ),
+        patch(
+            "xpcsviewer.simplemask.raw_file_worker.compute_qmap",
+            side_effect=AssertionError("Q-map should not be computed"),
+        ),
+        pytest.raises(RawDataReadError, match="geometry shape.*scattering image shape"),
+    ):
+        RawFileLoadWorker("bad.h5", "APS_8IDI").do_work()

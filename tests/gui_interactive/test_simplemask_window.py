@@ -265,6 +265,33 @@ def test_raw_open_close_retires_request(raw_editor, tmp_path):
     np.testing.assert_array_equal(window.kernel.detector_image, np.full((4, 4), 11))
 
 
+def test_raw_open_title_change_can_install_viewer_image(
+    raw_editor, monkeypatch, tmp_path
+):
+    window, workers, _ = raw_editor
+    _mask_one_pixel(window)
+    candidate = _write_raw_scan(tmp_path / "second.h5", np.full((4, 4), 22))
+    viewer_image = np.full((3, 5), 33.0)
+    viewer_metadata = window.kernel.metadata.copy()
+    yes = QtWidgets.QMessageBox.StandardButton.Yes
+    monkeypatch.setattr(QtWidgets.QMessageBox, "question", lambda *args: yes)
+
+    def load_viewer_image(title):
+        window.windowTitleChanged.disconnect(load_viewer_image)
+        window.load_from_viewer(viewer_image, viewer_metadata)
+
+    window.windowTitleChanged.connect(load_viewer_image)
+    window.load_from_raw_file(candidate, "APS_8IDI")
+    workers.pop().run()
+
+    np.testing.assert_array_equal(window.kernel.detector_image, viewer_image)
+    np.testing.assert_array_equal(window.image_view.image, np.log10(viewer_image + 1))
+    assert window._raw_source_path is None
+    assert window._raw_source_frame_count is None
+    assert window.status_bar.currentMessage() == "Loaded 5x3 detector image"
+    assert window.action_open_raw_file.isEnabled()
+
+
 def test_raw_open_recognizes_real_unsaved_mask_edits(raw_editor, monkeypatch, tmp_path):
     window, workers, source = raw_editor
     mask_path = str(tmp_path / "mask.h5")

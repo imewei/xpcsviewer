@@ -643,18 +643,20 @@ class SimpleMaskWindow(QMainWindow):
                 result["metadata"],
                 qmap_result=result["qmap_result"],
             )
+            if not self._owns_raw_open(request_id):
+                return
             self._raw_source_path = result["source_path"]
             self._raw_source_frame_count = result["frame_count"]
+            if result["metadata_is_placeholder"]:
+                self.status_bar.showMessage(
+                    "Loaded with placeholder geometry — the file's metadata "
+                    "could not be read; edit the geometry fields by hand.",
+                    8000,
+                )
+            else:
+                self.status_bar.showMessage("Raw file loaded", 3000)
         finally:
             self._release_raw_open(request_id)
-        if result["metadata_is_placeholder"]:
-            self.status_bar.showMessage(
-                "Loaded with placeholder geometry — the file's metadata "
-                "could not be read; edit the geometry fields by hand.",
-                8000,
-            )
-        else:
-            self.status_bar.showMessage("Raw file loaded", 3000)
 
     @Slot(str, str, str, int)
     def _on_raw_file_error(
@@ -1164,7 +1166,6 @@ class SimpleMaskWindow(QMainWindow):
             self._detector_image = detector_image
             self._reset_image_controls()
             self.image_view.remove_rois()
-            self.mark_saved()
 
             # Display the image
             self._display_image(detector_image)
@@ -1175,10 +1176,14 @@ class SimpleMaskWindow(QMainWindow):
             self.info_label.setText(
                 f"Image: {shape[1]} x {shape[0]} pixels\nBeam center: ({bcx}, {bcy})"
             )
-            self.status_bar.showMessage(f"Loaded {shape[1]}x{shape[0]} detector image")
-
             # Populate geometry spinboxes from metadata
             self._update_geometry_spinboxes()
+            if qmap_result is None:
+                self.status_bar.showMessage(
+                    f"Loaded {shape[1]}x{shape[0]} detector image"
+                )
+            # Title-change listeners can synchronously load a different image.
+            self.mark_saved()
 
     def _reset_image_controls(self) -> None:
         self._current_tool = None

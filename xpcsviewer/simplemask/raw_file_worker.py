@@ -78,6 +78,11 @@ class RawFileLoadWorker(BaseAsyncWorker):
             ):
                 raise ValueError("expected a nonempty 2-D scattering image")
             metadata = to_kernel_metadata(reader.metadata, reader.stype)
+            if metadata["shape"] != scattering.shape:
+                raise ValueError(
+                    f"geometry shape {metadata['shape']} does not match "
+                    f"scattering image shape {scattering.shape}"
+                )
             for key, name in (
                 ("det_dist", "detector_distance"),
                 ("pix_dim", "pixel_size"),
