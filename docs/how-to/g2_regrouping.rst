@@ -53,8 +53,8 @@ Export file layout
 ------------------
 
 The standalone HDF5 file has the root attribute ``xpcsviewer_artifact`` set to
-``g2_regroup``. The Viewer recognizes this marker and reports the file as a
-derived G2 export for downstream analysis. Under
+``g2_regroup``. When the Target loader reads the file, it logs that the file
+is a derived G2 export for downstream analysis. Under
 ``/xpcs/multitau`` it contains these datasets.
 
 .. list-table::

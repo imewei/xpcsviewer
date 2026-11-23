@@ -42,8 +42,8 @@ class G2Regrouping:
         _, static_first, self._static_index = np.unique(
             static_map[self._included], return_index=True, return_inverse=True
         )
-        self.dynamic_bin_ids, self._dynamic_index = np.unique(
-            dynamic_map[self._included], return_inverse=True
+        self.dynamic_bin_ids, self._dynamic_first, self._dynamic_index = np.unique(
+            dynamic_map[self._included], return_index=True, return_inverse=True
         )
         self._static_to_dynamic = self._dynamic_index[static_first]
         if not np.array_equal(
@@ -96,16 +96,19 @@ class G2Regrouping:
                 self._static_to_dynamic, static_g2, self._dynamic_static_counts
             )
 
-            # Center and square in a bounded range before rescaling the error.
+            # Scale before squaring, and center each bin to preserve small differences.
             max_magnitude = np.zeros(self._dynamic_pixel_counts.size)
             np.maximum.at(max_magnitude, self._dynamic_index, np.abs(pixel_g2))
             shifts = np.frexp(max_magnitude)[1]
             scaled_g2 = np.ldexp(pixel_g2, -shifts[self._dynamic_index])
-            pixel_means = (
+            scaled_g2 -= scaled_g2[self._dynamic_first][self._dynamic_index]
+            mean_offsets = (
                 np.bincount(self._dynamic_index, weights=scaled_g2)
                 / self._dynamic_pixel_counts
             )
-            squared_deviations = np.square(scaled_g2 - pixel_means[self._dynamic_index])
+            squared_deviations = np.square(
+                scaled_g2 - mean_offsets[self._dynamic_index]
+            )
             error = np.ldexp(
                 np.sqrt(np.bincount(self._dynamic_index, weights=squared_deviations))
                 / self._dynamic_pixel_counts,

@@ -106,6 +106,30 @@ def test_regroup_standard_error_preserves_float64_range(amplitude):
     )
 
 
+def test_regroup_constant_pixel_ratios_have_exactly_zero_error():
+    roi = np.ones((32, 32), dtype=int)
+    channels = np.ones((3, 32, 32))
+    channels[0] = 1e20
+
+    _, error = G2Regrouping(roi, roi).compute_delay(channels)
+
+    np.testing.assert_array_equal(error, [0])
+
+
+def test_regroup_nearly_equal_pixel_ratios_preserve_small_error():
+    roi = np.ones((32, 32), dtype=int)
+    channels = np.ones((3, 32, 32))
+    lower = 10000.1
+    upper = lower + 2 * np.spacing(lower)
+    channels[0, :16] = lower
+    channels[0, 16:] = upper
+
+    _, error = G2Regrouping(roi, roi).compute_delay(channels)
+
+    expected = (upper - lower) / (2 * np.sqrt(roi.size))
+    np.testing.assert_allclose(error, [expected], rtol=1e-12, atol=0)
+
+
 def test_regroup_static_mean_survives_sum_overflow():
     grouping = G2Regrouping(np.array([[1, 1]]), np.array([[1, 1]]))
     channels = np.array([[[1, 1]], [[1e308, 1e308]], [[1e-308, 1e-308]]])
