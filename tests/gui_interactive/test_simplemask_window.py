@@ -59,6 +59,40 @@ def test_partition_controls_follow_freshness(partition_window):
     assert list(received[0]["dynamic_num_pts"]) == [3, 1]
 
 
+def test_partition_unavailable_after_viewer_clears_image(partition_window, tmp_path):
+    window = partition_window
+    kernel = window.kernel
+    metadata = kernel.metadata.copy()
+    received = []
+    window.qmap_exported.connect(received.append)
+    window.btn_toggle_partition.click()
+    window.export_partition_to_viewer()
+    assert window.btn_toggle_partition.isChecked()
+    assert len(received) == 1
+    destination = tmp_path / "partition.h5"
+    destination.write_bytes(b"original")
+
+    window.load_from_viewer(None, None)
+
+    assert not kernel.is_ready()
+    assert kernel.new_partition is None
+    assert kernel.compute_partition() is None
+    kernel.save_partition(str(destination))
+    assert destination.read_bytes() == b"original"
+    assert window.image_view.image is None
+    assert not window.btn_toggle_partition.isChecked()
+    assert not window.btn_toggle_partition.isEnabled()
+    assert not window.btn_export_partition.isEnabled()
+    window.export_partition_to_viewer()
+    assert len(received) == 1
+
+    window.load_from_viewer(np.full((4, 4), 20.0), metadata)
+    assert window.kernel is kernel
+    window.btn_compute_partition.click()
+    window.export_partition_to_viewer()
+    assert len(received) == 2
+
+
 def test_pending_invalid_geometry_blocks_partition_export(
     partition_window, monkeypatch, tmp_path
 ):
@@ -114,8 +148,9 @@ def test_pending_invalid_geometry_blocks_partition_export(
     assert kernel.new_partition["beam_center_x"] == 1.501
 
 
+@pytest.mark.parametrize("edit_bins", [True, False], ids=["edited-bins", "same-bins"])
 def test_failed_partition_compute_cannot_export_previous_result(
-    partition_window, monkeypatch
+    partition_window, monkeypatch, edit_bins
 ):
     window = partition_window
     kernel = window.kernel
@@ -130,7 +165,8 @@ def test_failed_partition_compute_cannot_export_previous_result(
     def invalid_partition(*args, **kwargs):
         raise ValueError("invalid partition")
 
-    window.spin_dq_num.setValue(3)
+    if edit_bins:
+        window.spin_dq_num.setValue(3)
     monkeypatch.setattr(simplemask_kernel, "generate_partition", invalid_partition)
     window._on_compute_partition()
     assert kernel.new_partition is None

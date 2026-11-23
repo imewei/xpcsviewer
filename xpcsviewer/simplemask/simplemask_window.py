@@ -640,7 +640,7 @@ class SimpleMaskWindow(QMainWindow):
 
     def _on_geometry_changed(self) -> None:
         """Track unapplied edits against the last displayed geometry values."""
-        if self.kernel is None:
+        if self.kernel is None or not self.kernel.is_ready():
             return
 
         pending = any(
@@ -936,6 +936,22 @@ class SimpleMaskWindow(QMainWindow):
                 - shape: Detector shape (height, width)
         """
         if detector_image is None:
+            if self.kernel is not None:
+                self.kernel.clear_data()
+            self._detector_image = None
+            self._committed_geometry.clear()
+            self._current_tool = None
+            self._sync_tool_buttons(None)
+            self._show_mask_overlay = self._show_qmap_overlay = False
+            self.action_toggle_mask.setChecked(False)
+            self.action_toggle_mask.setText("Show Mask")
+            self.action_toggle_qmap.setChecked(False)
+            self.action_toggle_qmap.setText("Show Q-Map")
+            self.btn_compute_partition.setEnabled(False)
+            self.btn_find_beam_center.setEnabled(False)
+            self._refresh_partition_controls()
+            self.image_view.clear()
+            self.mark_saved()
             logger.info("No detector image provided, starting with empty canvas")
             self.info_label.setText(
                 "No data loaded.\n\n"

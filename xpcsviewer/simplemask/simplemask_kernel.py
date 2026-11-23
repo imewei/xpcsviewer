@@ -99,6 +99,14 @@ class SimpleMaskKernel:
         if pending:
             self.invalidate_partition()
 
+    def clear_data(self) -> None:
+        """Discard the loaded detector data and derived results."""
+        self.invalidate_partition()
+        self.set_geometry_pending(False)
+        self.detector_image = self.shape = self.mask = self.mask_kernel = None
+        self.qmap = self.qmap_unit = None
+        self.metadata = {}
+
     def read_data(
         self,
         detector_image: np.ndarray,
@@ -119,8 +127,7 @@ class SimpleMaskKernel:
         Returns:
             True if successful
         """
-        self.invalidate_partition()
-        self.set_geometry_pending(False)
+        self.clear_data()
         self.detector_image = detector_image.copy()
         self.shape = detector_image.shape
         self.metadata = metadata.copy()
@@ -148,7 +155,6 @@ class SimpleMaskKernel:
         self.mask = np.ones(self.shape, dtype=bool)
 
         # Compute Q-map
-        self.qmap = self.qmap_unit = self.mask_kernel = None
         self._apply_geometry(self.metadata)
 
         # Initialize mask assembly
