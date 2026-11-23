@@ -126,7 +126,60 @@ def test_raw_browse_uses_full_stack_and_preserves_calibration_input(qtbot, tmp_p
     np.testing.assert_allclose(window.image_view.image, np.log10([[51, 51]]))
 
 
-def test_raw_browse_discards_stale_work_across_navigation_and_new_load(qtbot, tmp_path):
+@pytest.mark.parametrize(
+    ("dtype", "invalid_count", "decoded_count"),
+    [
+        (np.uint16, 65535, -1),
+        (np.float32, np.nan, np.nan),
+        (np.float32, np.inf, np.inf),
+        (np.float32, -np.inf, -np.inf),
+    ],
+    ids=["overflow", "nan", "positive-infinity", "negative-infinity"],
+)
+def test_raw_browse_displays_invalid_detector_counts_without_hiding_valid_pixels(
+    qtbot, tmp_path, dtype, invalid_count, decoded_count
+):
+    window = SimpleMaskWindow()
+    qtbot.addWidget(window)
+    path = _write_raw_scan(
+        tmp_path / "scan.h5",
+        np.array(
+            [[[1, invalid_count, 2, 3, 4]], [[0, invalid_count, 10, 100, 1000]]],
+            dtype=dtype,
+        ),
+    )
+    window.load_from_raw_file(path, "APS_8IDI", num_frames=1)
+    qtbot.waitUntil(lambda: window._raw_source_path == path)
+    opening_image = [[1, decoded_count, 2, 3, 4]]
+    opening_display = np.log10([[2, 1, 3, 4, 5]])
+    np.testing.assert_array_equal(window.kernel.detector_image, opening_image)
+    np.testing.assert_allclose(window.image_view.image, opening_display)
+
+    zoom = window.image_view.getView().viewRange()
+    display = window.raw_frame_display
+    display.setCurrentIndex(1)
+    window.raw_frame_start.setValue(1)
+    qtbot.waitUntil(lambda: window.raw_frame_range_label.text() == "Frame 1")
+    log_frame = np.log10([[1, 1, 11, 101, 1001]])
+    np.testing.assert_allclose(window.image_view.image, log_frame)
+
+    invalid = np.array([[False, False, False, True, False]])
+    window.kernel.mask_kernel.evaluate("mask_draw", arr=invalid)
+    window.kernel.mask_apply("mask_draw")
+    display.setCurrentIndex(2)
+    np.testing.assert_allclose(
+        window.image_view.image, (log_frame / log_frame.max()) * [[1, 1, 1, 0.3, 1]]
+    )
+    display.setCurrentIndex(0)
+    np.testing.assert_allclose(window.image_view.image, opening_display)
+    np.testing.assert_array_equal(window.kernel.detector_image, opening_image)
+    assert window.image_view.getView().viewRange() == zoom
+
+
+@pytest.mark.parametrize("old_terminal", ["success", "error"])
+def test_raw_browse_discards_stale_work_across_navigation_and_new_load(
+    qtbot, tmp_path, old_terminal
+):
     window = SimpleMaskWindow()
     qtbot.addWidget(window)
     workers = []
@@ -151,7 +204,7 @@ def test_raw_browse_discards_stale_work_across_navigation_and_new_load(qtbot, tm
     qtbot.waitUntil(lambda: len(workers) == 1)
     last = workers.pop()
     assert last.begin_idx == 2
-    last_result = last.do_work()
+    last_result = last.do_work() if old_terminal == "success" else None
 
     new_path = _write_raw_scan(tmp_path / "new.h5", np.full((1, 4, 4), 22))
     window.load_from_raw_file(new_path, "APS_8IDI")
@@ -164,8 +217,10 @@ def test_raw_browse_discards_stale_work_across_navigation_and_new_load(qtbot, tm
     assert not workers
     new_image = window.image_view.image.copy()
     new_status = window.status_bar.currentMessage()
-    last.signals.finished.emit(last_result)
-    last.signals.error.emit(last.worker_id, "stale error", "", 0)
+    if old_terminal == "success":
+        last.signals.finished.emit(last_result)
+    else:
+        last.signals.error.emit(last.worker_id, "stale error", "", 0)
     np.testing.assert_array_equal(window.image_view.image, new_image)
     assert window.status_bar.currentMessage() == new_status
 

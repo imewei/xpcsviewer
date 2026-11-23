@@ -1138,7 +1138,7 @@ class SimpleMaskWindow(QMainWindow):
 
         channel = self.raw_frame_display.currentData()
         if channel is not None and self._raw_preview_image is not None:
-            display = np.log10(self._raw_preview_image + 1)
+            display = self._log_detector_image(self._raw_preview_image)
             if (
                 channel == "masked"
                 and self.kernel is not None
@@ -1153,7 +1153,7 @@ class SimpleMaskWindow(QMainWindow):
             return
 
         # Base image (log scale)
-        log_image = np.log10(self._detector_image + 1)
+        log_image = self._log_detector_image(self._detector_image)
 
         if (
             self._show_partition_overlay
@@ -1247,6 +1247,12 @@ class SimpleMaskWindow(QMainWindow):
             return display
 
         return roi_map
+
+    @staticmethod
+    def _log_detector_image(image: NDArray) -> NDArray:
+        """Render overflow and nonfinite counts at the zero-count display level."""
+        counts = np.where(np.isfinite(image) & (image >= 0), image, 0.0)
+        return np.log10(counts + 1)
 
     def _create_masked_display(self, image: NDArray, mask: NDArray) -> NDArray:
         """Create display image with mask overlay.
@@ -1408,9 +1414,7 @@ class SimpleMaskWindow(QMainWindow):
         Args:
             image: 2D detector image array
         """
-        # Use log scale for better visualization of scattering data
-        # Add small offset to avoid log(0)
-        log_image = np.log10(image + 1)
+        log_image = self._log_detector_image(image)
 
         # Ensure NumPy at PyQtGraph boundary (BUG-027)
         self.image_view.setImage(
