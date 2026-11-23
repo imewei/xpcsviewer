@@ -9,7 +9,7 @@ import pytest
 from pyqtgraph import ErrorBarItem, PlotWidget
 
 from xpcsviewer.fileIO import g2_regroup
-from xpcsviewer.gui.qt_compat import QtCore, QtWidgets
+from xpcsviewer.gui.qt_compat import QtCore, QtGui, QtWidgets
 from xpcsviewer.viewer_kernel import ViewerKernel
 from xpcsviewer.xpcs_viewer import XpcsViewer
 
@@ -144,6 +144,68 @@ def test_regroup_requires_registration_and_plots_positive_delays(
     np.testing.assert_allclose(_curve(dialog).getData()[1], [2, 2])
     np.testing.assert_array_equal(errors.opts["top"], [0, 0])
     assert len(jobs) == 1
+
+
+def test_regroup_plot_menu_keeps_markers_and_errors_aligned(
+    viewer, input_paths, monkeypatch, qtbot
+):
+    with h5py.File(input_paths[0], "r+") as source:
+        group = source["/xpcs/multitau"]
+        del group["delay_list"]
+        group["delay_list"] = np.array([0.1, 1, 10]) / 1.5
+
+    dialog = _open_regroup(viewer)
+    _preview(dialog, monkeypatch, input_paths[1], qtbot)
+    widget = dialog.findChild(PlotWidget)
+    plot = widget.getPlotItem()
+    view = plot.getViewBox()
+    menu = view.getMenu(None)
+    errors = next(item for item in plot.items if isinstance(item, ErrorBarItem))
+    qtbot.mouseClick(
+        widget.viewport(),
+        QtCore.Qt.MouseButton.RightButton,
+        pos=widget.mapFromScene(view.sceneBoundingRect().center()),
+    )
+    qtbot.waitUntil(menu.isVisible)
+    try:
+        actions = {action.text(): action for action in menu.actions()}
+        assert "View All" in actions
+        options = actions.get("Plot Options")
+        if options is not None:
+            options.menu().findChild(QtWidgets.QCheckBox, "logXCheck").click()
+        actions["View All"].trigger()
+        np.testing.assert_allclose(_curve(dialog).getData()[0], [-1, 0, 1])
+        np.testing.assert_array_equal(_curve(dialog).getData()[0], errors.opts["x"])
+        assert options is None
+    finally:
+        menu.close()
+
+
+@pytest.mark.parametrize("delays", [[0, 3.2, 3.3], [0, 0, 3.25]])
+def test_regroup_labels_narrow_delay_ranges(
+    viewer, input_paths, monkeypatch, qtbot, delays
+):
+    with h5py.File(input_paths[0], "r+") as source:
+        group = source["/xpcs/multitau"]
+        del group["delay_list"]
+        group["delay_list"] = np.array(delays) / 1.5
+
+    dialog = _open_regroup(viewer)
+    _preview(dialog, monkeypatch, input_paths[1], qtbot)
+    widget = dialog.findChild(PlotWidget)
+    widget.grab()
+    axis = widget.getAxis("bottom")
+    picture = QtGui.QPicture()
+    painter = QtGui.QPainter(picture)
+    try:
+        _, _, specs = axis.generateDrawSpecs(painter)
+    finally:
+        painter.end()
+
+    labels = {float(label) for _, _, label in specs}
+    assert len(labels) >= 2
+    if delays[1] > 0:
+        assert all(3.2 <= label <= 3.3 for label in labels)
 
 
 def test_regroup_discards_stale_preview_after_map_change(

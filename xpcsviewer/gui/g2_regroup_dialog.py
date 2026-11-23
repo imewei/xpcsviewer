@@ -18,6 +18,33 @@ from xpcsviewer.threading.async_workers import BaseAsyncWorker
 _HDF5_FILTER = "HDF5 files (*.h5 *.hdf *.hdf5);;All files (*)"
 
 
+class _DelayAxis(pg.AxisItem):
+    def logTickValues(
+        self,
+        minimum: float,
+        maximum: float,
+        size: float,
+        standard_ticks: list[tuple[float, list[float]]],
+    ) -> list[tuple[float | None, list[float]]]:
+        ticks = super().logTickValues(minimum, maximum, size, standard_ticks)
+        if any(minimum <= value <= maximum for _, values in ticks for value in values):
+            return ticks
+
+        # Place interior ticks when the visible range falls between standard log ticks.
+        step = (maximum - minimum) / 4
+        if step <= 0:
+            return ticks
+        return [(step, [minimum + i * step for i in (1, 2, 3)])]
+
+    def logTickStrings(
+        self, values: list[float], scale: float, spacing: float | None
+    ) -> list[str]:
+        if spacing is None or spacing >= 1:
+            return super().logTickStrings(values, scale, spacing)
+        precision = max(2, int(np.ceil(-np.log10(spacing))) + 1)
+        return [f"{value:.{precision}g}" for value in np.power(10.0, values) * scale]
+
+
 class _PreviewWorker(BaseAsyncWorker):
     def __init__(self, source: Path, qmap: Path) -> None:
         super().__init__(f"g2-regroup-preview-{uuid4().hex}")
@@ -97,11 +124,13 @@ class G2RegroupDialog(QtWidgets.QDialog):
         qmap_row.addWidget(self._qmap_label, 1)
         inputs.addRow("Q-map", qmap_row)
 
-        self._plot = pg.PlotWidget()
+        delay_axis = _DelayAxis("bottom")
+        self._plot = pg.PlotWidget(axisItems={"bottom": delay_axis})
+        # Plot Options can transform markers independently of their error bars.
+        self._plot.getPlotItem().setMenuEnabled(False, enableViewBoxMenu=True)
         self._plot.setLabel("bottom", "Delay", units="s")
         self._plot.setLabel("left", "Normalized G2")
         # Format ticks on the axis. Both plot items receive the same transformed x.
-        delay_axis = self._plot.getAxis("bottom")
         delay_axis.setLogMode(True)
         delay_axis.setTickSpacing(5, 1)
         delay_axis.setStyle(textFillLimits=[(1, 0.28)])

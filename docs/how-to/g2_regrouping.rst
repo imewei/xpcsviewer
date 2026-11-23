@@ -12,10 +12,12 @@ Regroup multi-tau G2 with an external Q-map
    that bin. A new Q-map needs its own preview before it can be saved. If
    validation fails, the previous plot remains visible.
 4. Click **Save as…** and choose a new HDF5 filename. Canceling the picker
-   creates no file. Once you choose a filename, the Viewer finishes the save
-   even if you close the dialog or switch datasets. It reports success after
-   the complete file appears at the destination. If the destination exists or
-   its filesystem cannot publish atomically, choose another destination.
+   creates no file. When the picker returns a filename, the Viewer accepts
+   the save only if the preview still matches the registered source and Q-map.
+   An accepted save finishes even if you close the dialog or switch datasets.
+   The Viewer reports success after the complete file appears at the destination.
+   If the destination exists or its filesystem cannot publish atomically,
+   choose another destination.
 
 Input files and normalization
 -----------------------------
@@ -51,7 +53,8 @@ Export file layout
 ------------------
 
 The standalone HDF5 file has the root attribute ``xpcsviewer_artifact`` set to
-``g2_regroup``. It is intended for downstream analysis. Under
+``g2_regroup``. The Viewer recognizes this marker and reports the file as a
+derived G2 export for downstream analysis. Under
 ``/xpcs/multitau`` it contains these datasets.
 
 .. list-table::
@@ -76,4 +79,5 @@ Columns in both G2 arrays follow ``dynamic_bin_ids``. All delays are exported,
 including zero. The correlation group has ``source_filename`` and
 ``qmap_filename`` provenance attributes containing the input filenames.
 ``/qmap/static_roi_map`` and ``/qmap/dynamic_roi_map`` contain the validated
-ROI maps. The source and Q-map files are read-only inputs.
+ROI maps in their original integer dtypes. The source and Q-map files are
+read-only inputs.
