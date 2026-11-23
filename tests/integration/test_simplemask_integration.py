@@ -4,11 +4,77 @@ Tests the mask and partition export/import functionality between
 SimpleMaskWindow and XpcsViewer.
 """
 
+import h5py
 import numpy as np
 import pytest
 from PySide6 import QtWidgets
 
-from xpcsviewer.simplemask import SimpleMaskWindow
+from xpcsviewer.simplemask import SimpleMaskWindow, simplemask_kernel
+from xpcsviewer.simplemask.simplemask_kernel import SimpleMaskKernel
+
+
+@pytest.fixture
+def partition_input():
+    return np.full((4, 4), 10.0), {
+        "bcx": 1.5,
+        "bcy": 1.5,
+        "det_dist": 5000.0,
+        "pix_dim": 0.075,
+        "energy": 10.0,
+    }
+
+
+@pytest.mark.parametrize(
+    "change", ["reload", "center", "fit", "mask", "undo", "redo", "reset"]
+)
+def test_partition_invalidated_by_effective_input_change(
+    partition_input, change, monkeypatch, tmp_path
+):
+    detector_image, metadata = partition_input
+    kernel = SimpleMaskKernel()
+    assert kernel.read_data(detector_image, metadata)
+    destination = tmp_path / "partition.h5"
+    destination.write_bytes(b"original")
+
+    excluded = np.zeros((4, 4), dtype=bool)
+    excluded[0, 0] = True
+    assert kernel.mask_kernel is not None
+    kernel.mask_kernel.evaluate("mask_draw", arr=excluded)
+    if change in {"undo", "redo", "reset"}:
+        kernel.mask_apply("mask_draw")
+    if change == "redo":
+        kernel.mask_action("undo")
+
+    bins = {"dq_num": 2, "sq_num": 2, "dp_num": 1, "sp_num": 1}
+    assert kernel.compute_partition(**bins) is not None
+    if change == "reload":
+        kernel.read_data(np.full((4, 4), 20.0), metadata)
+    elif change == "center":
+        kernel.update_parameters({"bcx": 2.0})
+    elif change == "fit":
+        monkeypatch.setattr(
+            simplemask_kernel,
+            "compute_center_from_ring",
+            lambda *a, **kw: (2.0, 1.5, {}),
+        )
+        kernel.find_beam_center()
+    elif change == "mask":
+        kernel.mask_apply("mask_draw")
+    else:
+        kernel.mask_action(change)
+
+    assert kernel.new_partition is None
+    kernel.save_partition(str(destination))
+    assert destination.read_bytes() == b"original"
+
+    assert kernel.compute_partition(**bins) is not None
+    kernel.save_partition(str(destination))
+    expected_mask = ~excluded if change in {"mask", "redo"} else np.ones_like(excluded)
+    expected_center_x = 2.0 if change in {"center", "fit"} else 1.5
+    with h5py.File(destination, "r") as handle:
+        np.testing.assert_array_equal(handle["/qmap/mask"][:], expected_mask)
+        assert handle["/qmap/beam_center_x"][()] == expected_center_x
+        assert handle["/qmap/beam_center_y"][()] == 1.5
 
 
 class TestMaskSignalExport:
@@ -105,19 +171,19 @@ class TestPartitionSignalExport:
         }
         window.load_from_viewer(detector_image, metadata)
 
-        # Compute partition first
-        if window.kernel is not None:
-            window.kernel.compute_partition()
+        assert window.kernel is not None
+        partition = window.kernel.compute_partition()
+        assert partition is not None
 
         received_partitions = []
         window.qmap_exported.connect(lambda p: received_partitions.append(p))
 
         window.export_partition_to_viewer()
 
-        # Should emit if partition was computed
-        if window.kernel is not None and window.kernel.new_partition is not None:
-            assert len(received_partitions) == 1
-            assert isinstance(received_partitions[0], dict)
+        assert len(received_partitions) == 1
+        np.testing.assert_array_equal(
+            received_partitions[0]["dynamic_roi_map"], partition["dynamic_roi_map"]
+        )
 
 
 class TestMaskExportContent:

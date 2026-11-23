@@ -10,7 +10,133 @@ import numpy as np
 import pytest
 from PySide6 import QtCore, QtWidgets
 
-from xpcsviewer.simplemask import SimpleMaskWindow
+from xpcsviewer.simplemask import SimpleMaskWindow, simplemask_kernel
+
+
+@pytest.fixture
+def partition_window(qtbot):
+    window = SimpleMaskWindow()
+    qtbot.addWidget(window)
+    window.load_from_viewer(
+        np.full((4, 4), 10.0),
+        {
+            "bcx": 1.501,
+            "bcy": 1.5,
+            "det_dist": 5000.0,
+            "pix_dim": 0.075,
+            "energy": 10.0,
+        },
+    )
+    window.spin_dq_num.setValue(2)
+    window.spin_sq_num.setValue(2)
+    window.spin_dp_num.setValue(1)
+    window.spin_sp_num.setValue(1)
+    assert window.kernel is not None
+    window.btn_compute_partition.click()
+    assert window.kernel.new_partition is not None
+    return window
+
+
+def test_partition_controls_follow_freshness(partition_window):
+    window = partition_window
+    kernel = window.kernel
+    received = []
+    window.qmap_exported.connect(received.append)
+    window.btn_toggle_partition.click()
+    assert window.btn_toggle_partition.isChecked()
+
+    window.spin_dq_num.setValue(3)
+    assert kernel.new_partition is None
+    assert not window.btn_toggle_partition.isChecked()
+    assert not window.btn_export_partition.isEnabled()
+    window.export_partition_to_viewer()
+    assert received == []
+
+    window.btn_compute_partition.click()
+    assert window.btn_export_partition.isEnabled()
+    window.export_partition_to_viewer()
+    assert len(received) == 1
+    assert list(received[0]["dynamic_num_pts"]) == [3, 1]
+
+
+def test_pending_invalid_geometry_blocks_partition_export(
+    partition_window, monkeypatch, tmp_path
+):
+    window = partition_window
+    kernel = window.kernel
+    original_image, original_qmap = kernel.detector_image, kernel.qmap
+    received = []
+    window.qmap_exported.connect(received.append)
+    destination = tmp_path / "partition.h5"
+    destination.write_bytes(b"original")
+
+    def invalid_geometry(*args, **kwargs):
+        raise ValueError("invalid detector distance")
+
+    window.spin_det_dist.setValue(6000.0)
+    with monkeypatch.context() as patch_geometry:
+        patch_geometry.setattr(simplemask_kernel, "compute_qmap", invalid_geometry)
+        patch_geometry.setattr(QtWidgets.QMessageBox, "warning", lambda *a: None)
+        window.action_generate_qmap.trigger()
+
+    assert kernel.detector_image is original_image
+    assert kernel.qmap is original_qmap
+    assert kernel.metadata["det_dist"] == 5000.0
+    assert kernel.new_partition is None
+    window.export_partition_to_viewer()
+    assert received == []
+    assert not window.btn_find_beam_center.isEnabled()
+    window.btn_compute_partition.click()
+    assert kernel.new_partition is None
+    assert kernel.compute_partition() is None
+    kernel.save_partition(str(destination))
+    assert destination.read_bytes() == b"original"
+
+    window.spin_det_dist.setValue(5000.0)
+    assert window.btn_find_beam_center.isEnabled()
+    window.btn_compute_partition.click()
+    assert kernel.new_partition is not None
+    assert kernel.metadata["bcx"] == 1.501
+
+    window.spin_det_dist.setValue(5500.0)
+    compute_qmap = simplemask_kernel.compute_qmap
+    proposed_distances = []
+
+    def record_geometry(scattering_type, metadata):
+        proposed_distances.append(metadata["det_dist"])
+        return compute_qmap(scattering_type, metadata)
+
+    monkeypatch.setattr(simplemask_kernel, "compute_qmap", record_geometry)
+    window.action_generate_qmap.trigger()
+    assert proposed_distances == [5500.0]
+    window.btn_compute_partition.click()
+    assert kernel.new_partition["detector_distance"] == 5500.0
+    assert kernel.new_partition["beam_center_x"] == 1.501
+
+
+def test_failed_partition_compute_cannot_export_previous_result(
+    partition_window, monkeypatch
+):
+    window = partition_window
+    kernel = window.kernel
+    partition = kernel.new_partition
+    received = []
+    window.qmap_exported.connect(received.append)
+
+    kernel.mask_kernel.evaluate("mask_draw", arr=np.zeros((4, 4), dtype=bool))
+    kernel.mask_apply("mask_draw")
+    assert kernel.new_partition is partition
+
+    def invalid_partition(*args, **kwargs):
+        raise ValueError("invalid partition")
+
+    window.spin_dq_num.setValue(3)
+    monkeypatch.setattr(simplemask_kernel, "generate_partition", invalid_partition)
+    window._on_compute_partition()
+    assert kernel.new_partition is None
+    assert not window.btn_export_partition.isEnabled()
+    window.export_partition_to_viewer()
+    assert received == []
 
 
 class TestSimpleMaskWindowCreation:

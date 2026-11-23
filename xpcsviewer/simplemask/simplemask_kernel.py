@@ -72,6 +72,7 @@ class SimpleMaskKernel:
         self.mask: np.ndarray | None = None
         self.mask_kernel: MaskAssemble | None = None
         self.new_partition: dict | None = None
+        self._geometry_pending = False
         self.metadata: dict[str, Any] = {}
 
         self.hdl = pg_hdl
@@ -87,6 +88,16 @@ class SimpleMaskKernel:
             True if detector image is loaded
         """
         return self.detector_image is not None
+
+    def invalidate_partition(self) -> None:
+        """Discard the partition derived from the previous inputs."""
+        self.new_partition = None
+
+    def set_geometry_pending(self, pending: bool) -> None:
+        """Prevent partition computation while geometry edits are unapplied."""
+        self._geometry_pending = pending
+        if pending:
+            self.invalidate_partition()
 
     def read_data(
         self,
@@ -108,6 +119,8 @@ class SimpleMaskKernel:
         Returns:
             True if successful
         """
+        self.invalidate_partition()
+        self.set_geometry_pending(False)
         self.detector_image = detector_image.copy()
         self.shape = detector_image.shape
         self.metadata = metadata.copy()
@@ -135,8 +148,8 @@ class SimpleMaskKernel:
         self.mask = np.ones(self.shape, dtype=bool)
 
         # Compute Q-map
-        stype = self.metadata.get("stype", "Transmission")
-        self.qmap, self.qmap_unit = compute_qmap(stype, self.metadata)
+        self.qmap = self.qmap_unit = self.mask_kernel = None
+        self._apply_geometry(self.metadata)
 
         # Initialize mask assembly
         self.mask_kernel = MaskAssemble(self.shape, self.detector_image)
@@ -150,16 +163,24 @@ class SimpleMaskKernel:
         Returns:
             Tuple of (qmap_dict, units_dict)
         """
-        stype = self.metadata.get("stype", "Transmission")
+        self.invalidate_partition()
+        return self._apply_geometry(self.metadata)
+
+    def _apply_geometry(
+        self, metadata: dict[str, Any]
+    ) -> tuple[dict[str, np.ndarray], dict[str, str]]:
+        stype = metadata.get("stype", "Transmission")
         logger.debug(f"compute_qmap: stype={stype}, shape={self.shape}")
-        self.qmap, self.qmap_unit = compute_qmap(stype, self.metadata)
+        qmap, units = compute_qmap(stype, metadata)
+        self.metadata = metadata
+        self.qmap, self.qmap_unit = qmap, units
         if self.mask_kernel is not None:
-            self.mask_kernel.update_qmap(self.qmap)
-        if logger.isEnabledFor(logging.DEBUG) and self.qmap:
-            sqmap = self.qmap.get("sqmap")
+            self.mask_kernel.update_qmap(qmap)
+        if logger.isEnabledFor(logging.DEBUG) and qmap:
+            sqmap = qmap.get("sqmap")
             if sqmap is not None:
                 logger.debug(f"compute_qmap: result sqmap shape={sqmap.shape}")
-        return self.qmap, self.qmap_unit
+        return qmap, units
 
     def mask_action(self, action: Literal["undo", "redo", "reset"] = "undo") -> None:
         """Execute undo/redo/reset on mask history.
@@ -184,7 +205,10 @@ class SimpleMaskKernel:
         if self.mask_kernel is None or self.mask is None:
             return self.mask if self.mask is not None else np.zeros((0, 0), dtype=bool)
 
-        self.mask = self.mask_kernel.apply(target)
+        mask = self.mask_kernel.apply(target)
+        if self.new_partition is not None and not np.array_equal(self.mask, mask):
+            self.invalidate_partition()
+        self.mask = mask
         return self.mask
 
     def save_mask(self, save_name: str) -> None:
@@ -547,9 +571,15 @@ class SimpleMaskKernel:
             symmetry_fold: Symmetry fold for phi
 
         Returns:
-            Partition dictionary or None if no data
+            Partition dictionary or None if data or applied geometry is missing
         """
-        if self.detector_image is None or self.qmap is None or self.mask is None:
+        self.invalidate_partition()
+        if (
+            self._geometry_pending
+            or self.detector_image is None
+            or self.qmap is None
+            or self.mask is None
+        ):
             return None
 
         map_names = mode.split("-")
@@ -630,8 +660,11 @@ class SimpleMaskKernel:
         Args:
             new_metadata: Dictionary with updated geometry values
         """
-        self.metadata.update(new_metadata)
-        self.compute_qmap()
+        metadata = self.metadata | new_metadata
+        if metadata != self.metadata:
+            self.invalidate_partition()
+        self._apply_geometry(metadata)
+        self.set_geometry_pending(False)
 
     def get_center(
         self, mode: Literal["xy", "vh"] = "xy"
@@ -680,6 +713,8 @@ class SimpleMaskKernel:
         """
         if self.detector_image is None:
             raise RuntimeError("No detector image loaded.")
+        if self._geometry_pending or self.qmap is None:
+            raise ValueError("Generate Q-map to apply geometry changes first.")
 
         bcx, bcy = self.get_center(mode="xy")
         initial_center = (bcx, bcy) if bcx is not None and bcy is not None else None

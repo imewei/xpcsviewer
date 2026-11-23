@@ -118,7 +118,6 @@ class SimpleMaskWindow(QMainWindow):
         self.kernel: SimpleMaskKernel | None = None
         self._unsaved_changes = False
         self._detector_image: NDArray[np.float64] | None = None
-        self._metadata: dict | None = None
         self._current_tool: str | None = None
         self._show_mask_overlay = False
         self._show_qmap_overlay = False
@@ -131,9 +130,18 @@ class SimpleMaskWindow(QMainWindow):
 
         # Set up the UI
         setup_ui(self)
+        self._geometry_fields = {
+            "bcx": self.spin_bcx,
+            "bcy": self.spin_bcy,
+            "det_dist": self.spin_det_dist,
+            "pix_dim": self.spin_pix_dim,
+            "energy": self.spin_energy,
+        }
+        self._committed_geometry: dict[str, float] = {}
 
         # Connect signals
         self._connect_signals()
+        self._refresh_partition_controls()
 
     def _connect_signals(self) -> None:
         """Connect UI signals to handlers."""
@@ -171,12 +179,8 @@ class SimpleMaskWindow(QMainWindow):
         self.action_generate_qmap.triggered.connect(self._on_generate_qmap)
         self.action_toggle_qmap.triggered.connect(self._on_toggle_qmap)
 
-        # Geometry spinbox changes update kernel
-        self.spin_bcx.valueChanged.connect(self._on_geometry_changed)
-        self.spin_bcy.valueChanged.connect(self._on_geometry_changed)
-        self.spin_det_dist.valueChanged.connect(self._on_geometry_changed)
-        self.spin_pix_dim.valueChanged.connect(self._on_geometry_changed)
-        self.spin_energy.valueChanged.connect(self._on_geometry_changed)
+        for spinbox in self._geometry_fields.values():
+            spinbox.valueChanged.connect(self._on_geometry_changed)
 
         # Auto beam-center finder
         self.btn_find_beam_center.clicked.connect(self._on_find_beam_center)
@@ -185,6 +189,13 @@ class SimpleMaskWindow(QMainWindow):
         self.btn_compute_partition.clicked.connect(self._on_compute_partition)
         self.btn_toggle_partition.clicked.connect(self._on_toggle_partition)
         self.btn_export_partition.clicked.connect(self.export_partition_to_viewer)
+        for spinbox in (
+            self.spin_dq_num,
+            self.spin_sq_num,
+            self.spin_dp_num,
+            self.spin_sp_num,
+        ):
+            spinbox.valueChanged.connect(self._on_partition_bins_changed)
 
     def _on_tool_selected(self, tool_key: str) -> None:
         """Handle drawing tool selection.
@@ -568,20 +579,15 @@ class SimpleMaskWindow(QMainWindow):
             self.status_bar.showMessage("Load data first")
             return
 
-        # Get geometry from spinboxes
         new_metadata = {
-            "bcx": self.spin_bcx.value(),
-            "bcy": self.spin_bcy.value(),
-            "det_dist": self.spin_det_dist.value(),
-            "pix_dim": self.spin_pix_dim.value(),
-            "energy": self.spin_energy.value(),
+            key: field.value()
+            for key, field in self._geometry_fields.items()
+            if self.kernel.qmap is None
+            or field.value() != self._committed_geometry[key]
         }
 
-        # Update kernel parameters
-        self.kernel.update_parameters(new_metadata)
-
         try:
-            qmap, _units = self.kernel.compute_qmap()
+            self.kernel.update_parameters(new_metadata)
         except ValueError as e:
             # Handle missing/invalid parameters
             logger.warning(f"Q-map generation failed: {e}")
@@ -593,8 +599,8 @@ class SimpleMaskWindow(QMainWindow):
             )
             return
 
-        # Initialize mask_kernel if this is the first successful Q-map computation
-        # (happens when initial load failed due to missing geometry)
+        self._update_geometry_spinboxes()
+        qmap = self.kernel.qmap
         # Initialize mask_kernel if this is the first successful Q-map computation
         # (happens when initial load failed due to missing geometry)
         if (
@@ -624,8 +630,7 @@ class SimpleMaskWindow(QMainWindow):
             # Update info label to show successful state
             if self._detector_image is not None:
                 shape = self._detector_image.shape
-                bcx = new_metadata["bcx"]
-                bcy = new_metadata["bcy"]
+                bcx, bcy = self.kernel.get_center()
                 self.info_label.setText(
                     f"Image: {shape[1]} x {shape[0]} pixels\n"
                     f"Beam center: ({bcx:.1f}, {bcy:.1f})"
@@ -634,9 +639,20 @@ class SimpleMaskWindow(QMainWindow):
             self.status_bar.showMessage("Q-map generation failed")
 
     def _on_geometry_changed(self) -> None:
-        """Handle geometry parameter change."""
-        # Mark that geometry has been modified
-        # Q-map will be regenerated on demand
+        """Track unapplied edits against the last displayed geometry values."""
+        if self.kernel is None:
+            return
+
+        pending = any(
+            field.value() != self._committed_geometry[key]
+            for key, field in self._geometry_fields.items()
+        )
+        self.kernel.set_geometry_pending(pending)
+        self.btn_compute_partition.setEnabled(not pending)
+        self.btn_find_beam_center.setEnabled(
+            not pending and self.kernel.qmap is not None
+        )
+        self._refresh_partition_controls()
 
     def _on_find_beam_center(self) -> None:
         """Auto-detect beam center from the diffraction ring pattern."""
@@ -653,20 +669,12 @@ class SimpleMaskWindow(QMainWindow):
             return
         except ValueError as e:
             logger.warning(f"Beam center detection failed: {e}")
+            self._refresh_partition_controls()
             self.status_bar.showMessage("Beam center detection failed")
             QMessageBox.warning(self, "Beam Center Detection Failed", str(e))
             return
 
-        # Reflect the result in the spinboxes without re-triggering
-        # _on_geometry_changed (the kernel already applied it).
-        self.spin_bcx.blockSignals(True)
-        self.spin_bcy.blockSignals(True)
-        try:
-            self.spin_bcx.setValue(cx)
-            self.spin_bcy.setValue(cy)
-        finally:
-            self.spin_bcx.blockSignals(False)
-            self.spin_bcy.blockSignals(False)
+        self._update_geometry_spinboxes()
 
         converged = diagnostics.get("converged", False)
         iterations = diagnostics.get("iterations", 0)
@@ -691,14 +699,19 @@ class SimpleMaskWindow(QMainWindow):
         dp_num = self.spin_dp_num.value()
         sp_num = self.spin_sp_num.value()
 
-        # Compute partition
-        partition = self.kernel.compute_partition(
-            mode="q-phi",
-            dq_num=dq_num,
-            sq_num=sq_num,
-            dp_num=dp_num,
-            sp_num=sp_num,
-        )
+        try:
+            partition = self.kernel.compute_partition(
+                mode="q-phi",
+                dq_num=dq_num,
+                sq_num=sq_num,
+                dp_num=dp_num,
+                sp_num=sp_num,
+            )
+        except ValueError as e:
+            logger.warning(f"Partition computation failed: {e}")
+            partition = None
+        finally:
+            self._refresh_partition_controls()
 
         if partition is not None:
             dq_count = (
@@ -714,6 +727,24 @@ class SimpleMaskWindow(QMainWindow):
             )
         else:
             self.status_bar.showMessage("Partition computation failed")
+
+    def _on_partition_bins_changed(self) -> None:
+        """Discard the partition computed with the previous bin counts."""
+        if self.kernel is not None:
+            self.kernel.invalidate_partition()
+            self._refresh_partition_controls()
+
+    def _refresh_partition_controls(self) -> None:
+        """Synchronize the overlay and export controls with the current result."""
+        available = self.kernel is not None and self.kernel.new_partition is not None
+        self.btn_export_partition.setEnabled(available)
+        self.btn_toggle_partition.setEnabled(available)
+        if self._show_partition_overlay:
+            if not available:
+                self._show_partition_overlay = False
+                self.btn_toggle_partition.setChecked(False)
+                self.btn_toggle_partition.setText("Show Partition")
+            self._refresh_display()
 
     def _on_toggle_partition(self) -> None:
         """Toggle partition overlay visibility."""
@@ -741,46 +772,24 @@ class SimpleMaskWindow(QMainWindow):
         self._refresh_display()
 
     def _update_geometry_spinboxes(self) -> None:
-        """Update geometry spinboxes from metadata."""
-        if self._metadata is None:
+        """Display committed geometry and remember the rounded field values."""
+        if self.kernel is None:
             return
 
-        # Block signals during update
-        self.spin_bcx.blockSignals(True)
-        self.spin_bcy.blockSignals(True)
-        self.spin_det_dist.blockSignals(True)
-        self.spin_pix_dim.blockSignals(True)
-        self.spin_energy.blockSignals(True)
-
-        try:
-            bcx = self._metadata.get("bcx")
-            if bcx is not None:
-                self.spin_bcx.setValue(float(bcx))
-
-            bcy = self._metadata.get("bcy")
-            if bcy is not None:
-                self.spin_bcy.setValue(float(bcy))
-
-            det_dist = self._metadata.get("det_dist")
-            if det_dist is not None:
-                self.spin_det_dist.setValue(float(det_dist))
-
-            pix_dim = self._metadata.get("pix_dim")
-            if pix_dim is not None:
-                self.spin_pix_dim.setValue(float(pix_dim))
-
-            energy = self._metadata.get("energy")
-            if energy is not None:
-                self.spin_energy.setValue(float(energy))
-        finally:
-            self.spin_bcx.blockSignals(False)
-            self.spin_bcy.blockSignals(False)
-            self.spin_det_dist.blockSignals(False)
-            self.spin_pix_dim.blockSignals(False)
-            self.spin_energy.blockSignals(False)
+        for key, field in self._geometry_fields.items():
+            value = self.kernel.metadata.get(key)
+            if value is not None:
+                previous = field.blockSignals(True)
+                try:
+                    field.setValue(float(value))
+                finally:
+                    field.blockSignals(previous)
+            self._committed_geometry[key] = field.value()
+        self._on_geometry_changed()
 
     def _refresh_mask_display(self) -> None:
         """Refresh display with optional mask overlay (legacy method)."""
+        self._refresh_partition_controls()
         self._refresh_display()
 
     def _refresh_display(self) -> None:
@@ -937,7 +946,6 @@ class SimpleMaskWindow(QMainWindow):
             return
 
         self._detector_image = detector_image
-        self._metadata = metadata or {}
 
         # Initialize kernel with image view handle
         if self.kernel is None:
@@ -946,17 +954,10 @@ class SimpleMaskWindow(QMainWindow):
             )
 
         try:
-            success = self.kernel.read_data(detector_image, self._metadata)
+            success = self.kernel.read_data(detector_image, metadata or {})
         except ValueError as e:
             # Handle missing geometry parameters gracefully
             logger.warning(f"Failed to initialize Q-map: {e}")
-
-            # Store image without Q-map for now
-            self.kernel.detector_image = detector_image.copy()
-            self.kernel.shape = detector_image.shape
-            self.kernel.metadata = self._metadata.copy() if self._metadata else {}
-            self.kernel.metadata["shape"] = self.kernel.shape
-            self.kernel.mask = np.ones(self.kernel.shape, dtype=bool)
 
             # Display the image anyway
             self._display_image(detector_image)
@@ -985,16 +986,12 @@ class SimpleMaskWindow(QMainWindow):
             logger.info(f"Loaded detector image with shape {detector_image.shape}")
             self._unsaved_changes = False
 
-            # Sync metadata back from kernel (includes defaults for missing params)
-            self._metadata = self.kernel.metadata.copy()
-
             # Display the image
             self._display_image(detector_image)
 
             # Update info label
             shape = detector_image.shape
-            bcx = self._metadata.get("bcx", "N/A")
-            bcy = self._metadata.get("bcy", "N/A")
+            bcx, bcy = self.kernel.get_center()
             self.info_label.setText(
                 f"Image: {shape[1]} x {shape[0]} pixels\nBeam center: ({bcx}, {bcy})"
             )
