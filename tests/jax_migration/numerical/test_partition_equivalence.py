@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 import pytest
 
-from xpcsviewer.backends import set_backend
+from xpcsviewer.backends import get_backend, set_backend
 from xpcsviewer.simplemask.utils import combine_partitions, generate_partition
 
 if TYPE_CHECKING:
@@ -26,6 +26,72 @@ try:
     JAX_AVAILABLE = True
 except ImportError:
     JAX_AVAILABLE = False
+
+
+@pytest.fixture(
+    params=[
+        "numpy",
+        pytest.param(
+            "jax",
+            marks=pytest.mark.skipif(not JAX_AVAILABLE, reason="JAX not installed"),
+        ),
+    ]
+)
+def partition_backend(request: pytest.FixtureRequest) -> None:
+    previous_backend = get_backend().name
+    request.addfinalizer(lambda: set_backend(previous_backend))
+    set_backend(request.param)
+
+
+def test_folded_phi_labels_fall_back_to_all_folds(partition_backend: None) -> None:
+    angles = np.array([[-160.0, -140.0, -120.0, -100.0]])
+    mask = np.ones_like(angles, dtype=bool)
+
+    result = generate_partition("phi", mask, angles, 4, symmetry_fold=2)
+
+    np.testing.assert_array_equal(result["partition"], [[1, 2, 3, 4]])
+    np.testing.assert_array_equal(result["v_list"], [-160, -140, -120, -100])
+
+
+def test_folded_phi_labels_prefer_first_fold_and_keep_empty_bins(
+    partition_backend: None,
+) -> None:
+    angles = np.array([[-160.0, -140.0, -120.0, -100.0, 20.0, 40.0, 55.0]])
+    mask = np.array([[True, True, True, True, True, True, False]])
+
+    result = generate_partition("phi", mask, angles, 5, symmetry_fold=2)
+
+    np.testing.assert_array_equal(result["partition"], [[1, 2, 4, 5, 1, 2, 0]])
+    np.testing.assert_array_equal(result["v_list"], [20, 40, 0, -120, -100])
+
+
+@pytest.mark.parametrize(
+    ("angles", "fold", "bins", "offset", "assignments", "labels"),
+    [
+        ([130.0, -170.0, -110.0, 150.0], 3, 2, None, [2, 1, 2, 2], [-170.0, 140.0]),
+        ([130.0, -170.0, -110.0], 3, 2, None, [2, 1, 2], [-170.0, 130.0]),
+        ([170.0, -170.0], 2, 1, 200.0, [1, 1], [-180.0]),
+    ],
+    ids=["most-populated-sector", "lowest-sector-tie", "offset-across-seam"],
+)
+def test_folded_phi_labels_choose_one_sector(
+    partition_backend: None,
+    angles: list[float],
+    fold: int,
+    bins: int,
+    offset: float | None,
+    assignments: list[int],
+    labels: list[float],
+) -> None:
+    phi = np.array([angles])
+    mask = np.ones_like(phi, dtype=bool)
+
+    result = generate_partition(
+        "phi", mask, phi, bins, phi_offset=offset, symmetry_fold=fold
+    )
+
+    np.testing.assert_array_equal(result["partition"], [assignments])
+    np.testing.assert_allclose(result["v_list"], labels, rtol=0, atol=1e-10)
 
 
 def create_test_mask(shape: tuple[int, int] = (256, 256)) -> np.ndarray:
