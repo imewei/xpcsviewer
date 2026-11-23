@@ -552,6 +552,8 @@ class QMap:
         return combined_list
 
     def get_qbin_label(self, qbin: int, append_qbin=False):
+        if not 1 <= qbin <= len(self.dynamic_index_mapping):
+            return "invalid qbin"
         qbin_absolute = self.dynamic_index_mapping[qbin - 1]
         if qbin_absolute < 0 or qbin_absolute >= len(self.qbin_labels):
             return "invalid qbin"

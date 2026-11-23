@@ -386,6 +386,30 @@ class TestQMapComputeQmap:
         assert len(units_dict) > 0, "units_dict should have entries"
 
 
+@pytest.mark.parametrize(
+    "mapping, labels, qbin, append_qbin, expected",
+    [
+        ([1, 0], ["a", "b"], -1, False, "invalid qbin"),
+        ([1, 0], ["a", "b"], 0, False, "invalid qbin"),
+        ([1, 0], ["a", "b"], 3, False, "invalid qbin"),
+        ([1, 0], ["a", "b"], 2, True, "qbin=2, a"),
+        ([0], ["a"], 0, False, "invalid qbin"),
+        ([], ["a"], 1, False, "invalid qbin"),
+        ([-1], ["a"], 1, False, "invalid qbin"),
+        ([2], ["a"], 1, False, "invalid qbin"),
+    ],
+)
+def test_qbin_label_checks_public_id_before_indexing(
+    mapping, labels, qbin, append_qbin, expected
+):
+    """Validate the public ID and mapped index independently."""
+    qmap = QMap.__new__(QMap)
+    qmap.dynamic_index_mapping = np.array(mapping, dtype=int)
+    qmap.qbin_labels = labels
+
+    assert qmap.get_qbin_label(qbin, append_qbin=append_qbin) == expected
+
+
 class TestQMapCreateQbinLabels:
     """Test suite for QMap create_qbin_labels method."""
 
