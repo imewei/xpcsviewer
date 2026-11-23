@@ -7,7 +7,7 @@ import h5py
 import numpy as np
 import pytest
 
-from xpcsviewer.fileIO import g2_regroup
+from xpcsviewer.fileIO import g2_regroup, hdf_reader
 from xpcsviewer.fileIO.g2_regroup import read_g2_regroup
 from xpcsviewer.fileIO.hdf_reader import get_analysis_type
 
@@ -304,6 +304,29 @@ def test_regroup_export_round_trips_data_and_provenance(
     assert set(tmp_path.iterdir()) == {source_path, qmap_path, output}
 
 
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX byte filenames")
+def test_regroup_export_round_trips_native_filename_bytes(
+    tmp_path, source_path, qmap_path
+):
+    source_bytes, qmap_bytes = b"source-\xff.h5", b"qmap-\xfe.h5"
+    source_name, qmap_name = os.fsdecode(source_bytes), os.fsdecode(qmap_bytes)
+    if "\udcff" not in source_name or "\udcfe" not in qmap_name:
+        pytest.skip(
+            "filesystem encoding decodes the filenames without surrogate escape"
+        )
+    source_path = source_path.rename(tmp_path / source_name)
+    qmap_path = qmap_path.rename(tmp_path / qmap_name)
+    output = tmp_path / "derived.h5"
+
+    g2_regroup.export_g2_regroup(read_g2_regroup(source_path, qmap_path), output)
+
+    with h5py.File(output, "r") as derived:
+        attrs = derived["/xpcs/multitau"].attrs
+        assert os.fsencode(attrs["source_filename"]) == source_bytes
+        assert os.fsencode(attrs["qmap_filename"]) == qmap_bytes
+    assert set(tmp_path.iterdir()) == {source_path, qmap_path, output}
+
+
 def test_regroup_export_is_not_a_viewer_result(tmp_path, source_path, qmap_path):
     output = tmp_path / "derived.h5"
     g2_regroup.export_g2_regroup(read_g2_regroup(source_path, qmap_path), output)
@@ -313,6 +336,22 @@ def test_regroup_export_is_not_a_viewer_result(tmp_path, source_path, qmap_path)
     with pytest.raises(ValueError, match="derived G2 export"):
         get_analysis_type(str(output), use_pool=False)
     assert get_analysis_type(str(source_path), use_pool=False) == ("Multitau",)
+
+
+def test_regroup_export_detection_keeps_shared_handle_open(tmp_path, monkeypatch):
+    path = str(tmp_path / "derived.h5")
+    with h5py.File(path, "w") as derived:
+        derived.attrs["xpcsviewer_artifact"] = "g2_regroup"
+
+    pool = hdf_reader.HDF5ConnectionPool()
+    monkeypatch.setattr(hdf_reader, "_connection_pool", pool)
+    try:
+        with pool.get_connection(path) as open_file:
+            with pytest.raises(ValueError, match="derived G2 export"):
+                get_analysis_type(path)
+            assert open_file.attrs["xpcsviewer_artifact"] == "g2_regroup"
+    finally:
+        pool.clear_pool()
 
 
 @pytest.mark.parametrize("marker", ["g2_regroup_preview", [b"g2_regroup", b"other"]])

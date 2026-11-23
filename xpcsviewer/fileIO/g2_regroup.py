@@ -163,6 +163,15 @@ def read_g2_regroup(
     )
 
 
+def _provenance_filename(path: Path) -> str | bytes:
+    name = path.name
+    try:
+        name.encode("utf-8")
+    except UnicodeEncodeError:
+        return os.fsencode(name)
+    return name
+
+
 def export_g2_regroup(result: G2RegroupResult, destination: Path) -> None:
     """Write a standalone regrouped HDF5 artifact to a new destination."""
     if os.path.lexists(destination):
@@ -176,8 +185,8 @@ def export_g2_regroup(result: G2RegroupResult, destination: Path) -> None:
         with temporary, h5py.File(temporary, "w") as artifact:
             artifact.attrs["xpcsviewer_artifact"] = "g2_regroup"
             multitau = artifact.create_group("/xpcs/multitau")
-            multitau.attrs["source_filename"] = result.source_path.name
-            multitau.attrs["qmap_filename"] = result.qmap_path.name
+            multitau.attrs["source_filename"] = _provenance_filename(result.source_path)
+            multitau.attrs["qmap_filename"] = _provenance_filename(result.qmap_path)
             delay_list = multitau.create_dataset("delay_list", data=result.delay_list)
             if result.delay_unit is not None:
                 delay_list.attrs["units"] = result.delay_unit
