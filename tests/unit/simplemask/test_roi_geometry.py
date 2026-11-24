@@ -6,6 +6,7 @@ only ``SimpleMaskKernel.apply_drawing`` so a wrong geometry fails on pixels.
 
 import gc
 import math
+import time
 
 import numpy as np
 import pyqtgraph as pg
@@ -19,6 +20,7 @@ from xpcsviewer.simplemask.rasterize import (
     line_vertices,
     rasterize,
 )
+from xpcsviewer.simplemask.roi_geometry import roi_to_polygon
 from xpcsviewer.simplemask.simplemask_kernel import SimpleMaskKernel
 from xpcsviewer.simplemask.simplemask_window import SimpleMaskWindow
 
@@ -242,3 +244,59 @@ def test_apply_with_no_pending_drawings_keeps_previous_layer(window):
     window.action_apply.trigger()  # (b) only undrawable shapes pending
     assert excluded(window.kernel.mask) == first
     assert "No drawings to apply" in window.status_bar.currentMessage()
+
+
+def _count_polygon2mask(monkeypatch):
+    from xpcsviewer.simplemask import rasterize as rasterize_mod
+    from xpcsviewer.simplemask import simplemask_kernel
+
+    calls = []
+    original = rasterize_mod.polygon2mask
+
+    def counting(*args, **kwargs):
+        calls.append(1)
+        return original(*args, **kwargs)
+
+    # Both modules bind the name at import, so patch each binding.
+    monkeypatch.setattr(rasterize_mod, "polygon2mask", counting)
+    monkeypatch.setattr(simplemask_kernel, "polygon2mask", counting)
+    return calls
+
+
+def test_apply_rasterises_each_roi_once(window, monkeypatch):
+    roi = pg.EllipseROI((5, 4), (12, 9))
+    roi.sl_mode = "exclusive"
+    window.kernel.hdl.add_item(roi)
+    calls = _count_polygon2mask(monkeypatch)
+    window.action_apply.trigger()
+    assert len(calls) == 1
+    assert "Applied drawings to mask" in window.status_bar.currentMessage()
+
+
+def test_large_ellipse_apply_timing(qtbot, monkeypatch):
+    """Informational only: wall time of one Apply on a detector-sized ellipse."""
+    shape = (2167, 2070)
+    win = SimpleMaskWindow()
+    qtbot.addWidget(win)
+    win.load_from_viewer(
+        np.ones(shape),
+        {
+            "bcx": 1035.0,
+            "bcy": 1083.0,
+            "det_dist": 5000.0,
+            "pix_dim": 0.075,
+            "energy": 10.0,
+        },
+    )
+    roi = pg.EllipseROI((35, 83), (2000, 2000))
+    roi.sl_mode = "exclusive"
+    win.kernel.hdl.add_item(roi)
+    calls = _count_polygon2mask(monkeypatch)
+    t0 = time.perf_counter()
+    win.action_apply.trigger()
+    print(f"\n2000x2000 ellipse Apply on {shape}: {time.perf_counter() - t0:.2f} s")
+    assert len(calls) == 1
+
+
+def test_empty_polyline_gives_n_by_2(tool):
+    assert roi_to_polygon(pg.PolyLineROI([]), tool.hdl.imageItem).shape == (0, 2)

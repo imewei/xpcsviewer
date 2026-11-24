@@ -191,7 +191,7 @@ class MaskFile(MaskBase):
             return False
 
         _, ext = os.path.splitext(fname)
-        if ext not in [".hdf", ".h5", ".hdf5"]:
+        if ext.lower() not in [".hdf", ".h5", ".hdf5"]:
             logger.error(f"MaskFile only supports HDF5 files. Found: {fname}")
             return False
 
@@ -202,14 +202,21 @@ class MaskFile(MaskBase):
             logger.error(f"Cannot read HDF file: {fname}, key: {key}")
             return False
 
-        # Handle transposed masks
-        if mask.ndim == 2 and mask.shape != self.shape:
+        # Handle transposed masks (swap only an exact transpose, so the error
+        # below reports the file's real shape)
+        if mask.shape != self.shape and mask.shape == tuple(self.shape)[::-1]:
             mask = np.swapaxes(mask, 0, 1)
 
         if mask.shape != self.shape:
             logger.error(
                 f"Mask shape {mask.shape} doesn't match detector shape {self.shape}"
             )
+            return False
+
+        # bool/int/uint/float only: bytes, strings and objects cannot be
+        # compared with 0, and complex values have no ordering.
+        if mask.dtype.kind not in "biuf":
+            logger.error(f"Unsupported mask dtype {mask.dtype} in {fname}:{key}")
             return False
 
         # Masked pixels have value <= 0

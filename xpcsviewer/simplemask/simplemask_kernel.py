@@ -21,7 +21,6 @@ from xpcsviewer.simplemask.area_mask import MaskAssemble
 from xpcsviewer.simplemask.calibration import compute_center_from_ring
 from xpcsviewer.simplemask.pyqtgraph_mod import ImageViewROI, LineROI
 from xpcsviewer.simplemask.qmap import compute_qmap
-from xpcsviewer.simplemask.rasterize import RoiPolygon, rasterize
 from xpcsviewer.simplemask.roi_geometry import roi_to_polygon
 from xpcsviewer.simplemask.utils import (
     check_consistency,
@@ -370,8 +369,9 @@ class SimpleMaskKernel:
             t.addPoints(x=[center[0]], y=[center[1]], symbol="+", size=15)
             self.hdl.add_item(t, label="center")
 
-    def _drawable_polygons(self) -> list[RoiPolygon]:
-        """Polygons of the pending ``roi_`` items that would change the mask.
+    def drawable_masks(self) -> list[tuple[str, np.ndarray]]:
+        """``(sl_mode, filled)`` for each pending ``roi_`` item that would
+        change the mask, rasterising each ROI exactly once.
 
         Skips ROIs without ``sl_mode``, with non-finite or collinear vertices
         (rank < 2, not signed area: a self-crossing polyline has zero area yet
@@ -379,7 +379,7 @@ class SimpleMaskKernel:
         """
         if self.hdl is None or self.shape is None:
             return []
-        polygons = []
+        drawn = []
         for key, roi in self.hdl.roi_items.items():
             if not key.startswith("roi_") or not hasattr(roi, "sl_mode"):
                 continue
@@ -388,18 +388,25 @@ class SimpleMaskKernel:
                 not np.isfinite(v).all()
                 or len(v) < 3
                 or np.linalg.matrix_rank(v - v.mean(axis=0), tol=1e-9) < 2
-                or not polygon2mask(self.shape, v).any()
             ):
                 continue
-            polygons.append(RoiPolygon(v, roi.sl_mode))
-        return polygons
+            filled = polygon2mask(self.shape, v)
+            if filled.any():
+                drawn.append((roi.sl_mode, filled))
+        return drawn
 
     def pending_roi_count(self) -> int:
         """Number of pending drawing ROIs that `apply_drawing` would rasterise."""
-        return len(self._drawable_polygons())
+        return len(self.drawable_masks())
 
-    def apply_drawing(self) -> np.ndarray:
-        """Rasterise all pending drawing ROIs into a keep-mask and remove them.
+    def apply_drawing(
+        self, drawn: list[tuple[str, np.ndarray]] | None = None
+    ) -> np.ndarray:
+        """Combine the pending drawing ROIs into a keep-mask and remove them.
+
+        Args:
+            drawn: result of `drawable_masks` from the same Apply, so the
+                caller's emptiness check does not rasterise a second time.
 
         Returns:
             Boolean keep-mask of ``self.shape`` (all True when nothing is drawn)
@@ -407,7 +414,20 @@ class SimpleMaskKernel:
         if self.detector_image is None or self.hdl is None or self.shape is None:
             return np.ones(self.shape, dtype=bool) if self.shape else np.array([])
 
-        keep = rasterize(self.shape, self._drawable_polygons())
+        if drawn is None:
+            drawn = self.drawable_masks()
+        # Same rule as rasterize.rasterize, on the already filled polygons.
+        exclusive = np.zeros(self.shape, dtype=bool)
+        inclusive = np.zeros(self.shape, dtype=bool)
+        has_inclusive = False
+        for mode, filled in drawn:
+            if mode == "inclusive":
+                has_inclusive = True
+                inclusive |= filled
+            else:
+                exclusive |= filled
+        keep_inclusive = inclusive if has_inclusive else np.ones(self.shape, bool)
+        keep = np.logical_and(~exclusive, keep_inclusive)
         self.hdl.remove_rois(filter_str="roi_")
         return keep
 

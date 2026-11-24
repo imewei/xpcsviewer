@@ -143,3 +143,40 @@ def test_window_loads_transposed_mask_without_prompt(window, tmp_path, monkeypat
     assert window.dialog_calls == []
     assert "Loaded mask" in window.status_bar.currentMessage()
     assert not window.kernel.mask[2, 7]
+
+
+def _write_typed(path, kind):
+    with h5py.File(path, "w") as f:
+        if kind == "bytes":
+            f["mask"] = np.full(SHAPE, b"1", dtype="S1")
+        elif kind == "vlen-str":
+            f.create_dataset("mask", SHAPE, dtype=h5py.string_dtype())
+        else:
+            f["mask"] = np.ones(SHAPE, dtype=complex)
+    return str(path)
+
+
+@pytest.mark.parametrize("kind", ["bytes", "vlen-str", "complex"])
+def test_unsupported_dtype_returns_false(tmp_path, kind):
+    kernel = _kernel()
+    before = _state(kernel)
+    assert kernel.load_mask(_write_typed(tmp_path / "m.h5", kind)) is False
+    after = _state(kernel)
+    np.testing.assert_array_equal(after[0], before[0])
+    assert after[1:] == before[1:]
+
+
+@pytest.mark.parametrize("name", ["M.H5", "m.HDF5"])
+def test_upper_case_extension_is_accepted(tmp_path, name):
+    data = np.ones(SHAPE, dtype=np.uint8)
+    data[1, 1] = 0
+    kernel = _kernel()
+    assert kernel.load_mask(_write(tmp_path / name, data)) is True
+    assert not kernel.mask[1, 1]
+
+
+def test_window_reports_string_mask_failure(window, tmp_path, monkeypatch):
+    _pick(monkeypatch, _write_typed(tmp_path / "strings.h5", "vlen-str"))
+    window._on_load_mask()
+    assert "Failed to load mask from strings.h5" in window.status_bar.currentMessage()
+    assert window.dialog_calls == []

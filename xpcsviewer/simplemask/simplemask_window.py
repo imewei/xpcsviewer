@@ -337,12 +337,13 @@ class SimpleMaskWindow(QMainWindow):
             return
 
         # An empty Apply must not replace (and so wipe) the previous draw layer.
-        if self.kernel.pending_roi_count() == 0:
+        drawn = self.kernel.drawable_masks()
+        if not drawn:
             self.status_bar.showMessage("No drawings to apply")
             return
 
         # Apply drawings from ROIs
-        mask_from_drawing = self.kernel.apply_drawing()
+        mask_from_drawing = self.kernel.apply_drawing(drawn)
 
         # Update mask via mask assembly
         if self.kernel.mask_kernel is not None:

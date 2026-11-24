@@ -24,4 +24,5 @@ def roi_to_polygon(roi: pg.ROI, image_item: pg.ImageItem, n: int = 180) -> np.nd
         else:
             local = [(0.0, 0.0), (w, 0.0), (w, h), (0.0, h)]
     mapped = [roi.mapToItem(image_item, QPointF(float(x), float(y))) for x, y in local]
-    return np.array([(p.y() - 0.5, p.x() - 0.5) for p in mapped], dtype=float)
+    rows_cols = [(p.y() - 0.5, p.x() - 0.5) for p in mapped]
+    return np.array(rows_cols, dtype=float).reshape(-1, 2)  # (0, 2) when empty
