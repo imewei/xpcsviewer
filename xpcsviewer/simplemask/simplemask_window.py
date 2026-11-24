@@ -336,6 +336,11 @@ class SimpleMaskWindow(QMainWindow):
             self.status_bar.showMessage("No data loaded")
             return
 
+        # An empty Apply must not replace (and so wipe) the previous draw layer.
+        if self.kernel.pending_roi_count() == 0:
+            self.status_bar.showMessage("No drawings to apply")
+            return
+
         # Apply drawings from ROIs
         mask_from_drawing = self.kernel.apply_drawing()
 

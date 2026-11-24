@@ -13,6 +13,7 @@ import h5py
 import numpy as np
 import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore
+from skimage.draw import polygon2mask
 
 from xpcsviewer.backends._conversions import ensure_numpy
 from xpcsviewer.fileIO.qmap_utils import Q_UNIT_DISPLAY
@@ -20,6 +21,8 @@ from xpcsviewer.simplemask.area_mask import MaskAssemble
 from xpcsviewer.simplemask.calibration import compute_center_from_ring
 from xpcsviewer.simplemask.pyqtgraph_mod import ImageViewROI, LineROI
 from xpcsviewer.simplemask.qmap import compute_qmap
+from xpcsviewer.simplemask.rasterize import RoiPolygon, rasterize
+from xpcsviewer.simplemask.roi_geometry import roi_to_polygon
 from xpcsviewer.simplemask.utils import (
     check_consistency,
     combine_partitions,
@@ -367,56 +370,46 @@ class SimpleMaskKernel:
             t.addPoints(x=[center[0]], y=[center[1]], symbol="+", size=15)
             self.hdl.add_item(t, label="center")
 
+    def _drawable_polygons(self) -> list[RoiPolygon]:
+        """Polygons of the pending ``roi_`` items that would change the mask.
+
+        Skips ROIs without ``sl_mode``, with non-finite or collinear vertices
+        (rank < 2, not signed area: a self-crossing polyline has zero area yet
+        fills pixels), or that cover no image pixel.
+        """
+        if self.hdl is None or self.shape is None:
+            return []
+        polygons = []
+        for key, roi in self.hdl.roi_items.items():
+            if not key.startswith("roi_") or not hasattr(roi, "sl_mode"):
+                continue
+            v = roi_to_polygon(roi, self.hdl.imageItem)
+            if (
+                not np.isfinite(v).all()
+                or len(v) < 3
+                or np.linalg.matrix_rank(v - v.mean(axis=0), tol=1e-9) < 2
+                or not polygon2mask(self.shape, v).any()
+            ):
+                continue
+            polygons.append(RoiPolygon(v, roi.sl_mode))
+        return polygons
+
+    def pending_roi_count(self) -> int:
+        """Number of pending drawing ROIs that `apply_drawing` would rasterise."""
+        return len(self._drawable_polygons())
+
     def apply_drawing(self) -> np.ndarray:
-        """Apply all pending drawing ROIs to create a mask.
+        """Rasterise all pending drawing ROIs into a keep-mask and remove them.
 
         Returns:
-            Mask array from drawing operations
+            Boolean keep-mask of ``self.shape`` (all True when nothing is drawn)
         """
         if self.detector_image is None or self.hdl is None or self.shape is None:
             return np.ones(self.shape, dtype=bool) if self.shape else np.array([])
 
-        shape = self.shape
-        ones = np.ones((shape[0] + 1, shape[1] + 1), dtype=bool)
-        mask_e = np.zeros_like(ones, dtype=bool)
-        mask_i = np.zeros_like(mask_e)
-
-        for k, x in self.hdl.roi_items.items():
-            if not k.startswith("roi_"):
-                continue
-
-            mask_temp = np.zeros_like(ones, dtype=bool)
-            sl, _ = x.getArraySlice(self.detector_image, self.hdl.imageItem)
-            y = x.getArrayRegion(ones, self.hdl.imageItem)
-
-            nz_idx = np.nonzero(y)
-            if len(nz_idx[0]) == 0:
-                continue
-
-            h_beg = np.min(nz_idx[1])
-            h_end = np.max(nz_idx[1]) + 1
-            v_beg = np.min(nz_idx[0])
-            v_end = np.max(nz_idx[0]) + 1
-
-            sl_v = slice(sl[0].start, sl[0].start + v_end - v_beg)
-            sl_h = slice(sl[1].start, sl[1].start + h_end - h_beg)
-            mask_temp[sl_v, sl_h] = y[v_beg:v_end, h_beg:h_end]
-
-            if hasattr(x, "sl_mode"):
-                if x.sl_mode == "exclusive":
-                    mask_e[mask_temp] = 1
-                elif x.sl_mode == "inclusive":
-                    mask_i[mask_temp] = 1
-
+        keep = rasterize(self.shape, self._drawable_polygons())
         self.hdl.remove_rois(filter_str="roi_")
-
-        if np.sum(mask_i) == 0:
-            mask_i = np.ones_like(mask_e, dtype=bool)
-
-        mask_p = np.logical_not(mask_e) * mask_i
-        mask_p = mask_p[:-1, :-1]
-
-        return mask_p
+        return keep
 
     def add_drawing(
         self,
