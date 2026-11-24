@@ -26,7 +26,7 @@ All notable changes to this project will be documented in this file.
 - Mask Editor: a rejected mask import is reported as a failure in the status bar and log, without a modal dialog; datasets of unsupported type (strings, bytes, complex) are rejected the same way, and upper-case `.H5`/`.HDF5` extensions are accepted
 - Mask Editor: draw and parameter edits replace their own mask layer instead of accumulating; Apply with nothing drawable is a no-op
 - Mask Editor: ROIs are rasterised through their transform, so rotated shapes match pySimpleMask geometry; line ROIs (vertical and angled) created programmatically or as pyqtgraph `LineROI` items are rasterised the same way, but the toolbar Line tool still does not create an ROI (known issue, unchanged in this release); degenerate and off-image ROIs are ignored
-- Mask Editor: Apply rasterises each ROI once instead of three times (about 3x faster for large curved ROIs)
+- Mask Editor: Apply on a large curved ROI is slower than in 0.1.10 (about 2.4 s for a 2000-pixel ellipse on a 2167x2070 detector), because shapes are now rasterised as polygons to match pySimpleMask geometry
 
 ## [0.1.10] - 2026-08-11
 
