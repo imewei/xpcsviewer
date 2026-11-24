@@ -446,7 +446,7 @@ class SimpleMaskWindow(QMainWindow):
             return
 
         if self._raw_file_worker is not None:
-            return
+            return  # type: ignore[unreachable]  # file dialog runs a nested event loop
 
         # Load the mask
         previous_mask = self.kernel.mask

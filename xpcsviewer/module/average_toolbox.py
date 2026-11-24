@@ -245,7 +245,7 @@ class AverageToolbox(QtCore.QRunnable):
         self.status = "finished"
         self.signals.status.emit((self.jid, self.status))
         QtCore.QMetaObject.invokeMethod(
-            self.model, "layoutChanged", QtCore.Qt.QueuedConnection
+            self.model, "layoutChanged", QtCore.Qt.ConnectionType.QueuedConnection
         )
         self.signals.progress.emit((self.jid, 100))
         self.signals.finished.emit()

@@ -2324,10 +2324,13 @@ class XpcsFile:
         sigma_reshaped = sigma_valid[:, np.newaxis]
 
         # Improved initial parameter guess based on data characteristics
-        if len(x_valid) > 1:
+        # log10 is only defined for strictly positive samples; a zero or negative
+        # tau (or q) would turn the starting values into NaN/inf.
+        positive = (x_valid > 0) & (y_valid > 0)
+        if np.count_nonzero(positive) > 1:
             # Use data-driven initial guess for better convergence
-            log_x = np.log10(x_valid)
-            log_y = np.log10(np.abs(y_valid))
+            log_x = np.log10(x_valid[positive])
+            log_y = np.log10(y_valid[positive])
 
             # Linear regression for initial slope estimate
             slope = np.polyfit(log_x, log_y, 1)[0] if len(log_x) > 1 else -2.0
