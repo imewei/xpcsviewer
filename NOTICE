@@ -11,3 +11,12 @@ under the Apache License, Version 2.0 (LICENSE-APACHE-2.0):
   Upstream file: src/pysimplemask/core/rasterize.py
   Upstream commit: 56245b4faa0fb9275cc5a554e057150909d5f977
   Modifications: reformatted docstrings for the project line length.
+
+  Derived file: xpcsviewer/simplemask/qmap.py (transmission swing rotation
+    and q = 2 k0 sin(alpha/2) in _swing_rotation and
+    _transmission_qmap_core_xp)
+  Upstream file: src/pysimplemask/core/qmap.py
+  Upstream commit: 56245b4faa0fb9275cc5a554e057150909d5f977
+  Modifications: shared NumPy / jax.jit core; zero swing skips the
+    rotation and keeps the arctan path; cos(alpha) computed as l/|v|;
+    qx and qy kept as float64.
