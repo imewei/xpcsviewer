@@ -347,7 +347,11 @@ class MaskAssemble:
         workers: Dictionary of named mask worker instances.
         mask_record: List of historical mask states.
         mask_ptr: Index into *mask_record* for the current state.
+        layer_record: Per-state layer arrays; the combined mask is their AND.
     """
+
+    # Re-applying one of these replaces its previous layer instead of adding to it.
+    REPLACING_TARGETS: frozenset[str] = frozenset({"mask_draw", "mask_parameter"})
 
     def __init__(
         self,
@@ -387,6 +391,7 @@ class MaskAssemble:
             else np.ones(shape, dtype=bool)
         )
         self.mask_record: list[np.ndarray] = [initial_mask]
+        self.layer_record: list[dict[str, np.ndarray]] = [{"accumulated": initial_mask}]
         self.mask_ptr = 0
         # 0: no mask; 1: apply the default mask
         self.mask_ptr_min = 0
@@ -413,29 +418,53 @@ class MaskAssemble:
             return self.get_mask()
 
         new_layer = self.get_one_mask(target)
-        # Use read-only view for the current mask — avoids a 4MB memcpy.
-        # np.logical_and always allocates a fresh output array, so `combined`
-        # is already an independent copy that is safe to push to history.
-        current_ref = self._get_mask_ref()
-        combined = np.logical_and(current_ref, new_layer)
+        # Unchanged layers are shared by reference with the previous state.
+        layers = dict(self._layers_at(self.mask_ptr))
+        key = target if target in self.REPLACING_TARGETS else "accumulated"
+        old_layer = layers.get(key)
+        if key == "accumulated" and old_layer is not None:
+            new_layer = np.logical_and(old_layer, new_layer)
+        layers[key] = new_layer
+        # np.logical_and.reduce allocates, so `combined` is safe to push to history.
+        combined = np.logical_and.reduce(list(layers.values()))
 
+        # A missing layer excludes nothing, i.e. it is all True. Comparing the
+        # layer itself keeps edits hidden under existing exclusions undoable.
+        layer_changed = (
+            not new_layer.all()
+            if old_layer is None
+            else not np.array_equal(old_layer, new_layer)
+        )
         # Short-circuit change detection: compare nonzero counts first (integer
         # comparison) before falling back to the full O(H*W) element scan.
         last = self.mask_record[self.mask_ptr]
-        changed = (combined.sum() != last.sum()) or not np.array_equal(last, combined)
+        changed = (
+            layer_changed
+            or combined.sum() != last.sum()
+            or not np.array_equal(last, combined)
+        )
 
         if changed:
+            # mask_record may have been extended directly; keep the lists aligned.
+            while len(self.layer_record) < self.mask_ptr + 1:
+                self.layer_record.append(self._layers_at(len(self.layer_record)))
             # Remove any redo states beyond current pointer
             while len(self.mask_record) > self.mask_ptr + 1:
                 self.mask_record.pop()
-            # combined is freshly allocated — push directly, no extra copy needed.
+            while len(self.layer_record) > self.mask_ptr + 1:
+                self.layer_record.pop()
             self.mask_record.append(combined)
+            self.layer_record.append(layers)
             self.mask_ptr += 1
 
-            # Enforce bounded history: drop the oldest entry (beyond mask_ptr_min
-            # anchor) when the limit is exceeded to prevent unbounded memory growth.
-            if len(self.mask_record) > self.max_history + self.mask_ptr_min:
-                self.mask_record.pop(self.mask_ptr_min)
+            # Enforce bounded history. Pop the oldest undo state after the
+            # baseline so reset still returns to it, and never the new state.
+            cap = max(self.max_history, 2) + self.mask_ptr_min
+            oldest = self.mask_ptr_min + 1
+            while len(self.mask_record) > cap:
+                self.mask_record.pop(oldest)
+                if len(self.layer_record) > oldest:
+                    self.layer_record.pop(oldest)
                 self.mask_ptr -= 1
         return combined
 
@@ -474,7 +503,19 @@ class MaskAssemble:
             # Keep the default mask if one exists
             while len(self.mask_record) > 1 + self.mask_ptr_min:
                 self.mask_record.pop()
+            while len(self.layer_record) > 1 + self.mask_ptr_min:
+                self.layer_record.pop()
             self.mask_ptr = self.mask_ptr_min
+
+    def _layers_at(self, ptr: int) -> dict[str, np.ndarray]:
+        """Return the layers of history entry *ptr*.
+
+        Entries added to ``mask_record`` directly have no layer record and
+        are treated as a single accumulated layer.
+        """
+        if ptr < len(self.layer_record):
+            return self.layer_record[ptr]
+        return {"accumulated": self.mask_record[ptr]}
 
     def get_one_mask(self, target: str) -> np.ndarray:
         """Get mask from a single worker.
