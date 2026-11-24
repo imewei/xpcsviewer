@@ -18,5 +18,7 @@ under the Apache License, Version 2.0 (LICENSE-APACHE-2.0):
   Upstream file: src/pysimplemask/core/qmap.py
   Upstream commit: 56245b4faa0fb9275cc5a554e057150909d5f977
   Modifications: shared NumPy / jax.jit core; zero swing skips the
-    rotation and keeps the arctan path; cos(alpha) computed as l/|v|;
-    qx and qy kept as float64.
+    rotation and keeps the arctan path; alpha computed with
+    arctan2(hypot(x, y), l), exact near the beam (upstream uses arccos(l/|v|),
+    so results deliberately differ within about 1 pixel of the beam; the rest
+    of the detector agrees with upstream to 1e-12); qx and qy kept as float64.

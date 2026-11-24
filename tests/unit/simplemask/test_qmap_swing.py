@@ -810,9 +810,34 @@ def _rotated_alpha_phi(h_deg: float, v_deg: float) -> tuple[np.ndarray, np.ndarr
     rx = np.array([[1, 0, 0], [0, np.cos(b), -np.sin(b)], [0, np.sin(b), np.cos(b)]])
     ry = np.array([[np.cos(a), 0, -np.sin(a)], [0, 1, 0], [np.sin(a), 0, np.cos(a)]])
     rot = vec @ (ry @ rx).T
-    alpha = np.arccos(rot[..., 2] / np.linalg.norm(rot, axis=-1))
+    # arctan2 of the transverse / longitudinal parts: exact near the beam.
+    alpha = np.arctan2(np.linalg.norm(rot[..., :2], axis=-1), rot[..., 2])
     phi = -np.arctan2(rot[..., 1], rot[..., 0])
     return alpha, phi
+
+
+@pytest.mark.parametrize("backend", ["numpy", "jax"])
+def test_swung_q_is_exact_near_the_beam(use_backend, backend: str) -> None:
+    """arccos(l/|v|) loses ~1e-5 relative in q within a pixel of the beam."""
+    use_backend(backend)
+    shape, center, pix, dist, energy = (200, 240), (100.0, 120.0), 0.075, 5000.0, 10.0
+    qmap, _ = compute_transmission_qmap(energy, center, shape, pix, dist, 0.05, 0.0)
+    ld = np.longdouble
+    a = np.deg2rad(ld(0.05))
+    k0 = 2 * ld(np.pi) / (ld(E2KCONST) / ld(energy))
+    for row, col in [(100, 178), (100, 177), (100, 179), (101, 178), (99, 178)]:
+        # swing_h rotates (h, v, l) about the vertical axis: Ry = [[c,0,-s],[0,1,0],[s,0,c]]
+        h, v, length = (
+            (col - ld(center[1])) * ld(pix),
+            (row - ld(center[0])) * ld(pix),
+            ld(dist),
+        )
+        x = np.cos(a) * h - np.sin(a) * length
+        z = np.sin(a) * h + np.cos(a) * length
+        alpha = np.arctan2(np.hypot(x, v), z)
+        np.testing.assert_allclose(
+            qmap["q"][row, col], float(2 * k0 * np.sin(alpha / 2)), rtol=1e-9, atol=0
+        )
 
 
 def test_swung_components_match_rotated_vectors() -> None:

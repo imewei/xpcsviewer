@@ -1,3 +1,8 @@
+# Copyright © UChicago Argonne LLC
+# See LICENSE-APACHE-2.0 for details (Apache License 2.0).
+#
+# Ported from pySimpleMask 56245b4 `src/pysimplemask/core/qmap.py`;
+# modified for xpcsviewer.
 """Q-map computation for SimpleMask.
 
 This module provides functions to compute momentum transfer (Q) maps
@@ -166,8 +171,8 @@ def _transmission_qmap_core_xp(
             [hg * pix_dim, vg * pix_dim, xp.full_like(vg, 1.0) * det_dist], axis=-1
         )
         coor = det_vec @ rot.T
-        cos_alpha = coor[..., 2] / xp.linalg.norm(coor, axis=-1)
-        alpha = xp.arccos(xp.clip(cos_alpha, -1.0, 1.0))
+        # arctan2 stays exact near the beam, where arccos(l/|v|) cancels.
+        alpha = xp.arctan2(xp.hypot(coor[..., 0], coor[..., 1]), coor[..., 2])
         phi = xp.arctan2(coor[..., 1], coor[..., 0]) * (-1)
 
     # Q components use the in-plane projection; q is the full |Q|.
