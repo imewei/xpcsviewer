@@ -142,9 +142,9 @@ class LoggingConfig:
         try:
             from importlib.metadata import version
 
-            return version("xpcsviewer")
+            return version("xpcsviewer-gui")
         except Exception:
-            return "unknown"
+            return "0+unknown"
 
     def _configure_logging(self):
         """Configure the logging system."""
