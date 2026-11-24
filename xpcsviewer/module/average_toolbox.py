@@ -5,7 +5,7 @@ import threading
 import time
 import traceback
 import uuid
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from shutil import copyfile
 
 # Third-party imports
@@ -389,8 +389,9 @@ class AverageToolbox(QtCore.QRunnable):
                 )
                 future_to_batch[future] = batch_indices
 
-            # Collect results as they complete
-            for future in as_completed(future_to_batch):
+            # Merge in submission (file) order so the first file in the list,
+            # not thread timing, sets the accepted shape, as in sequential.
+            for future in future_to_batch:
                 if self.is_killed.is_set():
                     logger.info("the averaging instance has been killed.")
                     self._progress = "killed"
@@ -402,8 +403,6 @@ class AverageToolbox(QtCore.QRunnable):
                     batch_results, batch_baselines = future.result()
 
                     # Merge batch results into main result
-                    # Write baseline at file's original index m so that
-                    # completion order (as_completed) does not corrupt ordering.
                     for m, (file_result, baseline_val) in zip(
                         batch_indices,
                         zip(batch_results, batch_baselines, strict=False),
@@ -411,19 +410,25 @@ class AverageToolbox(QtCore.QRunnable):
                     ):
                         self.baseline[m] = baseline_val
 
+                        # All-or-nothing, as in the sequential path, so mask[m]
+                        # means every field of file m was summed.
                         if file_result is not None:
-                            for key in fields:
-                                data = file_result[key]
-                                if result[key] is None:
-                                    result[key] = data
-                                    mask[m] = 1
-                                elif result[key].shape == data.shape:
-                                    result[key] += data
-                                    mask[m] = 1
-                                else:
-                                    logger.info(
-                                        f"data shape does not match for key {key}"
-                                    )
+                            if all(
+                                result[key] is None
+                                or result[key].shape == file_result[key].shape
+                                for key in fields
+                            ):
+                                mask[m] = 1
+                                for key in fields:
+                                    if result[key] is None:
+                                        result[key] = file_result[key].copy()
+                                    else:
+                                        result[key] += file_result[key]
+                            else:
+                                logger.info(
+                                    "data shape does not match, skipping %s",
+                                    self.model[m],
+                                )
 
                         self.signals.values.emit((self.jid, baseline_val))
 

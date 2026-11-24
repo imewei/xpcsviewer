@@ -3292,12 +3292,12 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         if worker is None:
             self.statusbar.showMessage("no averaging job exists", 1000)
             return
-        if worker.status == "finished":
-            self.statusbar.showMessage("this job has finished", 1000)
+        # Only a fresh job may start: a queued job started twice segfaults, and
+        # a run worker is auto-deleted, so restarting it raises.
+        if worker.status != "wait":
+            self.statusbar.showMessage(f"this job is {worker.status}", 1000)
             return
-        if worker.status == "running":
-            self.statusbar.showMessage("this job is running.", 1000)
-            return
+        worker.status = "queued"  # do_average sets "running" when it starts
 
         # Disconnect any previously connected slot before reconnecting (BUG-037):
         # prevents lambda slot accumulation on repeated calls.

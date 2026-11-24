@@ -2,8 +2,10 @@
 
 import logging
 import multiprocessing
+import os
 from unittest.mock import MagicMock
 
+import numpy as np
 import pytest
 
 from xpcsviewer.module.average_toolbox import AverageToolbox
@@ -159,3 +161,84 @@ def test_poll_running_keeps_timer_running():
     XpcsViewer._poll_avg_job(viewer)
     viewer.timer.stop.assert_not_called()
     assert not _empty_messages(viewer)
+
+
+class _FakeXF:
+    """Stand-in XpcsFile: g2 == 1, g2_err == 10; odd files get one extra lag."""
+
+    def __init__(self, path, fields=None):
+        index = int(os.path.basename(path)[1:].split("_")[0])
+        n_lag = 5 + (index % 2 if _FakeXF.mixed else 0)
+        self.g2 = np.ones((n_lag, 3))
+        self.g2_err = np.full((n_lag, 3), 10.0)
+        self.saxs_2d = np.full((4, 5), float(index))
+
+    def clear_cache(self):
+        pass
+
+
+def _average(tmp_path, monkeypatch, parallel, mixed):
+    monkeypatch.setattr(_FakeXF, "mixed", mixed, raising=False)
+    monkeypatch.setattr("xpcsviewer.module.average_toolbox.XF", _FakeXF)
+    monkeypatch.setattr("xpcsviewer.module.average_toolbox.copyfile", lambda *a: None)
+    written = {}
+    monkeypatch.setattr(
+        "xpcsviewer.module.average_toolbox.put",
+        lambda path, result, **k: written.update(result),
+    )
+    monkeypatch.setattr(multiprocessing, "cpu_count", lambda: 4 if parallel else 1)
+    monkeypatch.setattr(
+        "xpcsviewer.module.average_toolbox.MemoryMonitor.is_memory_pressure_high",
+        staticmethod(lambda *a, **k: False),
+    )
+    calls = []
+    for name in ("_process_files_parallel", "_process_files_sequential"):
+        original = getattr(AverageToolbox, name)
+
+        def spy(self, *a, _orig=original, _name=name, **k):
+            calls.append(_name)
+            return _orig(self, *a, **k)
+
+        monkeypatch.setattr(AverageToolbox, name, spy)
+    toolbox, _ = _make(tmp_path, n_files=8)
+    toolbox.do_average(
+        save_path=str(tmp_path / "out.h5"), fields=["g2", "g2_err", "saxs_2d"]
+    )
+    expected = "_process_files_parallel" if parallel else "_process_files_sequential"
+    assert calls == [expected]
+    return toolbox, written
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+def test_parallel_merge_matches_sequential(tmp_path, monkeypatch, mixed):
+    par, par_out = _average(tmp_path, monkeypatch, parallel=True, mixed=mixed)
+    seq, seq_out = _average(tmp_path, monkeypatch, parallel=False, mixed=mixed)
+    assert par.status == seq.status == "finished"
+    assert par.n_accepted == seq.n_accepted == (4 if mixed else 8)
+    assert par_out.keys() == seq_out.keys()
+    for key in seq_out:
+        np.testing.assert_array_equal(par_out[key], seq_out[key])
+    np.testing.assert_array_equal(par_out["g2"], 1.0)
+    np.testing.assert_allclose(par_out["g2_err"], 10.0 / np.sqrt(par.n_accepted))
+
+
+def _start_self(status):
+    viewer = MagicMock()
+    viewer.vk.avg_worker.status = status
+    return viewer
+
+
+def test_second_start_of_queued_job_is_refused():
+    viewer = _start_self("wait")
+    XpcsViewer.start_avg_job(viewer)
+    XpcsViewer.start_avg_job(viewer)  # still queued: a second start crashed Qt
+    viewer.thread_pool.start.assert_called_once_with(viewer.vk.avg_worker)
+
+
+@pytest.mark.parametrize("status", ["running", "finished", "killed"])
+def test_non_waiting_job_is_not_restarted(status):
+    viewer = _start_self(status)
+    XpcsViewer.start_avg_job(viewer)
+    viewer.thread_pool.start.assert_not_called()
+    assert viewer.vk.avg_worker.status == status
+    assert status in viewer.statusbar.showMessage.call_args.args[0]
