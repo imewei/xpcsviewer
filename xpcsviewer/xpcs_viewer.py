@@ -3268,8 +3268,22 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
 
         self.timer.setInterval(1000)
         worker.initialize_plot(self.mp_avg_g2)
-        self.timer.timeout.connect(self.vk.update_avg_info)
+        self.timer.timeout.connect(self._poll_avg_job)
         self.timer.start()
+
+    def _poll_avg_job(self) -> None:
+        """1 Hz tick: refresh the plot, stop on a terminal job state."""
+        if self.vk is None or self.vk.avg_worker is None:
+            self.timer.stop()
+            return
+        self.vk.update_avg_info()
+        worker = self.vk.avg_worker
+        if worker.status in ("finished", "killed"):
+            self.timer.stop()
+            if worker.status == "finished" and worker.n_accepted == 0:
+                self.statusbar.showMessage(
+                    "Averaging finished: no valid dataset; no output written", 8000
+                )
 
     def start_avg_job(self):
         if self.vk is None:

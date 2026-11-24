@@ -80,6 +80,7 @@ class AverageToolbox(QtCore.QRunnable):
         self.origin_path = os.path.join(self.work_dir, self.model[0])
 
         self.is_killed = threading.Event()
+        self.n_accepted = 0
 
     def kill(self):
         self.is_killed.set()
@@ -121,7 +122,8 @@ class AverageToolbox(QtCore.QRunnable):
             fields = ["saxs_2d"]
         self.stime = time.strftime("%H:%M:%S")
         self.status = "running"
-        logger.info("average job %d starts", self.jid)
+        self.n_accepted = 0
+        logger.info("average job %s starts", self.jid)
         tot_num = len(self.model)
         steps = (tot_num + chunk_size - 1) // chunk_size
         mask = np.zeros(tot_num, dtype=np.int64)
@@ -180,8 +182,13 @@ class AverageToolbox(QtCore.QRunnable):
                 t0,
             )
 
+        if self.is_killed.is_set():
+            # the parallel path returns on a kill without setting the status
+            self.status = "killed"
+            return
         if np.sum(mask) == 0:
             logger.info("no dataset is valid; check the baseline criteria.")
+            self._finish(0)
             return
         for key in fields:
             if key == "saxs_1d":
@@ -228,16 +235,21 @@ class AverageToolbox(QtCore.QRunnable):
         final_cleanup_memory_mb, _ = MemoryMonitor.get_memory_usage()
         logger.info(f"Memory after cleanup: {final_cleanup_memory_mb:.1f}MB")
 
+        self._finish(int(np.sum(mask)))
+        return  # Return None since we deleted result to save memory
+
+    def _finish(self, n_accepted: int) -> None:
+        """Publish completion; count and end time precede the status flip."""
+        self.n_accepted = n_accepted
+        self.etime = time.strftime("%H:%M:%S")
         self.status = "finished"
         self.signals.status.emit((self.jid, self.status))
-        self.etime = time.strftime("%H:%M:%S")
         QtCore.QMetaObject.invokeMethod(
             self.model, "layoutChanged", QtCore.Qt.QueuedConnection
         )
         self.signals.progress.emit((self.jid, 100))
         self.signals.finished.emit()
-        logger.info("average job %d finished", self.jid)
-        return  # Return None since we deleted result to save memory
+        logger.info("average job %s finished", self.jid)
 
     def _process_files_sequential(
         self,
