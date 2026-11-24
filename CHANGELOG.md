@@ -17,12 +17,16 @@ All notable changes to this project will be documented in this file.
 ### Fixed
 
 - Version: `xpcsviewer.__version__` previously fell back to a hard-coded `0.1.10` (and the log banner to `unknown`); it is now looked up from the `xpcsviewer-gui` distribution, so installed wheels report their real version, with `0+unknown` only when package metadata is absent
-- Fitting: `fit_with_fixed*` raise `ValueError` when a parameter is fixed without an explicit value, instead of silently holding it at the bounds midpoint; failed-fit placeholders keep the explicit fixed values; external callers must now pass a finite `p0` whenever a parameter is fixed (`fit_with_fixed*` also raise when a fixed parameter's `p0` is not finite)
-- Fitting: tau-q starting values ignore zero or non-positive tau and q samples, so they can no longer be NaN
+- Fitting: in the G2 fit panel an unchecked parameter is still held at the midpoint of its min/max bounds (the geometric mean when the tau bounds are positive). Scripts calling `fit_with_fixed*` directly must now pass an explicit, finite `p0` whenever a parameter is fixed (`ValueError` otherwise) instead of getting a silent bounds-midpoint fallback; failed-fit placeholders keep the explicit fixed values
+- Fitting: `fit_with_fixed*` treat integer `fit_flag` values such as `[1, 1, 0]` as booleans; integer flags previously gave wrong parameters
+- Fitting: tau-q ignores samples with non-positive tau or q (or infinite q) for the starting values, the fit and the plot grid, and logs how many it dropped; such samples previously made the starting values NaN, biased the fitted amplitude or failed the fit
 - Averaging: a job whose inputs are all rejected (by the baseline criteria or because they fail to load) now ends `finished` with no output file (it stayed `running` and kept polling); killed jobs stay `killed`, and the empty result is reported in the status bar
-- Mask Editor: a rejected mask import is reported as a failure in the status bar and log, without a modal dialog
+- Averaging: with 8 or more files (the parallel path) a scan is averaged only when all its fields match the shapes already accepted, as on the sequential path, and the job reports the number of scans actually averaged; a scan with a different lag count previously diluted G2 and its error bars
+- Averaging: a second Start click on a queued, running, finished or killed job is ignored (it could crash the application)
+- Mask Editor: a rejected mask import is reported as a failure in the status bar and log, without a modal dialog; datasets of unsupported type (strings, bytes, complex) are rejected the same way, and upper-case `.H5`/`.HDF5` extensions are accepted
 - Mask Editor: draw and parameter edits replace their own mask layer instead of accumulating; Apply with nothing drawable is a no-op
-- Mask Editor: ROIs are rasterised through their transform, so rotated shapes and lines match pySimpleMask geometry; degenerate and off-image ROIs are ignored
+- Mask Editor: ROIs are rasterised through their transform, so rotated shapes match pySimpleMask geometry; line ROIs (vertical and angled) created programmatically or as pyqtgraph `LineROI` items are rasterised the same way, but the toolbar Line tool still does not create an ROI (known issue, unchanged in this release); degenerate and off-image ROIs are ignored
+- Mask Editor: Apply rasterises each ROI once instead of three times (about 3x faster for large curved ROIs)
 
 ## [0.1.10] - 2026-08-11
 
