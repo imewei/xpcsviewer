@@ -251,12 +251,15 @@ class SimpleMaskKernel:
             key: Dataset key for mask data
 
         Returns:
-            True if successful
+            True if a mask of the detector shape (or its transpose) was read
+            and applied; False leaves the current mask and history unchanged.
         """
         if self.mask_kernel is None:
             return False
 
-        self.mask_kernel.evaluate("mask_file", fname=fname, key=key)
+        # MaskAssemble.evaluate returns a description, not a success flag.
+        if not self.mask_kernel.workers["mask_file"].evaluate(fname=fname, key=key):
+            return False
         self.mask_apply("mask_file")
         return True
 

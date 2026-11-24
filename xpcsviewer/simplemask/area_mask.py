@@ -79,7 +79,7 @@ class MaskBase:
         self.mtype = "base"
         self.qrings: list = []
 
-    def evaluate(self, **kwargs: Any) -> None:
+    def evaluate(self, **kwargs: Any) -> bool | None:
         """Evaluate mask (base method)."""
 
     def describe(self) -> str:
@@ -174,47 +174,47 @@ class MaskFile(MaskBase):
         fname: str | None = None,
         key: str | None = None,
         **kwargs: Any,
-    ) -> None:
+    ) -> bool:
         """Load mask from an HDF5 file.
 
         Args:
             fname: Path to HDF5 file
             key: Dataset key within the HDF5 file containing the mask
+
+        Returns:
+            True only when a mask of the detector shape (or its transpose)
+            was read; otherwise False and ``zero_loc`` is cleared.
         """
-        if fname is None or not os.path.isfile(fname):
-            self.zero_loc = None
-            return
+        self.zero_loc = None
+        if fname is None or key is None or not os.path.isfile(fname):
+            logger.error(f"Mask file not found: {fname}")
+            return False
 
         _, ext = os.path.splitext(fname)
-        mask = None
-
-        if ext in [".hdf", ".h5", ".hdf5"]:
-            try:
-                with h5py.File(fname, "r") as f:
-                    mask = f[key][()]
-            except Exception:
-                logger.error(f"Cannot read HDF file: {fname}, key: {key}")
-        else:
+        if ext not in [".hdf", ".h5", ".hdf5"]:
             logger.error(f"MaskFile only supports HDF5 files. Found: {fname}")
+            return False
 
-        if mask is None:
-            self.zero_loc = None
-            return
+        try:
+            with h5py.File(fname, "r") as f:
+                mask = np.asarray(f[key][()])
+        except Exception:
+            logger.error(f"Cannot read HDF file: {fname}, key: {key}")
+            return False
 
         # Handle transposed masks
-        if mask.shape != self.shape:
+        if mask.ndim == 2 and mask.shape != self.shape:
             mask = np.swapaxes(mask, 0, 1)
 
         if mask.shape != self.shape:
             logger.error(
                 f"Mask shape {mask.shape} doesn't match detector shape {self.shape}"
             )
-            self.zero_loc = None
-            return
+            return False
 
         # Masked pixels have value <= 0
-        mask = mask <= 0
-        self.zero_loc = np.array(np.nonzero(mask))
+        self.zero_loc = np.array(np.nonzero(mask <= 0))
+        return True
 
 
 class MaskThreshold(MaskBase):

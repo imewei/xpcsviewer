@@ -9,7 +9,6 @@ from pathlib import Path
 from typing import Any, Literal
 from uuid import uuid4
 
-import h5py
 import numpy as np
 from numpy.typing import NDArray
 
@@ -441,11 +440,7 @@ class SimpleMaskWindow(QMainWindow):
         if not file_path:
             return
 
-        # Validate mask dimensions before loading
-        if (
-            not self._validate_mask_dimensions(file_path)
-            or self._raw_file_worker is not None
-        ):
+        if self._raw_file_worker is not None:
             return
 
         # Load the mask
@@ -459,59 +454,10 @@ class SimpleMaskWindow(QMainWindow):
             self.status_bar.showMessage(f"Loaded mask from {Path(file_path).name}")
             logger.info(f"Loaded mask from {file_path}")
         else:
-            QMessageBox.warning(
-                self,
-                "Load Failed",
-                f"Failed to load mask from:\n{file_path}",
+            self.status_bar.showMessage(
+                f"Failed to load mask from {Path(file_path).name}"
             )
-
-    def _validate_mask_dimensions(self, file_path: str) -> bool:
-        """Validate that mask file dimensions match current detector shape.
-
-        Args:
-            file_path: Path to HDF5 mask file
-
-        Returns:
-            True if dimensions match or user confirms override
-        """
-        if self.kernel is None or self.kernel.shape is None:
-            return False
-
-        try:
-            with h5py.File(file_path, "r") as hf:
-                if "mask" not in hf:
-                    QMessageBox.warning(
-                        self,
-                        "Invalid Mask File",
-                        f"No 'mask' dataset found in:\n{file_path}",
-                    )
-                    return False
-
-                mask_shape = hf["mask"].shape
-                detector_shape = self.kernel.shape
-
-                if mask_shape != detector_shape:
-                    reply = QMessageBox.warning(
-                        self,
-                        "Dimension Mismatch",
-                        f"Mask dimensions {mask_shape} do not match\n"
-                        f"detector dimensions {detector_shape}.\n\n"
-                        "Load anyway? (mask will be cropped or padded)",
-                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                        QMessageBox.StandardButton.No,
-                    )
-                    if reply == QMessageBox.StandardButton.No:
-                        return False
-
-        except OSError as e:
-            QMessageBox.critical(
-                self,
-                "File Error",
-                f"Could not read mask file:\n{file_path}\n\nError: {e}",
-            )
-            return False
-
-        return True
+            logger.warning(f"Failed to load mask from {file_path}")
 
     def _on_open_raw_file(self) -> None:
         """Choose an HDF5 detector file and its averaging range."""
