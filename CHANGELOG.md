@@ -4,6 +4,25 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Mask Editor: ROI vertex rasteriser ported from pySimpleMask (Apache-2.0); the wheel now ships `NOTICE` and `LICENSE-APACHE-2.0`
+- Q-map: transmission geometry accepts horizontal and vertical detector swing angles (degrees, read from optional metadata keys); zero swing leaves TTH, phi, qx, qy, x and y unchanged
+
+### Changed
+
+- Add `scikit-image>=0.26.0` dependency (used by the ROI rasteriser)
+- Q-map: `q` is now the momentum-transfer magnitude `2*k0*sin(alpha/2)` instead of `k0*sin(alpha)`; `qx`/`qy` keep the `k0*sin(alpha)` projection. Saved zero-swing transmission Q-maps and q-based partitions shift slightly, by about `alpha^2/8` relative (more at wide angle)
+
+### Fixed
+
+- Version: `xpcsviewer.__version__` is looked up from the `xpcsviewer-gui` distribution, so installed wheels report their real version instead of `unknown`
+- Fitting: `fit_with_fixed*` raise `ValueError` when a parameter is fixed without an explicit value, instead of silently holding it at the bounds midpoint; failed-fit placeholders keep the explicit fixed values
+- Averaging: a job whose inputs are all rejected (by the baseline criteria or because they fail to load) now ends `finished` with no output file (it stayed `running` and kept polling); killed jobs stay `killed`, and the empty result is reported in the status bar
+- Mask Editor: a rejected mask import is reported as a failure in the status bar and log, without a modal dialog
+- Mask Editor: draw and parameter edits replace their own mask layer instead of accumulating; Apply with nothing drawable is a no-op
+- Mask Editor: ROIs are rasterised through their transform, so rotated shapes and lines match pySimpleMask geometry; degenerate and off-image ROIs are ignored
+
 ## [0.1.10] - 2026-08-11
 
 ### Added
