@@ -16,7 +16,9 @@ from .hdf import HdfDataset
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["HdfDataset", "ScatteringDataset", "get_format_loader"]
+__all__ = ["HDF5_SUFFIXES", "HdfDataset", "ScatteringDataset", "get_format_loader"]
+
+HDF5_SUFFIXES: tuple[str, ...] = (".h5", ".hdf5", ".hdf")
 
 
 def get_format_loader(fname: str, **kwargs: Any) -> ScatteringDataset:
@@ -27,7 +29,7 @@ def get_format_loader(fname: str, **kwargs: Any) -> ScatteringDataset:
     Raises:
         ValueError: If the extension is not recognized.
     """
-    if fname.endswith((".h5", ".hdf5", ".hdf")):
+    if fname.casefold().endswith(HDF5_SUFFIXES):
         logger.info("APS HDF dataset")
         return HdfDataset(fname, **kwargs)
     raise ValueError(f"unsupported dataset file: {fname}")

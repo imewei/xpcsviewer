@@ -2,9 +2,9 @@
 import json
 import os
 import shutil
-import time
 from collections import OrderedDict
 from pathlib import Path
+from uuid import uuid4
 
 # Third-party imports
 import numpy as np
@@ -28,7 +28,9 @@ from .backends._conversions import ensure_numpy
 
 # Import async components
 from .constants import MIN_AVERAGING_FILES
+from .fileIO.g2_regroup import G2RegroupResult
 from .fileIO.qmap_utils import Q_UNIT_DISPLAY
+from .gui.g2_regroup_dialog import G2RegroupDialog, G2RegroupExportWorker
 from .gui.layout_helpers import apply_all_layout_improvements
 from .gui.shortcuts.shortcut_manager import ShortcutManager
 
@@ -177,6 +179,8 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
 
         self.thread_pool = QtCore.QThreadPool()
         logger.info("Maximal threads: %d", self.thread_pool.maxThreadCount())
+        self._g2_regroup_dialog: G2RegroupDialog | None = None
+        self._g2_regroup_export: G2RegroupExportWorker | None = None
 
         # Initialize async components
         self.progress_manager = ProgressManager(self)
@@ -209,6 +213,7 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
 
         # Track active async operations
         self.active_plot_operations = {}  # operation_id -> plot_type
+        self._g2_fit_bounds_initialized = False
 
         # list widget models
         self.source_model = None
@@ -660,6 +665,10 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         action_reload.triggered.connect(self.reload_source)
         file_menu.addAction(action_reload)
 
+        action_regroup = QAction("Regroup G2…", self)
+        action_regroup.triggered.connect(self._open_g2_regroup)
+        file_menu.addAction(action_regroup)
+
         # Recent directories submenu
         self.recent_menu = file_menu.addMenu("Recent &Directories")
         self._populate_recent_directories_menu()
@@ -1005,6 +1014,8 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         Args:
             event: The close event
         """
+        self._close_g2_regroup()
+
         # Close SimpleMask window if open
         if hasattr(self, "_simplemask_window") and self._simplemask_window is not None:
             self._simplemask_window.close()
@@ -1448,6 +1459,12 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         self, operation_id: str, error_msg: str, traceback_str: str
     ):
         """Handle async operation errors."""
+        if (
+            operation_id.startswith("plot_")
+            and operation_id not in self.active_plot_operations
+        ):
+            return
+
         logger.error(f"Async operation {operation_id} failed: {error_msg}")
         logger.debug(f"Traceback: {traceback_str}")
 
@@ -1532,6 +1549,7 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
                     not in {"q_range", "t_range", "y_range", "rows", "target_timestamp"}
                 },
             )
+            self._initialize_g2_fit_bounds(result.get("fit_delay_extent"))
             logger.info("G2 plot applied successfully from async worker result")
 
         except Exception as e:
@@ -1712,6 +1730,78 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             )
 
         return selected_row
+
+    @QtCore.Slot()
+    def _open_g2_regroup(self) -> None:
+        if self._g2_regroup_dialog is not None:
+            self._g2_regroup_dialog.raise_()
+            self._g2_regroup_dialog.activateWindow()
+            return
+
+        selected = self.list_view_target.selectedIndexes()
+        if self.vk is None or len(selected) != 1:
+            self.statusbar.showMessage(
+                "Select one result in the Target list to regroup G2.", 5000
+            )
+            return
+
+        source = (Path(self.vk.path) / self.vk.target[selected[0].row()]).resolve()
+        dialog = G2RegroupDialog(source, self.thread_pool, self)
+        self._g2_regroup_dialog = dialog
+        dialog.set_export_active(self._g2_regroup_export is not None)
+        dialog.finished.connect(self._g2_regroup_closed)
+        dialog.save_requested.connect(self._start_g2_regroup_export)
+        dialog.open()
+
+    def _close_g2_regroup(self) -> None:
+        if self._g2_regroup_dialog is not None:
+            self._g2_regroup_dialog.reject()
+
+    @QtCore.Slot(int)
+    def _g2_regroup_closed(self, _result: int) -> None:
+        self._g2_regroup_dialog = None
+
+    @QtCore.Slot(object, object)
+    def _start_g2_regroup_export(
+        self, result: G2RegroupResult, destination: Path
+    ) -> None:
+        if self._g2_regroup_export is not None:
+            return
+        worker = G2RegroupExportWorker(result, destination)
+        self._g2_regroup_export = worker
+        if self._g2_regroup_dialog is not None:
+            self._g2_regroup_dialog.set_export_active(True)
+        queued = QtCore.Qt.ConnectionType.QueuedConnection
+        worker.signals.finished.connect(self._g2_regroup_export_finished, queued)
+        worker.signals.error.connect(self._g2_regroup_export_failed, queued)
+        self.thread_pool.start(worker)
+
+    def _release_g2_regroup_export(self, message: str) -> None:
+        self._g2_regroup_export = None
+        if self._g2_regroup_dialog is not None:
+            self._g2_regroup_dialog.set_export_active(False, message)
+
+    @QtCore.Slot(object)
+    def _g2_regroup_export_finished(self, destination: Path) -> None:
+        assert self._g2_regroup_export is not None
+        source = self._g2_regroup_export.result.source_path.name
+        message = f"Saved regrouped G2 from {source} to {destination}"
+        self._release_g2_regroup_export(message)
+        self.toast_manager.show_success(message)
+
+    @QtCore.Slot(str, str, str, int)
+    def _g2_regroup_export_failed(
+        self, worker_id: str, error: str, _traceback: str, _retry: int
+    ) -> None:
+        assert self._g2_regroup_export is not None
+        source = self._g2_regroup_export.result.source_path.name
+        reason = error.removeprefix(f"Error in worker {worker_id}: ")
+        message = (
+            f"Could not save regrouped G2 from {source}. {reason}\n"
+            "Choose a new writable destination to retry."
+        )
+        self._release_g2_regroup_export(message)
+        self.toast_manager.show_error(message)
 
     def update_plot(self):
         """
@@ -1911,7 +2001,7 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             self.plot_kwargs_record[tab_name] = kwargs
 
             # Start async plotting
-            operation_id = f"plot_{tab_name}_{int(time.time() * 1000)}"
+            operation_id = f"plot_{tab_name}_{uuid4().hex}"
 
             # Start progress tracking
             description = f"Plotting {tab_name.replace('_', ' ').title()}"
@@ -3154,8 +3244,10 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             self.statusbar.showMessage("check avg min/max values.", 1000)
             return
 
+        self._reset_g2_fit_bounds()
         self.vk.submit_job(**kwargs)
-        # the target_average has been reset
+        if not self.vk.target:
+            self._close_g2_regroup()
         self.update_box(self.vk.target, mode="target")
 
     def update_avg_info(self):
@@ -3176,8 +3268,22 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
 
         self.timer.setInterval(1000)
         worker.initialize_plot(self.mp_avg_g2)
-        self.timer.timeout.connect(self.vk.update_avg_info)
+        self.timer.timeout.connect(self._poll_avg_job)
         self.timer.start()
+
+    def _poll_avg_job(self) -> None:
+        """1 Hz tick: refresh the plot, stop on a terminal job state."""
+        if self.vk is None or self.vk.avg_worker is None:
+            self.timer.stop()
+            return
+        self.vk.update_avg_info()
+        worker = self.vk.avg_worker
+        if worker.status in ("finished", "killed"):
+            self.timer.stop()
+            if worker.status == "finished" and worker.n_accepted == 0:
+                self.statusbar.showMessage(
+                    "Averaging finished: no valid dataset; no output written", 8000
+                )
 
     def start_avg_job(self):
         if self.vk is None:
@@ -3186,12 +3292,12 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         if worker is None:
             self.statusbar.showMessage("no averaging job exists", 1000)
             return
-        if worker.status == "finished":
-            self.statusbar.showMessage("this job has finished", 1000)
+        # Only a fresh job may start: a queued job started twice segfaults, and
+        # a run worker is auto-deleted, so restarting it raises.
+        if worker.status != "wait":
+            self.statusbar.showMessage(f"this job is {worker.status}", 1000)
             return
-        if worker.status == "running":
-            self.statusbar.showMessage("this job is running.", 1000)
-            return
+        worker.status = "queued"  # do_average sets "running" when it starts
 
         # Disconnect any previously connected slot before reconnecting (BUG-037):
         # prevents lambda slot accumulation on repeated calls.
@@ -3235,7 +3341,16 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         self.tree = worker.get_pg_tree()
         self.tree.show()
 
+    def _initialize_g2_fit_bounds(self, extent: tuple[float, float] | None) -> None:
+        if not self._g2_fit_bounds_initialized and extent is not None:
+            self._g2_fit_bounds_initialized = True
+            t_min, t_max = extent
+            self.g2_bmin.setValue(t_min / 20)
+            self.g2_bmax.setValue(t_max * 10)
+
     def init_g2(self, qd_per_file, tel):
+        from .module import g2mod
+
         if qd_per_file is None or tel is None:
             return
         if len(qd_per_file) == 0 or len(tel) == 0:
@@ -3255,23 +3370,13 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         q_auto = self.g2_qauto.isChecked()
         t_auto = self.g2_tauto.isChecked()
 
-        # tel is a list of arrays, which may have diffent shape; drop any empty
-        # arrays so [0]/[-1] indexing cannot raise.
-        tel = [t for t in tel if len(t) > 0]
-        if not tel:
-            return
-        t_min = np.min([t[0] for t in tel])
-        t_max = np.max([t[-1] for t in tel])
+        extent = g2mod.get_positive_delay_extent(tel)
+        self._initialize_g2_fit_bounds(extent)
 
-        def to_e(x):
-            return f"{x:.2e}"
-
-        self.g2_bmin.setValue(t_min / 20)
-        self.g2_bmax.setValue(t_max * 10)
-
-        if t_auto:
-            self.g2_tmin.setText(to_e(t_min / 1.1))
-            self.g2_tmax.setText(to_e(t_max * 1.1))
+        if t_auto and extent is not None:
+            t_min, t_max = extent
+            self.g2_tmin.setText(f"{t_min / 1.1:.2e}")
+            self.g2_tmax.setText(f"{t_max * 1.1:.2e}")
 
         if q_auto:
             # qd_per_file arrays may be ragged (different Q-bin counts); reduce
@@ -3633,6 +3738,10 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
                 logger.warning("Reload requested before viewer kernel initialized")
                 return
 
+            if os.path.abspath(path) != os.path.abspath(self.vk.path):
+                self.load_path(path)
+                return
+
             logger.debug(f"reload_source: building from {sanitize_path(path)}")
             built = self.vk.build(path=path, sort_method=self.sort_method.currentText())
             if not built:
@@ -3698,6 +3807,8 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         # Normalize to an absolute path so vk.path, work_dir, and any persisted
         # session paths survive a restart from a different working directory.
         folder = os.path.abspath(folder)
+        self._close_g2_regroup()
+        self._reset_g2_fit_bounds()
         self.work_dir.setText(folder)
         logger.info(f"Loading data from: {sanitize_path(folder)}")
 
@@ -4004,6 +4115,8 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
 
         logger.debug(f"remove_target: Removing {len(rmv_list)} files from target list")
 
+        if len(rmv_list) == len(self.vk.target):
+            self._reset_g2_fit_bounds()
         self.vk.remove_target(rmv_list)
         # clear selection to avoid the bug: when the last one is selected, then
         # the list will out of bounds
@@ -4018,7 +4131,19 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             self.reset_gui()
         self.update_box(self.vk.target, mode="target")
 
+    def _reset_g2_fit_bounds(self) -> None:
+        for operation_id, plot_type in list(self.active_plot_operations.items()):
+            if plot_type != "g2":
+                continue
+            if self.progress_manager.is_operation_active(operation_id):
+                self.progress_manager.cancel_operation_ui(operation_id)
+            else:
+                self.cancel_async_operation(operation_id)
+        self._g2_fit_bounds_initialized = False
+
     def reset_gui(self):
+        self._close_g2_regroup()
+        self._reset_g2_fit_bounds()
         self.vk.reset_kernel()
         for x in [
             # self.pg_saxs,

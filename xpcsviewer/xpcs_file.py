@@ -1705,6 +1705,7 @@ class XpcsFile:
         from xpcsviewer.fitting import (
             fit_with_fixed,
             fit_with_fixed_parallel,
+            initial_fit_guess,
         )
         from xpcsviewer.xpcs_file.fitting import double_exp_all, single_exp_all
 
@@ -1729,20 +1730,9 @@ class XpcsFile:
         # Use optimized get_g2_data (which now has caching)
         q_val, t_el, g2, sigma, label = self.get_g2_data(qrange=q_range, trange=t_range)
 
-        # Optimized initial parameter guess using numpy vectorization
-        bounds_array = np.array(bounds)
-        p0 = np.mean(bounds_array, axis=0)
-
-        # Improved geometric mean calculation for tau parameters
-        tau_indices = [1]  # tau parameter for single exponential
-        if fit_func == "double":
-            tau_indices.append(4)  # second tau parameter for double exponential
-
-        for tau_idx in tau_indices:
-            if bounds_array[0, tau_idx] > 0 and bounds_array[1, tau_idx] > 0:
-                p0[tau_idx] = np.sqrt(
-                    bounds_array[0, tau_idx] * bounds_array[1, tau_idx]
-                )
+        # The fit UI has no initial-value entry: the bounds midpoint (geometric
+        # mean for tau) is both the starting point and the documented fixed value.
+        p0 = initial_fit_guess(bounds, [1, 4] if fit_func == "double" else [1])
 
         # Optimized fit_x generation - cache if t_el doesn't change
         t_range_key = (
@@ -2315,6 +2305,17 @@ class XpcsFile:
 
         # Optimized filtering: combine validity checks
         valid_idx = (sigma > 0) & np.isfinite(y) & np.isfinite(sigma)
+        # a*q**b lives on the log-log domain: drop q<=0, tau<=0 and infinite q
+        # from the start values, the solver and the plot grid alike.
+        domain = np.isfinite(x) & (x > 0) & (y > 0)
+        n_dropped = int(np.count_nonzero(valid_idx & ~domain))
+        if n_dropped:
+            logger.warning(
+                "fit_tauq: dropped %d sample(s) with non-positive or non-finite "
+                "q or tau",
+                n_dropped,
+            )
+        valid_idx &= domain
 
         if np.sum(valid_idx) == 0:
             tauq_result = {"tauq_success": False}
@@ -2334,10 +2335,11 @@ class XpcsFile:
         sigma_reshaped = sigma_valid[:, np.newaxis]
 
         # Improved initial parameter guess based on data characteristics
+        # (every sample is strictly positive here, so log10 is finite)
         if len(x_valid) > 1:
             # Use data-driven initial guess for better convergence
             log_x = np.log10(x_valid)
-            log_y = np.log10(np.abs(y_valid))
+            log_y = np.log10(y_valid)
 
             # Linear regression for initial slope estimate
             slope = np.polyfit(log_x, log_y, 1)[0] if len(log_x) > 1 else -2.0

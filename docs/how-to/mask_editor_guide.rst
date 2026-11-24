@@ -17,6 +17,30 @@ Launching the Mask Editor
 
 If no file is loaded, the Mask Editor opens with an empty canvas.
 
+Opening and Browsing Raw Frames
+===============================
+
+Choose **File > Open Raw File...** to open an APS 8-ID-I HDF5 detector file.
+Select the frame range used to create the scattering image.
+
+* **Representative sample** averages the first 1,000 frames or the first
+  fifth of the stack, whichever is larger, up to the full stack.
+* **All frames** averages the full stack.
+* **Custom** averages from a zero-based start frame for the specified count.
+  Use a count of ``0`` to average all remaining frames. If a positive count
+  extends past the end of the stack, the average stops at the final frame.
+
+For a frame stack, choose **Raw frames** or **Masked raw frames** above the
+image. Set **Start frame** and **Frame count** to preview an average from the
+full stack. A count of ``1`` previews a single frame. The range label shows
+the frames read, stopping at the final frame when necessary. Use **Scattering**
+to return to the opening average.
+
+You can draw and apply masks while browsing. **Masked raw frames** darkens
+the excluded pixels using the current Boolean mask. The mask, Q-map, and
+partition overlay toggles control the **Scattering** view. The opening
+average remains the input for mask calculations and beam center calibration.
+
 Drawing Tools
 =============
 

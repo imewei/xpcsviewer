@@ -10,10 +10,12 @@ Functions:
 
 # Standard library imports
 import logging
+from collections.abc import Sequence
 
 # Third-party imports
 import numpy as np
 import pyqtgraph as pg
+from numpy.typing import ArrayLike
 
 from xpcsviewer.backends._conversions import ensure_numpy
 from xpcsviewer.plothandler.plot_constants import MATPLOTLIB_COLORS_RGB as colors
@@ -39,6 +41,20 @@ def _log_array_dims(prefix: str, arr) -> None:
 
 # https://www.geeksforgeeks.org/pyqtgraph-symbols/
 symbols = ["o", "t", "t1", "t2", "t3", "s", "p", "h", "star", "+", "d", "x"]
+
+
+def get_positive_delay_extent(
+    delays: Sequence[ArrayLike],
+) -> tuple[float, float] | None:
+    """Return the finite positive delay extrema across per-file arrays."""
+    lower, upper = np.inf, -np.inf
+    for delay in delays:
+        values = np.asarray(delay)
+        positive = values[np.isfinite(values) & (values > 0)]
+        if positive.size:
+            lower = min(lower, float(positive.min()))
+            upper = max(upper, float(positive.max()))
+    return (lower, upper) if lower <= upper else None
 
 
 def get_data(xf_list, q_range=None, t_range=None):

@@ -843,38 +843,47 @@ def get_analysis_type(fname, ftype="nexus", use_pool=True):
         else h5py.File(fname, "r")
     )
     with context_manager as hdf_result:
-        # Primary detection: Check for folder presence (more reliable)
-        multitau_folder = "/xpcs/multitau"
-        twotime_folder = "/xpcs/twotime"
+        artifact = getattr(hdf_result, "attrs", {}).get("xpcsviewer_artifact")
+        is_derived = isinstance(artifact, (str, bytes)) and artifact in (
+            "g2_regroup",
+            b"g2_regroup",
+        )
+        if not is_derived:
+            # Primary detection: Check for folder presence (more reliable)
+            multitau_folder = "/xpcs/multitau"
+            twotime_folder = "/xpcs/twotime"
 
-        if multitau_folder in hdf_result:
-            analysis_type.append("Multitau")
-            logger.debug(
-                f"Detected Multitau format: folder {multitau_folder} found in {fname}"
-            )
-
-        if twotime_folder in hdf_result:
-            analysis_type.append("Twotime")
-            logger.debug(
-                f"Detected Twotime format: folder {twotime_folder} found in {fname}"
-            )
-
-        # Fallback detection: Check for specific files (backward compatibility)
-        if not analysis_type:
-            logger.debug(
-                f"Folder detection failed, falling back to file detection for {fname}"
-            )
-            if c2_prefix in hdf_result:
-                analysis_type.append("Twotime")
-                logger.debug(
-                    f"Detected Twotime format via file: {c2_prefix} found in {fname}"
-                )
-            if g2_prefix in hdf_result:
+            if multitau_folder in hdf_result:
                 analysis_type.append("Multitau")
                 logger.debug(
-                    f"Detected Multitau format via file: {g2_prefix} found in {fname}"
+                    f"Detected Multitau format: folder {multitau_folder} found in {fname}"
                 )
 
+            if twotime_folder in hdf_result:
+                analysis_type.append("Twotime")
+                logger.debug(
+                    f"Detected Twotime format: folder {twotime_folder} found in {fname}"
+                )
+
+            # Fallback detection: Check for specific files (backward compatibility)
+            if not analysis_type:
+                logger.debug(
+                    f"Folder detection failed, falling back to file detection for {fname}"
+                )
+                if c2_prefix in hdf_result:
+                    analysis_type.append("Twotime")
+                    logger.debug(
+                        f"Detected Twotime format via file: {c2_prefix} found in {fname}"
+                    )
+                if g2_prefix in hdf_result:
+                    analysis_type.append("Multitau")
+                    logger.debug(
+                        f"Detected Multitau format via file: {g2_prefix} found in {fname}"
+                    )
+
+    # Exiting normally keeps a valid pooled handle open for other readers.
+    if is_derived:
+        raise ValueError(f"{fname} is a derived G2 export for downstream analysis")
     if len(analysis_type) == 0:
         raise ValueError(f"No analysis type found in {fname}")
 

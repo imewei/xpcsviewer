@@ -940,7 +940,7 @@ class FitResult:
         """
         # T026: Build versions dictionary for reproducibility
         versions = {
-            "xpcsviewer": safe_version("xpcs-toolkit"),
+            "xpcsviewer": safe_version("xpcsviewer-gui"),
             "numpyro": safe_version("numpyro"),
             "jax": safe_version("jax"),
             "arviz": safe_version("arviz"),

@@ -4,6 +4,30 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Mask Editor: ROI vertex rasteriser ported from pySimpleMask (Apache-2.0); the wheel now ships `NOTICE` and `LICENSE-APACHE-2.0`
+- Q-map: transmission geometry accepts horizontal and vertical detector swing angles (degrees, read from optional metadata keys); zero swing leaves TTH, phi, qx, qy, x and y unchanged
+
+### Changed
+
+- Add `scikit-image>=0.26.0` dependency (used by the ROI rasteriser)
+- Q-map: `q` is now the momentum-transfer magnitude `2*k0*sin(alpha/2)` instead of `k0*sin(alpha)`; `qx`/`qy` keep the `k0*sin(alpha)` projection. Saved zero-swing transmission Q-maps and q-based partitions shift slightly, by about `alpha^2/8` relative (more at wide angle). The interactive viewer's hover q readout (`fileIO/qmap_utils.py`, used via `xpcs_file`) still uses `k0*sin(alpha)` like upstream pyXpcsViewer, so at wide angle (about 1.5% at 20 deg) it no longer equals the SimpleMask partition q; aligning the viewer is a separate decision
+
+### Fixed
+
+- Version: `xpcsviewer.__version__` previously fell back to a hard-coded `0.1.10` (and the log banner to `unknown`); it is now looked up from the `xpcsviewer-gui` distribution, so installed wheels report their real version, with `0+unknown` only when package metadata is absent
+- Fitting: in the G2 fit panel an unchecked parameter is still held at the midpoint of its min/max bounds (the geometric mean when the tau bounds are positive). Scripts calling `fit_with_fixed*` directly must now pass an explicit, finite `p0` whenever a parameter is fixed (`ValueError` otherwise) instead of getting a silent bounds-midpoint fallback; failed-fit placeholders keep the explicit fixed values
+- Fitting: `fit_with_fixed*` treat integer `fit_flag` values such as `[1, 1, 0]` as booleans; integer flags previously gave wrong parameters
+- Fitting: tau-q ignores samples with non-positive tau or q (or infinite q) for the starting values, the fit and the plot grid, and logs how many it dropped; such samples previously made the starting values NaN, biased the fitted amplitude or failed the fit
+- Averaging: a job whose inputs are all rejected (by the baseline criteria or because they fail to load) now ends `finished` with no output file (it stayed `running` and kept polling); killed jobs stay `killed`, and the empty result is reported in the status bar
+- Averaging: with 8 or more files (the parallel path) a scan is averaged only when all its fields match the shapes already accepted, as on the sequential path, and the job reports the number of scans actually averaged; a scan with a different lag count previously diluted G2 and its error bars
+- Averaging: a second Start click on a queued, running, finished or killed job is ignored (it could crash the application)
+- Mask Editor: a rejected mask import is reported as a failure in the status bar and log, without a modal dialog; datasets of unsupported type (strings, bytes, complex) are rejected the same way, and upper-case `.H5`/`.HDF5` extensions are accepted
+- Mask Editor: draw and parameter edits replace their own mask layer instead of accumulating; Apply with nothing drawable is a no-op
+- Mask Editor: ROIs are rasterised through their transform, so rotated shapes match pySimpleMask geometry; line ROIs (vertical and angled) created programmatically or as pyqtgraph `LineROI` items are rasterised the same way, but the toolbar Line tool still does not create an ROI (known issue, unchanged in this release); degenerate and off-image ROIs are ignored
+- Mask Editor: Apply on a large curved ROI is slower than in 0.1.10 (about 2.4 s for a 2000-pixel ellipse on a 2167x2070 detector), because shapes are now rasterised as polygons to match pySimpleMask geometry
+
 ## [0.1.10] - 2026-08-11
 
 ### Added

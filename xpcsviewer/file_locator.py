@@ -16,6 +16,7 @@ import datetime
 import os
 import threading
 import traceback
+from collections.abc import Callable
 
 # Local imports
 from .fileIO.qmap_utils import QMapManager
@@ -78,23 +79,33 @@ class FileLocator:
         self.timestamp = None
 
     def set_path(self, path):
-        self.path = path
+        with self._cache_lock:
+            self.path = path
 
     def clear(self):
         self.source.clear()
         self.source_search.clear()
 
-    def get_xf_list(self, rows=None, filter_atype=None, filter_fitted=False):
+    def get_xf_list(
+        self,
+        rows=None,
+        filter_atype=None,
+        filter_fitted=False,
+        *,
+        check_cancelled: Callable[[], None] | None = None,
+    ):
         """
         get the cached xpcs_file list;
         :param rows: a list of index to select; if None is given, then use
+        :param check_cancelled: raises InterruptedError if the lookup was cancelled;
         :return: list of xpcs_file objects;
         """
-        # Snapshot the target list under the cache lock so that concurrent
-        # modifications from the main thread (add_target, remove_target, etc.)
-        # do not cause index errors or stale reads (SRE-3).
+        # Keep the target rows tied to the directory they were selected from.
         with self._cache_lock:
-            target_snapshot = list(self.target)
+            if check_cancelled is not None:
+                check_cancelled()
+            path = self.path
+            target_snapshot = self.target.copy()
 
         if rows is None:
             selected = list(range(len(target_snapshot)))
@@ -114,6 +125,8 @@ class FileLocator:
                 "Using cached files as fallback for plotting (target list empty)"
             )
             with self._cache_lock:
+                if check_cancelled is not None:
+                    check_cancelled()
                 ret = [xf for xf in self.cache.values() if xf is not None]
             # Apply filters if specified
             if filter_fitted:
@@ -126,7 +139,7 @@ class FileLocator:
         for n in selected:
             if n < 0 or n >= len(target_snapshot):
                 continue
-            full_fname = os.path.normpath(os.path.join(self.path, target_snapshot[n]))
+            full_fname = os.path.normpath(os.path.join(path, target_snapshot[n]))
 
             # Check the cache without holding the lock during I/O.
             # XpcsFile construction can be slow (HDF5 read) — holding the
@@ -141,11 +154,15 @@ class FileLocator:
             if not is_cached:
                 # Construct the XpcsFile object outside the lock so HDF5 I/O
                 # does not prevent concurrent cache lookups.
+                if check_cancelled is not None:
+                    check_cancelled()
                 xf_obj = create_xpcs_dataset(full_fname, qmap_manager=self.qmap_manager)
                 # Re-acquire the lock only to insert the new entry.
                 # If another thread raced ahead and already inserted the same
                 # file, prefer the existing entry so we never duplicate objects.
                 with self._cache_lock:
+                    if check_cancelled is not None:
+                        check_cancelled()
                     if full_fname not in self.cache:
                         self.cache[full_fname] = xf_obj
                     else:
@@ -260,7 +277,7 @@ class FileLocator:
             logger.warning("FileLocator.build called with invalid path: %r", path)
             return False
 
-        self.path = path
+        self.set_path(path)
         flist = [
             entry.name
             for entry in os.scandir(path)

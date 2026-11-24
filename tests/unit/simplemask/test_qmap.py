@@ -98,11 +98,11 @@ class TestComputeTransmissionQmap:
 
         qmap, _ = compute_transmission_qmap(energy, center, shape, pix_dim, det_dist)
 
-        # At small angles, q ~ k0 * sin(theta) ~ k0 * r / det_dist
+        # q = 2 * k0 * sin(theta / 2) (momentum-transfer magnitude)
         # for a pixel at (center[0], center[1] + 100)
         r = 100 * pix_dim  # mm
         theta = np.arctan(r / det_dist)
-        expected_q = expected_k0 * np.sin(theta)
+        expected_q = 2 * expected_k0 * np.sin(theta / 2)
 
         actual_q = qmap["q"][center[0], center[1] + 100]
         assert np.abs(actual_q - expected_q) < 1e-6
@@ -247,8 +247,7 @@ class TestNumericalAccuracy:
         r = 10 * pix_dim
         theta = np.arctan(r / det_dist)
 
-        # Small angle: sin(theta) ~ theta
-        expected_q = (2 * np.pi / wavelength) * np.sin(theta)
+        expected_q = (4 * np.pi / wavelength) * np.sin(theta / 2)
         actual_q = qmap["q"][center[0], center[1] + 10]
 
         # Should match to high precision at small angles

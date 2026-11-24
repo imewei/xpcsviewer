@@ -74,6 +74,11 @@ class FileReader(abc.ABC):
         self.shape: tuple[int, int] | None = None
         self.scat: np.ndarray | None = None
 
+    @property
+    def frame_count(self) -> int | None:
+        """Return the size of the frame stack when the format supplies one."""
+        return None
+
     def prepare_data(
         self, *args: Any, metadata_fname: str | None = None, **kwargs: Any
     ) -> None:

@@ -6,6 +6,7 @@ This module provides the setupUi function for SimpleMaskWindow layout.
 # Qt imports via compatibility layer
 from xpcsviewer.gui.qt_compat import (
     QAction,
+    QComboBox,
     QDoubleSpinBox,
     QFormLayout,
     QGroupBox,
@@ -58,6 +59,34 @@ def setup_ui(window) -> None:
     left_panel = QWidget()
     left_layout = QVBoxLayout(left_panel)
     left_layout.setContentsMargins(0, 0, 0, 0)
+
+    frames = QHBoxLayout()
+    window.raw_frame_display = QComboBox()
+    window.raw_frame_display.addItem("Scattering")
+    window.raw_frame_display.addItem("Raw frames", "raw")
+    window.raw_frame_display.addItem("Masked raw frames", "masked")
+    window.raw_frame_display.setAccessibleName("Detector display")
+    window.raw_frame_display.setEnabled(False)
+    frames.addWidget(window.raw_frame_display)
+
+    window.raw_frame_start = QSpinBox()
+    window.raw_frame_start.setToolTip("Zero-based start frame")
+    window.raw_frame_count = QSpinBox()
+    window.raw_frame_count.setRange(1, 2_147_483_647)
+    for text, control in (
+        ("&Start frame", window.raw_frame_start),
+        ("Frame &count", window.raw_frame_count),
+    ):
+        label = QLabel(text)
+        label.setBuddy(control)
+        frames.addWidget(label)
+        frames.addWidget(control)
+        control.setEnabled(False)
+
+    window.raw_frame_range_label = QLabel()
+    frames.addWidget(window.raw_frame_range_label)
+    frames.addStretch()
+    left_layout.addLayout(frames)
 
     # PyQtGraph ImageView with ROI support
     window.image_view = ImageViewROI()
@@ -179,7 +208,7 @@ def setup_ui(window) -> None:
     partition_overlay_layout = QHBoxLayout()
     window.btn_toggle_partition = QPushButton("Show Partition")
     window.btn_toggle_partition.setCheckable(True)
-    window.btn_toggle_partition.setToolTip("Toggle partition overlay display")
+    window.btn_toggle_partition.setToolTip("Toggle the partition overlay in Scattering")
     partition_overlay_layout.addWidget(window.btn_toggle_partition)
     partition_layout.addRow(partition_overlay_layout)
 
@@ -306,7 +335,7 @@ def _setup_toolbar(window) -> None:
     # Toggle Q-Map overlay
     window.action_toggle_qmap = QAction("Show Q-Map", window)
     window.action_toggle_qmap.setCheckable(True)
-    window.action_toggle_qmap.setToolTip("Toggle Q-map overlay display")
+    window.action_toggle_qmap.setToolTip("Toggle the Q-map overlay in Scattering")
     toolbar.addAction(window.action_toggle_qmap)
 
     toolbar.addSeparator()
@@ -314,7 +343,7 @@ def _setup_toolbar(window) -> None:
     # Toggle mask overlay
     window.action_toggle_mask = QAction("Show Mask", window)
     window.action_toggle_mask.setCheckable(True)
-    window.action_toggle_mask.setToolTip("Toggle mask overlay display")
+    window.action_toggle_mask.setToolTip("Toggle the mask overlay in Scattering")
     toolbar.addAction(window.action_toggle_mask)
 
     window.toolbar = toolbar

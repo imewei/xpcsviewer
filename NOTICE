@@ -1,0 +1,24 @@
+xpcsviewer
+Copyright (c) the xpcsviewer authors. Licensed under the MIT License (LICENSE).
+
+This product includes software derived from pySimpleMask, which is licensed
+under the Apache License, Version 2.0 (LICENSE-APACHE-2.0):
+
+  Copyright © UChicago Argonne LLC
+  https://github.com/AdvancedPhotonSource/pySimpleMask
+
+  Derived file: xpcsviewer/simplemask/rasterize.py
+  Upstream file: src/pysimplemask/core/rasterize.py
+  Upstream commit: 56245b4faa0fb9275cc5a554e057150909d5f977
+  Modifications: reformatted docstrings for the project line length.
+
+  Derived file: xpcsviewer/simplemask/qmap.py (transmission swing rotation
+    and q = 2 k0 sin(alpha/2) in _swing_rotation and
+    _transmission_qmap_core_xp)
+  Upstream file: src/pysimplemask/core/qmap.py
+  Upstream commit: 56245b4faa0fb9275cc5a554e057150909d5f977
+  Modifications: shared NumPy / jax.jit core; zero swing skips the
+    rotation and keeps the arctan path; alpha computed with
+    arctan2(hypot(x, y), l), exact near the beam (upstream uses arccos(l/|v|),
+    so results deliberately differ within about 1 pixel of the beam; the rest
+    of the detector agrees with upstream to 1e-12); qx and qy kept as float64.

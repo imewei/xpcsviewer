@@ -256,11 +256,8 @@ def _generate_partition_backend(
     # Convert inputs to backend arrays
     mask_b: Any = backend.array(mask)
     xmap_b: Any = backend.array(xmap)
-    xmap_phi = None
-    unit_xmap = None
 
     if map_name == "phi":
-        xmap_phi = xmap_b
         if phi_offset is not None:
             # xmap = np.rad2deg(np.angle(np.exp(1j * np.deg2rad(xmap + phi_offset))))
             angle_rad = backend.deg2rad(xmap_b + phi_offset)
@@ -269,7 +266,6 @@ def _generate_partition_backend(
                 backend.arctan2(backend.sin(angle_rad), backend.cos(angle_rad))
             )
         if symmetry_fold > 1:
-            unit_xmap = (xmap_b < (360 / symmetry_fold)) * (xmap_b >= 0)
             xmap_b = xmap_b + 180.0
             xmap_b = backend.mod(xmap_b, 360.0 / symmetry_fold)
 
@@ -355,19 +351,27 @@ def _generate_partition_backend(
     partition_np = ensure_numpy(partition).astype(np.uint32)
     v_list_np = ensure_numpy(v_list)
 
-    if map_name == "phi" and symmetry_fold > 1 and unit_xmap is not None:
-        # Use NumPy for bincount (complex operation)
-        unit_xmap_np = ensure_numpy(unit_xmap)
-        partition_np_i64 = partition_np.astype(np.int64)
-        assert xmap_phi is not None
-        xmap_phi_np = ensure_numpy(xmap_phi)
-        idx_map = (unit_xmap_np * partition_np_i64).astype(np.int64)
-        sum_value = np.bincount(idx_map.flatten(), weights=xmap_phi_np.flatten())
-        norm_factor = np.bincount(idx_map.flatten())
-        # Use a large float max instead of None for numpy < 1.17 compatibility if needed,
-        # but clip accepts None for max in recent numpy. Mypy complains about None.
-        v_list_np = sum_value / np.clip(norm_factor, 1, np.inf)
-        v_list_np = v_list_np[1:]
+    if map_name == "phi" and symmetry_fold > 1:
+        valid = (mask > 0) & (partition_np != 0)
+        offset = 0.0 if phi_offset is None else phi_offset
+        shifted = (xmap[valid].astype(np.float64) + offset) % 360.0
+        sector_width = 360.0 / symmetry_fold
+        sectors = np.minimum(shifted / sector_width, symmetry_fold - 1).astype(np.int64)
+        pairs, pair_indices, counts = np.unique(
+            np.column_stack((partition_np[valid], sectors)),
+            axis=0,
+            return_inverse=True,
+            return_counts=True,
+        )
+        bin_ids, sector_ids = pairs.T
+        # Within each bin, prefer sector zero, then larger counts, then lower sectors.
+        order = np.lexsort((sector_ids, -counts, sector_ids != 0, bin_ids))
+        bins, first = np.unique(bin_ids[order], return_index=True)
+        chosen = order[first]
+        sums = np.bincount(pair_indices.ravel(), weights=shifted)
+        means = sums[chosen] / counts[chosen]
+        v_list_np = np.zeros(num_pts, dtype=np.float64)
+        v_list_np[bins - 1] = (means - offset + 180.0) % 360.0 - 180.0
 
     return {
         "map_name": map_name,

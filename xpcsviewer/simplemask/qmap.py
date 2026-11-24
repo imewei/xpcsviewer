@@ -1,3 +1,8 @@
+# Copyright © UChicago Argonne LLC
+# See LICENSE-APACHE-2.0 for details (Apache License 2.0).
+#
+# Ported from pySimpleMask 56245b4 `src/pysimplemask/core/qmap.py`;
+# modified for xpcsviewer.
 """Q-map computation for SimpleMask.
 
 This module provides functions to compute momentum transfer (Q) maps
@@ -72,6 +77,8 @@ def compute_qmap(
             - shape: Detector shape (height, width)
             - pix_dim: Pixel size in mm
             - det_dist: Sample-to-detector distance in mm
+            - swing_angle_horizontal, swing_angle_vertical: Optional detector
+              swing in degrees (transmission only, default 0.0)
             - alpha_i_deg: Incident angle in degrees (reflection only)
             - orientation: Detector orientation (reflection only)
 
@@ -94,6 +101,8 @@ def compute_qmap(
             metadata["shape"],
             metadata["pix_dim"],
             metadata["det_dist"],
+            swing_angle_horizontal=metadata.get("swing_angle_horizontal") or 0.0,
+            swing_angle_vertical=metadata.get("swing_angle_vertical") or 0.0,
         )
         if logger.isEnabledFor(logging.DEBUG):
             sqmap = result[0].get("sqmap")
@@ -118,6 +127,63 @@ def compute_qmap(
     raise ValueError(f"Unknown scattering type: {stype}")
 
 
+def _swing_rotation(
+    swing_angle_horizontal: float, swing_angle_vertical: float
+) -> np.ndarray | None:
+    """Detector rotation ``Ry @ Rx`` for the swing angles (degrees).
+
+    Adapted from pySimpleMask 56245b4 `core/qmap.py`. Returns None for zero
+    swing so callers take the identity branch and keep the unswung arrays.
+    """
+    if swing_angle_horizontal == 0 and swing_angle_vertical == 0:
+        return None
+    a_h = np.deg2rad(swing_angle_horizontal)
+    a_v = np.deg2rad(swing_angle_vertical)
+    sh, ch = np.sin(a_h), np.cos(a_h)
+    sv, cv = np.sin(a_v), np.cos(a_v)
+    rx = np.array([[1, 0, 0], [0, cv, -sv], [0, sv, cv]])
+    ry = np.array([[ch, 0, -sh], [0, 1, 0], [sh, 0, ch]])
+    return ry @ rx
+
+
+def _transmission_qmap_core_xp(
+    xp: Any, k0: Any, v: Any, h: Any, pix_dim: Any, det_dist: Any, rot: Any
+) -> tuple[Any, ...]:
+    """Transmission Q-map core for ``xp`` = numpy or jax.numpy.
+
+    ``v``/``h`` are pixel offsets from the beam center; ``rot`` is the swing
+    rotation from :func:`_swing_rotation` or None. Returns
+    ``(phi_deg, alpha_deg, q, qx, qy)``.
+    """
+    vg, hg = xp.meshgrid(v, h, indexing="ij")
+
+    if rot is None:
+        # Radial distance in real space (mm)
+        r = xp.hypot(vg, hg) * pix_dim
+        # Azimuthal angle (negated for convention)
+        phi = xp.arctan2(vg, hg) * (-1)
+        # Scattering angle
+        alpha = xp.arctan(r / det_dist)
+    else:
+        # Adapted from pySimpleMask 56245b4 `core/qmap.py`: rotate the lab-frame
+        # detector vectors (h, v, l) in mm by R = Ry @ Rx.
+        det_vec = xp.stack(
+            [hg * pix_dim, vg * pix_dim, xp.full_like(vg, 1.0) * det_dist], axis=-1
+        )
+        coor = det_vec @ rot.T
+        # arctan2 stays exact near the beam, where arccos(l/|v|) cancels.
+        alpha = xp.arctan2(xp.hypot(coor[..., 0], coor[..., 1]), coor[..., 2])
+        phi = xp.arctan2(coor[..., 1], coor[..., 0]) * (-1)
+
+    # Q components use the in-plane projection; q is the full |Q|.
+    qr = xp.sin(alpha) * k0
+    qx = qr * xp.cos(phi)
+    qy = qr * xp.sin(phi)
+    q = 2.0 * k0 * xp.sin(alpha / 2.0)
+
+    return xp.rad2deg(phi), xp.rad2deg(alpha), q, qx, qy
+
+
 def _get_transmission_qmap_jit():
     """Get or create JIT-compiled transmission Q-map function.
 
@@ -135,28 +201,12 @@ def _get_transmission_qmap_jit():
         import jax
         import jax.numpy as jnp
 
+        # rot=None is a leafless pytree, so jit traces the identity branch
+        # separately; the `if` in the core never sees a traced value.
         @jax.jit
-        def _transmission_qmap_core(k0, v, h, pix_dim, det_dist):
+        def _transmission_qmap_core(k0, v, h, pix_dim, det_dist, rot):
             """JIT-compiled core Q-map computation."""
-            vg, hg = jnp.meshgrid(v, h, indexing="ij")
-
-            # Radial distance in real space (mm)
-            r = jnp.hypot(vg, hg) * pix_dim
-
-            # Azimuthal angle (negated for convention)
-            phi = jnp.arctan2(vg, hg) * (-1)
-
-            # Scattering angle
-            alpha = jnp.arctan(r / det_dist)
-            alpha_deg = jnp.rad2deg(alpha)
-
-            # Q components
-            qr = jnp.sin(alpha) * k0
-            qx = qr * jnp.cos(phi)
-            qy = qr * jnp.sin(phi)
-            phi_deg = jnp.rad2deg(phi)
-
-            return phi_deg, alpha_deg, qr, qx, qy, hg, vg
+            return _transmission_qmap_core_xp(jnp, k0, v, h, pix_dim, det_dist, rot)
 
         if len(_JIT_CACHE) >= _JIT_CACHE_MAXSIZE:
             oldest_key = next(iter(_JIT_CACHE))
@@ -222,7 +272,8 @@ def compute_q_at_pixel(
     # Scattering angle
     alpha = backend.arctan(r / det_dist)
 
-    # Q magnitude
+    # In-plane projection k0*sin(alpha); the q-map |Q| is 2*k0*sin(alpha/2),
+    # larger by ~alpha^2/8
     q = backend.sin(alpha) * k0
 
     return q
@@ -351,6 +402,8 @@ def _compute_transmission_qmap_backend(
     shape: tuple[int, int],
     pix_dim: float,
     det_dist: float,
+    swing_angle_horizontal: float = 0.0,
+    swing_angle_vertical: float = 0.0,
 ) -> tuple[dict[str, np.ndarray], dict[str, str]]:
     """Backend-accelerated transmission Q-map computation.
 
@@ -369,39 +422,27 @@ def _compute_transmission_qmap_backend(
     v = backend.arange(shape[0], dtype=np.float64) - center[0]
     h = backend.arange(shape[1], dtype=np.float64) - center[1]
 
+    # Zero swing is decided here, outside jit, and takes the identity branch.
+    rot = _swing_rotation(swing_angle_horizontal, swing_angle_vertical)
+
     # Try to use JIT-compiled version for JAX backend
     jit_fn = _get_transmission_qmap_jit()
     if jit_fn is not None:
         import jax.numpy as jnp
 
-        # Convert to JAX arrays for JIT function
-        k0_jax = jnp.asarray(k0)
-        v_jax = jnp.asarray(v)
-        h_jax = jnp.asarray(h)
-        pix_dim_jax = jnp.asarray(pix_dim)
-        det_dist_jax = jnp.asarray(det_dist)
-
-        phi_deg, alpha, qr, qx, qy, hg, vg = jit_fn(
-            k0_jax, v_jax, h_jax, pix_dim_jax, det_dist_jax
+        phi_deg, alpha, q, qx, qy = jit_fn(
+            jnp.asarray(k0),
+            jnp.asarray(v),
+            jnp.asarray(h),
+            jnp.asarray(pix_dim),
+            jnp.asarray(det_dist),
+            None if rot is None else jnp.asarray(rot),
         )
     else:
         # Non-JIT path for NumPy backend
-        vg, hg = backend.meshgrid(v, h, indexing="ij")
-
-        # Radial distance in real space (mm)
-        r = backend.hypot(vg, hg) * pix_dim
-
-        # Azimuthal angle (negated for convention)
-        phi = backend.arctan2(vg, hg) * (-1)
-
-        # Scattering angle
-        alpha = backend.arctan(r / det_dist)
-
-        # Q components
-        qr = backend.sin(alpha) * k0
-        qx = qr * backend.cos(phi)
-        qy = qr * backend.sin(phi)
-        phi_deg = backend.rad2deg(phi)
+        phi_deg, alpha, q, qx, qy = _transmission_qmap_core_xp(
+            np, k0, v, h, pix_dim, det_dist, rot
+        )
 
     # Create absolute pixel-index meshgrids (0..N-1) for status bar display.
     # These are independent of beam center, unlike hg/vg which are offsets.
@@ -411,16 +452,11 @@ def _compute_transmission_qmap_backend(
         indexing="ij",
     )
 
-    # Convert alpha to degrees (JIT path already returns degrees,
-    # non-JIT path returns radians)
-    if jit_fn is None:
-        alpha = backend.rad2deg(alpha)
-
     # Convert all arrays to NumPy for output (I/O boundary)
     qmap = {
         "phi": ensure_numpy(phi_deg),
         "TTH": ensure_numpy(alpha),
-        "q": ensure_numpy(qr),
+        "q": ensure_numpy(q),
         "qx": ensure_numpy(qx),
         "qy": ensure_numpy(qy),
         "x": pix_x,
@@ -446,9 +482,19 @@ def _compute_transmission_qmap_cached(
     shape: tuple[int, int],
     pix_dim: float,
     det_dist: float,
+    swing_angle_horizontal: float = 0.0,
+    swing_angle_vertical: float = 0.0,
 ) -> tuple[dict[str, np.ndarray], dict[str, str]]:
     """Cached inner computation for transmission Q-map."""
-    return _compute_transmission_qmap_backend(energy, center, shape, pix_dim, det_dist)
+    return _compute_transmission_qmap_backend(
+        energy,
+        center,
+        shape,
+        pix_dim,
+        det_dist,
+        swing_angle_horizontal,
+        swing_angle_vertical,
+    )
 
 
 def compute_transmission_qmap(
@@ -457,6 +503,8 @@ def compute_transmission_qmap(
     shape: tuple[int, int],
     pix_dim: float,
     det_dist: float,
+    swing_angle_horizontal: float = 0.0,
+    swing_angle_vertical: float = 0.0,
 ) -> tuple[dict[str, np.ndarray], dict[str, str]]:
     """Compute Q-map for transmission geometry.
 
@@ -466,6 +514,8 @@ def compute_transmission_qmap(
         shape: Detector shape as (height, width)
         pix_dim: Pixel dimension in mm
         det_dist: Sample-to-detector distance in mm
+        swing_angle_horizontal: Detector swing about the vertical axis (deg)
+        swing_angle_vertical: Detector swing about the horizontal axis (deg)
 
     Returns:
         Tuple of (qmap, qmap_unit) dictionaries.
@@ -485,7 +535,13 @@ def compute_transmission_qmap(
     # in place, so sharing them across callers is safe.  Callers that need their
     # own writable copy must call np.copy() themselves.
     qmap, qmap_unit = _compute_transmission_qmap_cached(
-        energy, center, shape, pix_dim, det_dist
+        energy,
+        center,
+        shape,
+        pix_dim,
+        det_dist,
+        swing_angle_horizontal,
+        swing_angle_vertical,
     )
     return qmap, qmap_unit
 

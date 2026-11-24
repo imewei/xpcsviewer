@@ -21,6 +21,7 @@ Example:
 
 # Handle imports gracefully for documentation builds
 import os
+from collections.abc import Callable
 from importlib.metadata import PackageNotFoundError, version
 from typing import TYPE_CHECKING
 
@@ -77,10 +78,15 @@ else:
 
 
 # Version handling
-try:
-    __version__ = version("xpcsviewer")
-except PackageNotFoundError:
-    __version__ = "0.1.10"  # Fallback if package is not installed
+def _package_version(lookup: Callable[[str], str] = version) -> str:
+    """Return the installed ``xpcsviewer-gui`` wheel version."""
+    try:
+        return lookup("xpcsviewer-gui")
+    except PackageNotFoundError:
+        return "0+unknown"  # not installed: do not claim a release
+
+
+__version__ = _package_version()
 
 __author__ = "Miaoqi Chu & Wei Chen"
 __credits__ = "Argonne National Laboratory"

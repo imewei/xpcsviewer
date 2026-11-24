@@ -114,30 +114,25 @@ class TestNLSQPowerLaw:
             f"Fixed b={b_fixed:.3f}, expected -2.0 from p0 (not 0.0 from upper bound)"
         )
 
-    def test_fixed_param_without_p0_uses_midpoint(self):
-        """When p0 is None and b is fixed, use midpoint of bounds."""
+    def test_fixed_param_without_p0_raises(self):
+        """When p0 is None and b is fixed, the solver must demand explicit p0."""
         q, tau, tau_err = _make_synthetic_data()
 
         bounds = np.array([[1e-15, -4.0], [1e-2, 0.0]])
         fit_flag = np.array([True, False])  # Fix b
         fit_x = np.logspace(-2.1, -0.4, 50)
 
-        _fit_line, fit_val = fit_with_fixed(
-            power_law,
-            q,
-            tau[:, np.newaxis],
-            tau_err[:, np.newaxis],
-            bounds,
-            fit_flag,
-            fit_x,
-            p0=None,
-        )
-
-        b_fixed = fit_val[0, 0, 1]
-        expected_midpoint = (-4.0 + 0.0) / 2  # = -2.0
-        assert b_fixed == pytest.approx(expected_midpoint), (
-            f"Fixed b={b_fixed:.3f}, expected midpoint={expected_midpoint:.3f}"
-        )
+        with pytest.raises(ValueError, match="explicit p0"):
+            fit_with_fixed(
+                power_law,
+                q,
+                tau[:, np.newaxis],
+                tau_err[:, np.newaxis],
+                bounds,
+                fit_flag,
+                fit_x,
+                p0=None,
+            )
 
 
 # ---------------------------------------------------------------------------

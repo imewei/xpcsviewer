@@ -9,7 +9,7 @@ while leveraging the new fitting infrastructure internally.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from typing import Any, cast
 
@@ -198,6 +198,44 @@ def double_exp_all(
     return _double_exp_all_fn(x, a, b_, c, d, e, f)
 
 
+def _resolve_full_p0(
+    p0: NDArray[np.floating[Any]] | None,
+    bounds: NDArray[np.floating[Any]],
+    fit_flag: NDArray[np.bool_],
+) -> NDArray[np.floating[Any]]:
+    """Return the full starting vector, refusing to invent values for fixed slots.
+
+    Fixed parameters are held at their ``p0`` value, so ``p0`` is mandatory
+    whenever any ``fit_flag`` entry is False. With every parameter free, the
+    bounds midpoint is only an optimiser starting point and is acceptable.
+    """
+    fit_flag = np.asarray(fit_flag, dtype=bool)
+    if p0 is None:
+        if not fit_flag.all():
+            raise ValueError("fixed parameters require explicit p0 values")
+        return np.mean(bounds, axis=0)
+    full_p0 = np.array(p0, dtype=float)
+    if full_p0.shape != fit_flag.shape:
+        raise ValueError(
+            f"p0 has shape {full_p0.shape} but fit_flag has shape {fit_flag.shape}"
+        )
+    if not np.all(np.isfinite(full_p0[~fit_flag])):
+        raise ValueError("fixed parameters require finite explicit p0 values")
+    return full_p0
+
+
+def initial_fit_guess(
+    bounds: NDArray[np.floating[Any]], tau_indices: Sequence[int]
+) -> NDArray[np.floating[Any]]:
+    """Bounds midpoint, using the geometric mean for positive-bounded taus."""
+    bounds = np.asarray(bounds, dtype=float)
+    guess = np.mean(bounds, axis=0)
+    for idx in tau_indices:
+        if bounds[0, idx] > 0 and bounds[1, idx] > 0:
+            guess[idx] = np.sqrt(bounds[0, idx] * bounds[1, idx])
+    return guess
+
+
 @log_timing(threshold_ms=100)
 def fit_with_fixed(
     base_func: Callable[..., NDArray[np.floating[Any]]],
@@ -229,12 +267,21 @@ def fit_with_fixed(
     fit_x : array
         X values for output curve
     p0 : array, optional
-        Initial parameter values
+        Starting values, one per parameter. Required, and finite, for every
+        parameter with ``fit_flag`` False: such a parameter is held at its
+        ``p0`` value. With every parameter free it may be omitted and the
+        bounds midpoint is used.
 
     Returns
     -------
     tuple
         (fit_line, fit_params)
+
+    Raises
+    ------
+    ValueError
+        If ``p0`` is missing or non-finite for a fixed parameter, or its shape
+        differs from ``fit_flag``.
     """
     # Ensure numpy arrays at nlsq boundary
     x = ensure_numpy(x)
@@ -242,7 +289,7 @@ def fit_with_fixed(
     sigma = ensure_numpy(sigma)
     fit_x = ensure_numpy(fit_x)
 
-    fit_flag = np.asarray(fit_flag)
+    fit_flag = np.asarray(fit_flag, dtype=bool)
 
     fix_flag = np.logical_not(fit_flag)
 
@@ -254,12 +301,8 @@ def fit_with_fixed(
     bounds_fit = bounds[:, fit_flag]
 
     # Preserve full initial guess before slicing to free params.
-    # Fixed parameters use their p0 value (data-driven) or the midpoint
-    # of bounds when p0 is absent — NOT the upper bound.
-    if p0 is not None:
-        full_p0 = np.array(p0)
-    else:
-        full_p0 = np.mean(bounds, axis=0)
+    # Fixed parameters are held at their explicit p0 value.
+    full_p0 = _resolve_full_p0(p0, bounds, fit_flag)
 
     # Slice to free parameters for optimizer
     p0 = full_p0[fit_flag]
@@ -311,6 +354,7 @@ def fit_with_fixed(
         except Exception as e:
             logger.warning(f"Fitting failed for column {n}: {e}")
             fit_val[n, 0, :] = np.mean(bounds, axis=0)
+            fit_val[n, 0, fix_flag] = full_p0[fix_flag]
             fit_val[n, 1, :] = 0
 
     # Generate fit lines
@@ -375,7 +419,7 @@ def fit_with_fixed_parallel(
     sigma = ensure_numpy(sigma)
     fit_x = ensure_numpy(fit_x)
 
-    fit_flag = np.asarray(fit_flag)
+    fit_flag = np.asarray(fit_flag, dtype=bool)
     fix_flag = np.logical_not(fit_flag)
     bounds = np.asarray(bounds)
 
@@ -385,10 +429,7 @@ def fit_with_fixed_parallel(
     bounds_fit = bounds[:, fit_flag]
 
     # Preserve full initial guess for fixed parameter values
-    if p0 is not None:
-        full_p0 = np.array(p0)
-    else:
-        full_p0 = np.mean(bounds, axis=0)
+    full_p0 = _resolve_full_p0(p0, bounds, fit_flag)
     p0 = full_p0[fit_flag]
 
     fit_val = np.zeros((num_qvals, 2, num_args))
@@ -434,6 +475,7 @@ def fit_with_fixed_parallel(
                 fit_val[col_idx, 1, fix_flag] = 0
             else:
                 fit_val[col_idx, 0, :] = np.mean(bounds, axis=0)
+                fit_val[col_idx, 0, fix_flag] = full_p0[fix_flag]
                 fit_val[col_idx, 1, :] = 0
 
             if completed_fits % max(1, num_qvals // 10) == 0:
@@ -582,7 +624,7 @@ def fit_with_fixed_sequential(
     sigma = ensure_numpy(sigma)
     fit_x = ensure_numpy(fit_x)
 
-    fit_flag = np.asarray(fit_flag)
+    fit_flag = np.asarray(fit_flag, dtype=bool)
     fix_flag = np.logical_not(fit_flag)
     bounds = np.asarray(bounds)
 
@@ -590,10 +632,7 @@ def fit_with_fixed_sequential(
     bounds_fit = bounds[:, fit_flag]
 
     # Preserve full initial guess for fixed parameter values
-    if p0 is not None:
-        full_p0 = np.array(p0)
-    else:
-        full_p0 = np.mean(bounds, axis=0)
+    full_p0 = _resolve_full_p0(p0, bounds, fit_flag)
     p0 = full_p0[fit_flag]
 
     fit_val = np.zeros((y.shape[1], 2, num_args))
@@ -655,6 +694,7 @@ def fit_with_fixed_sequential(
             logger.warning(f"Sequential fitting failed for column {n}: {e}")
             fit_methods.append("fallback_error")
             fit_val[n, 0, :] = np.mean(bounds, axis=0)
+            fit_val[n, 0, fix_flag] = full_p0[fix_flag]
             fit_val[n, 1, :] = 0
 
     fit_line = np.zeros((y.shape[1], len(fit_x)))

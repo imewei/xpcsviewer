@@ -13,6 +13,7 @@ import h5py
 import numpy as np
 import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore
+from skimage.draw import polygon2mask
 
 from xpcsviewer.backends._conversions import ensure_numpy
 from xpcsviewer.fileIO.qmap_utils import Q_UNIT_DISPLAY
@@ -20,6 +21,7 @@ from xpcsviewer.simplemask.area_mask import MaskAssemble
 from xpcsviewer.simplemask.calibration import compute_center_from_ring
 from xpcsviewer.simplemask.pyqtgraph_mod import ImageViewROI, LineROI
 from xpcsviewer.simplemask.qmap import compute_qmap
+from xpcsviewer.simplemask.roi_geometry import roi_to_polygon
 from xpcsviewer.simplemask.utils import (
     check_consistency,
     combine_partitions,
@@ -72,6 +74,7 @@ class SimpleMaskKernel:
         self.mask: np.ndarray | None = None
         self.mask_kernel: MaskAssemble | None = None
         self.new_partition: dict | None = None
+        self._geometry_pending = False
         self.metadata: dict[str, Any] = {}
 
         self.hdl = pg_hdl
@@ -88,10 +91,30 @@ class SimpleMaskKernel:
         """
         return self.detector_image is not None
 
+    def invalidate_partition(self) -> None:
+        """Discard the partition derived from the previous inputs."""
+        self.new_partition = None
+
+    def set_geometry_pending(self, pending: bool) -> None:
+        """Prevent partition computation while geometry edits are unapplied."""
+        self._geometry_pending = pending
+        if pending:
+            self.invalidate_partition()
+
+    def clear_data(self) -> None:
+        """Discard the loaded detector data and derived results."""
+        self.invalidate_partition()
+        self.set_geometry_pending(False)
+        self.detector_image = self.shape = self.mask = self.mask_kernel = None
+        self.qmap = self.qmap_unit = None
+        self.metadata = {}
+
     def read_data(
         self,
         detector_image: np.ndarray,
         metadata: dict[str, Any],
+        *,
+        qmap_result: tuple[dict[str, np.ndarray], dict[str, str]] | None = None,
     ) -> bool:
         """Load detector data and initialize mask.
 
@@ -104,14 +127,15 @@ class SimpleMaskKernel:
                 - pix_dim: Pixel size (mm)
                 - energy: X-ray energy (keV)
                 - shape: Detector shape (height, width)
+            qmap_result: Precomputed Q-map and units for the supplied geometry.
 
         Returns:
             True if successful
         """
-        self.detector_image = detector_image.copy()
-        self.shape = detector_image.shape
-        self.metadata = metadata.copy()
-        self.metadata["shape"] = self.shape
+        image = detector_image.copy()
+        shape = image.shape
+        metadata = metadata.copy()
+        metadata["shape"] = shape
 
         # Fill in defaults for missing geometry parameters so Q-map
         # computation can proceed even when HDF5 metadata is incomplete.
@@ -120,26 +144,28 @@ class SimpleMaskKernel:
             "pix_dim": 0.075,
             "energy": 10.0,
             "det_dist": 5000.0,
-            "bcx": self.shape[1] / 2.0,
-            "bcy": self.shape[0] / 2.0,
+            "bcx": shape[1] / 2.0,
+            "bcy": shape[0] / 2.0,
         }
         for key, default in _geometry_defaults.items():
-            if self.metadata.get(key) is None:
+            if metadata.get(key) is None:
                 logger.info(
                     f"Geometry parameter '{key}' missing from HDF5 metadata, "
                     f"using default: {default}"
                 )
-                self.metadata[key] = default
+                metadata[key] = default
 
-        # Initialize mask
-        self.mask = np.ones(self.shape, dtype=bool)
+        mask = np.ones(shape, dtype=bool)
+        mask_kernel = MaskAssemble(shape, image)
+        self.clear_data()
+        self.detector_image, self.shape, self.metadata = image, shape, metadata
+        self.mask = mask
+        if qmap_result is None:
+            self._apply_geometry(metadata)
+        else:
+            self.qmap, self.qmap_unit = qmap_result
 
-        # Compute Q-map
-        stype = self.metadata.get("stype", "Transmission")
-        self.qmap, self.qmap_unit = compute_qmap(stype, self.metadata)
-
-        # Initialize mask assembly
-        self.mask_kernel = MaskAssemble(self.shape, self.detector_image)
+        self.mask_kernel = mask_kernel
         self.mask_kernel.update_qmap(self.qmap)
 
         return True
@@ -150,16 +176,24 @@ class SimpleMaskKernel:
         Returns:
             Tuple of (qmap_dict, units_dict)
         """
-        stype = self.metadata.get("stype", "Transmission")
+        self.invalidate_partition()
+        return self._apply_geometry(self.metadata)
+
+    def _apply_geometry(
+        self, metadata: dict[str, Any]
+    ) -> tuple[dict[str, np.ndarray], dict[str, str]]:
+        stype = metadata.get("stype", "Transmission")
         logger.debug(f"compute_qmap: stype={stype}, shape={self.shape}")
-        self.qmap, self.qmap_unit = compute_qmap(stype, self.metadata)
+        qmap, units = compute_qmap(stype, metadata)
+        self.metadata = metadata
+        self.qmap, self.qmap_unit = qmap, units
         if self.mask_kernel is not None:
-            self.mask_kernel.update_qmap(self.qmap)
-        if logger.isEnabledFor(logging.DEBUG) and self.qmap:
-            sqmap = self.qmap.get("sqmap")
+            self.mask_kernel.update_qmap(qmap)
+        if logger.isEnabledFor(logging.DEBUG) and qmap:
+            sqmap = qmap.get("sqmap")
             if sqmap is not None:
                 logger.debug(f"compute_qmap: result sqmap shape={sqmap.shape}")
-        return self.qmap, self.qmap_unit
+        return qmap, units
 
     def mask_action(self, action: Literal["undo", "redo", "reset"] = "undo") -> None:
         """Execute undo/redo/reset on mask history.
@@ -184,7 +218,10 @@ class SimpleMaskKernel:
         if self.mask_kernel is None or self.mask is None:
             return self.mask if self.mask is not None else np.zeros((0, 0), dtype=bool)
 
-        self.mask = self.mask_kernel.apply(target)
+        mask = self.mask_kernel.apply(target)
+        if self.new_partition is not None and not np.array_equal(self.mask, mask):
+            self.invalidate_partition()
+        self.mask = mask
         return self.mask
 
     def save_mask(self, save_name: str) -> None:
@@ -216,12 +253,15 @@ class SimpleMaskKernel:
             key: Dataset key for mask data
 
         Returns:
-            True if successful
+            True if a mask of the detector shape (or its transpose) was read
+            and applied; False leaves the current mask and history unchanged.
         """
         if self.mask_kernel is None:
             return False
 
-        self.mask_kernel.evaluate("mask_file", fname=fname, key=key)
+        # MaskAssemble.evaluate returns a description, not a success flag.
+        if not self.mask_kernel.workers["mask_file"].evaluate(fname=fname, key=key):
+            return False
         self.mask_apply("mask_file")
         return True
 
@@ -329,56 +369,63 @@ class SimpleMaskKernel:
             t.addPoints(x=[center[0]], y=[center[1]], symbol="+", size=15)
             self.hdl.add_item(t, label="center")
 
-    def apply_drawing(self) -> np.ndarray:
-        """Apply all pending drawing ROIs to create a mask.
+    def drawable_masks(self) -> list[tuple[str, np.ndarray]]:
+        """``(sl_mode, filled)`` for each pending ``roi_`` item that would
+        change the mask, rasterising each ROI exactly once.
+
+        Skips ROIs without ``sl_mode``, with non-finite or collinear vertices
+        (rank < 2, not signed area: a self-crossing polyline has zero area yet
+        fills pixels), or that cover no image pixel.
+        """
+        if self.hdl is None or self.shape is None:
+            return []
+        drawn = []
+        for key, roi in self.hdl.roi_items.items():
+            if not key.startswith("roi_") or not hasattr(roi, "sl_mode"):
+                continue
+            v = roi_to_polygon(roi, self.hdl.imageItem)
+            if (
+                not np.isfinite(v).all()
+                or len(v) < 3
+                or np.linalg.matrix_rank(v - v.mean(axis=0), tol=1e-9) < 2
+            ):
+                continue
+            filled = polygon2mask(self.shape, v)
+            if filled.any():
+                drawn.append((roi.sl_mode, filled))
+        return drawn
+
+    def apply_drawing(
+        self, drawn: list[tuple[str, np.ndarray]] | None = None
+    ) -> np.ndarray:
+        """Combine the pending drawing ROIs into a keep-mask and remove them.
+
+        Args:
+            drawn: result of `drawable_masks` from the same Apply, so the
+                caller's emptiness check does not rasterise a second time.
 
         Returns:
-            Mask array from drawing operations
+            Boolean keep-mask of ``self.shape`` (all True when nothing is drawn)
         """
         if self.detector_image is None or self.hdl is None or self.shape is None:
             return np.ones(self.shape, dtype=bool) if self.shape else np.array([])
 
-        shape = self.shape
-        ones = np.ones((shape[0] + 1, shape[1] + 1), dtype=bool)
-        mask_e = np.zeros_like(ones, dtype=bool)
-        mask_i = np.zeros_like(mask_e)
-
-        for k, x in self.hdl.roi_items.items():
-            if not k.startswith("roi_"):
-                continue
-
-            mask_temp = np.zeros_like(ones, dtype=bool)
-            sl, _ = x.getArraySlice(self.detector_image, self.hdl.imageItem)
-            y = x.getArrayRegion(ones, self.hdl.imageItem)
-
-            nz_idx = np.nonzero(y)
-            if len(nz_idx[0]) == 0:
-                continue
-
-            h_beg = np.min(nz_idx[1])
-            h_end = np.max(nz_idx[1]) + 1
-            v_beg = np.min(nz_idx[0])
-            v_end = np.max(nz_idx[0]) + 1
-
-            sl_v = slice(sl[0].start, sl[0].start + v_end - v_beg)
-            sl_h = slice(sl[1].start, sl[1].start + h_end - h_beg)
-            mask_temp[sl_v, sl_h] = y[v_beg:v_end, h_beg:h_end]
-
-            if hasattr(x, "sl_mode"):
-                if x.sl_mode == "exclusive":
-                    mask_e[mask_temp] = 1
-                elif x.sl_mode == "inclusive":
-                    mask_i[mask_temp] = 1
-
+        if drawn is None:
+            drawn = self.drawable_masks()
+        # Same rule as rasterize.rasterize, on the already filled polygons.
+        exclusive = np.zeros(self.shape, dtype=bool)
+        inclusive = np.zeros(self.shape, dtype=bool)
+        has_inclusive = False
+        for mode, filled in drawn:
+            if mode == "inclusive":
+                has_inclusive = True
+                inclusive |= filled
+            else:
+                exclusive |= filled
+        keep_inclusive = inclusive if has_inclusive else np.ones(self.shape, bool)
+        keep = np.logical_and(~exclusive, keep_inclusive)
         self.hdl.remove_rois(filter_str="roi_")
-
-        if np.sum(mask_i) == 0:
-            mask_i = np.ones_like(mask_e, dtype=bool)
-
-        mask_p = np.logical_not(mask_e) * mask_i
-        mask_p = mask_p[:-1, :-1]
-
-        return mask_p
+        return keep
 
     def add_drawing(
         self,
@@ -547,9 +594,15 @@ class SimpleMaskKernel:
             symmetry_fold: Symmetry fold for phi
 
         Returns:
-            Partition dictionary or None if no data
+            Partition dictionary or None if data or applied geometry is missing
         """
-        if self.detector_image is None or self.qmap is None or self.mask is None:
+        self.invalidate_partition()
+        if (
+            self._geometry_pending
+            or self.detector_image is None
+            or self.qmap is None
+            or self.mask is None
+        ):
             return None
 
         map_names = mode.split("-")
@@ -630,8 +683,11 @@ class SimpleMaskKernel:
         Args:
             new_metadata: Dictionary with updated geometry values
         """
-        self.metadata.update(new_metadata)
-        self.compute_qmap()
+        metadata = self.metadata | new_metadata
+        if metadata != self.metadata:
+            self.invalidate_partition()
+        self._apply_geometry(metadata)
+        self.set_geometry_pending(False)
 
     def get_center(
         self, mode: Literal["xy", "vh"] = "xy"
@@ -680,6 +736,8 @@ class SimpleMaskKernel:
         """
         if self.detector_image is None:
             raise RuntimeError("No detector image loaded.")
+        if self._geometry_pending or self.qmap is None:
+            raise ValueError("Generate Q-map to apply geometry changes first.")
 
         bcx, bcy = self.get_center(mode="xy")
         initial_center = (bcx, bcy) if bcx is not None and bcy is not None else None

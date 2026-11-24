@@ -11,6 +11,7 @@ How-to guides are **task-oriented**: they help you solve a real-world problem.
    quickstart
    /usage
    mask_editor_guide
+   g2_regrouping
    examples
    /contributing
 

@@ -79,7 +79,7 @@ class MaskBase:
         self.mtype = "base"
         self.qrings: list = []
 
-    def evaluate(self, **kwargs: Any) -> None:
+    def evaluate(self, **kwargs: Any) -> bool | None:
         """Evaluate mask (base method)."""
 
     def describe(self) -> str:
@@ -174,47 +174,54 @@ class MaskFile(MaskBase):
         fname: str | None = None,
         key: str | None = None,
         **kwargs: Any,
-    ) -> None:
+    ) -> bool:
         """Load mask from an HDF5 file.
 
         Args:
             fname: Path to HDF5 file
             key: Dataset key within the HDF5 file containing the mask
+
+        Returns:
+            True only when a mask of the detector shape (or its transpose)
+            was read; otherwise False and ``zero_loc`` is cleared.
         """
-        if fname is None or not os.path.isfile(fname):
-            self.zero_loc = None
-            return
+        self.zero_loc = None
+        if fname is None or key is None or not os.path.isfile(fname):
+            logger.error(f"Mask file not found: {fname}")
+            return False
 
         _, ext = os.path.splitext(fname)
-        mask = None
-
-        if ext in [".hdf", ".h5", ".hdf5"]:
-            try:
-                with h5py.File(fname, "r") as f:
-                    mask = f[key][()]
-            except Exception:
-                logger.error(f"Cannot read HDF file: {fname}, key: {key}")
-        else:
+        if ext.lower() not in [".hdf", ".h5", ".hdf5"]:
             logger.error(f"MaskFile only supports HDF5 files. Found: {fname}")
+            return False
 
-        if mask is None:
-            self.zero_loc = None
-            return
+        try:
+            with h5py.File(fname, "r") as f:
+                mask = np.asarray(f[key][()])
+        except Exception as exc:
+            logger.error(f"Cannot read HDF file: {fname}, key: {key}: {exc!r}")
+            return False
 
-        # Handle transposed masks
-        if mask.shape != self.shape:
+        # Handle transposed masks (swap only an exact transpose, so the error
+        # below reports the file's real shape)
+        if mask.shape != self.shape and mask.shape == tuple(self.shape)[::-1]:
             mask = np.swapaxes(mask, 0, 1)
 
         if mask.shape != self.shape:
             logger.error(
                 f"Mask shape {mask.shape} doesn't match detector shape {self.shape}"
             )
-            self.zero_loc = None
-            return
+            return False
+
+        # bool/int/uint/float only: bytes, strings and objects cannot be
+        # compared with 0, and complex values have no ordering.
+        if mask.dtype.kind not in "biuf":
+            logger.error(f"Unsupported mask dtype {mask.dtype} in {fname}:{key}")
+            return False
 
         # Masked pixels have value <= 0
-        mask = mask <= 0
-        self.zero_loc = np.array(np.nonzero(mask))
+        self.zero_loc = np.array(np.nonzero(mask <= 0))
+        return True
 
 
 class MaskThreshold(MaskBase):
@@ -347,7 +354,11 @@ class MaskAssemble:
         workers: Dictionary of named mask worker instances.
         mask_record: List of historical mask states.
         mask_ptr: Index into *mask_record* for the current state.
+        layer_record: Per-state layer arrays; the combined mask is their AND.
     """
+
+    # Re-applying one of these replaces its previous layer instead of adding to it.
+    REPLACING_TARGETS: frozenset[str] = frozenset({"mask_draw", "mask_parameter"})
 
     def __init__(
         self,
@@ -387,6 +398,7 @@ class MaskAssemble:
             else np.ones(shape, dtype=bool)
         )
         self.mask_record: list[np.ndarray] = [initial_mask]
+        self.layer_record: list[dict[str, np.ndarray]] = [{"accumulated": initial_mask}]
         self.mask_ptr = 0
         # 0: no mask; 1: apply the default mask
         self.mask_ptr_min = 0
@@ -413,29 +425,53 @@ class MaskAssemble:
             return self.get_mask()
 
         new_layer = self.get_one_mask(target)
-        # Use read-only view for the current mask — avoids a 4MB memcpy.
-        # np.logical_and always allocates a fresh output array, so `combined`
-        # is already an independent copy that is safe to push to history.
-        current_ref = self._get_mask_ref()
-        combined = np.logical_and(current_ref, new_layer)
+        # Unchanged layers are shared by reference with the previous state.
+        layers = dict(self._layers_at(self.mask_ptr))
+        key = target if target in self.REPLACING_TARGETS else "accumulated"
+        old_layer = layers.get(key)
+        if key == "accumulated" and old_layer is not None:
+            new_layer = np.logical_and(old_layer, new_layer)
+        layers[key] = new_layer
+        # np.logical_and.reduce allocates, so `combined` is safe to push to history.
+        combined = np.logical_and.reduce(list(layers.values()))
 
+        # A missing layer excludes nothing, i.e. it is all True. Comparing the
+        # layer itself keeps edits hidden under existing exclusions undoable.
+        layer_changed = (
+            not new_layer.all()
+            if old_layer is None
+            else not np.array_equal(old_layer, new_layer)
+        )
         # Short-circuit change detection: compare nonzero counts first (integer
         # comparison) before falling back to the full O(H*W) element scan.
         last = self.mask_record[self.mask_ptr]
-        changed = (combined.sum() != last.sum()) or not np.array_equal(last, combined)
+        changed = (
+            layer_changed
+            or combined.sum() != last.sum()
+            or not np.array_equal(last, combined)
+        )
 
         if changed:
+            # mask_record may have been extended directly; keep the lists aligned.
+            while len(self.layer_record) < self.mask_ptr + 1:
+                self.layer_record.append(self._layers_at(len(self.layer_record)))
             # Remove any redo states beyond current pointer
             while len(self.mask_record) > self.mask_ptr + 1:
                 self.mask_record.pop()
-            # combined is freshly allocated — push directly, no extra copy needed.
+            while len(self.layer_record) > self.mask_ptr + 1:
+                self.layer_record.pop()
             self.mask_record.append(combined)
+            self.layer_record.append(layers)
             self.mask_ptr += 1
 
-            # Enforce bounded history: drop the oldest entry (beyond mask_ptr_min
-            # anchor) when the limit is exceeded to prevent unbounded memory growth.
-            if len(self.mask_record) > self.max_history + self.mask_ptr_min:
-                self.mask_record.pop(self.mask_ptr_min)
+            # Enforce bounded history. Pop the oldest undo state after the
+            # baseline so reset still returns to it, and never the new state.
+            cap = max(self.max_history, 2) + self.mask_ptr_min
+            oldest = self.mask_ptr_min + 1
+            while len(self.mask_record) > cap:
+                self.mask_record.pop(oldest)
+                if len(self.layer_record) > oldest:
+                    self.layer_record.pop(oldest)
                 self.mask_ptr -= 1
         return combined
 
@@ -474,7 +510,19 @@ class MaskAssemble:
             # Keep the default mask if one exists
             while len(self.mask_record) > 1 + self.mask_ptr_min:
                 self.mask_record.pop()
+            while len(self.layer_record) > 1 + self.mask_ptr_min:
+                self.layer_record.pop()
             self.mask_ptr = self.mask_ptr_min
+
+    def _layers_at(self, ptr: int) -> dict[str, np.ndarray]:
+        """Return the layers of history entry *ptr*.
+
+        Entries added to ``mask_record`` directly have no layer record and
+        are treated as a single accumulated layer.
+        """
+        if ptr < len(self.layer_record):
+            return self.layer_record[ptr]
+        return {"accumulated": self.mask_record[ptr]}
 
     def get_one_mask(self, target: str) -> np.ndarray:
         """Get mask from a single worker.

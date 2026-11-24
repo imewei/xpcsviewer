@@ -140,6 +140,7 @@ dependencies = [
     "ipykernel>=7.2",
     "ipywidgets>=8.1.8",
     "jupyterlab>=4.4",
+    "scikit-image>=0.26.0",
 ]
 
 [project.optional-dependencies]
@@ -179,6 +180,9 @@ override-dependencies = [
 [tool.setuptools_scm]
 version_scheme = "python-simplified-semver"
 local_scheme = "node-and-timestamp"
+
+[tool.setuptools]
+license-files = ["LICENSE", "NOTICE", "LICENSE-APACHE-2.0"]
 
 [tool.setuptools.packages.find]
 include = ["xpcsviewer", "xpcsviewer.*"]
