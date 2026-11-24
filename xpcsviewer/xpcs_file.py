@@ -1705,6 +1705,7 @@ class XpcsFile:
         from xpcsviewer.fitting import (
             fit_with_fixed,
             fit_with_fixed_parallel,
+            initial_fit_guess,
         )
         from xpcsviewer.xpcs_file.fitting import double_exp_all, single_exp_all
 
@@ -1729,20 +1730,9 @@ class XpcsFile:
         # Use optimized get_g2_data (which now has caching)
         q_val, t_el, g2, sigma, label = self.get_g2_data(qrange=q_range, trange=t_range)
 
-        # Optimized initial parameter guess using numpy vectorization
-        bounds_array = np.array(bounds)
-        p0 = np.mean(bounds_array, axis=0)
-
-        # Improved geometric mean calculation for tau parameters
-        tau_indices = [1]  # tau parameter for single exponential
-        if fit_func == "double":
-            tau_indices.append(4)  # second tau parameter for double exponential
-
-        for tau_idx in tau_indices:
-            if bounds_array[0, tau_idx] > 0 and bounds_array[1, tau_idx] > 0:
-                p0[tau_idx] = np.sqrt(
-                    bounds_array[0, tau_idx] * bounds_array[1, tau_idx]
-                )
+        # The fit UI has no initial-value entry: the bounds midpoint (geometric
+        # mean for tau) is both the starting point and the documented fixed value.
+        p0 = initial_fit_guess(bounds, [1, 4] if fit_func == "double" else [1])
 
         # Optimized fit_x generation - cache if t_el doesn't change
         t_range_key = (
