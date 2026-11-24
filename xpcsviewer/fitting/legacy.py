@@ -276,7 +276,7 @@ def fit_with_fixed(
     sigma = ensure_numpy(sigma)
     fit_x = ensure_numpy(fit_x)
 
-    fit_flag = np.asarray(fit_flag)
+    fit_flag = np.asarray(fit_flag, dtype=bool)
 
     fix_flag = np.logical_not(fit_flag)
 
@@ -406,7 +406,7 @@ def fit_with_fixed_parallel(
     sigma = ensure_numpy(sigma)
     fit_x = ensure_numpy(fit_x)
 
-    fit_flag = np.asarray(fit_flag)
+    fit_flag = np.asarray(fit_flag, dtype=bool)
     fix_flag = np.logical_not(fit_flag)
     bounds = np.asarray(bounds)
 
@@ -611,7 +611,7 @@ def fit_with_fixed_sequential(
     sigma = ensure_numpy(sigma)
     fit_x = ensure_numpy(fit_x)
 
-    fit_flag = np.asarray(fit_flag)
+    fit_flag = np.asarray(fit_flag, dtype=bool)
     fix_flag = np.logical_not(fit_flag)
     bounds = np.asarray(bounds)
 

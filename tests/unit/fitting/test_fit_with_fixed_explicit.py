@@ -126,3 +126,17 @@ def test_fit_g2_fixed_baseline_is_held_at_bounds_midpoint():
         force_refit=True,
     )
     np.testing.assert_allclose(summary["fit_val"][:, 0, 3], 1.1)
+
+
+@pytest.mark.parametrize("solver", SOLVERS)
+@pytest.mark.parametrize(
+    "flags",
+    [[1, 1, 0], np.array([1, 1, 0], dtype=np.int64), [1, 1, 1]],
+    ids=["int", "np-int64", "int-all-free"],
+)
+def test_integer_fit_flags_match_bool_flags(solver, flags):
+    p0 = np.array([0.4, 0.9, 0.2])
+    want = _call(solver, np.asarray(flags, dtype=bool), p0)
+    got = _call(solver, flags, p0)
+    np.testing.assert_array_equal(got[1], want[1])
+    np.testing.assert_array_equal(got[0], want[0])
