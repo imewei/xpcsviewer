@@ -196,7 +196,7 @@ def test_apply_drawing_without_rois_is_all_true(tool):
     assert np.all(mask)
 
 
-def test_pending_roi_count_counts_only_drawable_shapes(tool):
+def test_drawable_masks_counts_only_drawable_shapes(tool):
     for roi in (
         pg.RectROI((7, 5), (10, 8)),
         pg.CircleROI((-34, -34), radius=4.0),
@@ -204,7 +204,7 @@ def test_pending_roi_count_counts_only_drawable_shapes(tool):
     ):
         roi.sl_mode = "exclusive"
         tool.hdl.add_item(roi)
-    assert tool.pending_roi_count() == 1
+    assert len(tool.drawable_masks()) == 1
     assert len(tool.hdl.roi_items) == 3  # counting does not consume the ROIs
 
 

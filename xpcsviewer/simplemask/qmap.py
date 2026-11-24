@@ -272,7 +272,8 @@ def compute_q_at_pixel(
     # Scattering angle
     alpha = backend.arctan(r / det_dist)
 
-    # Q magnitude
+    # In-plane projection k0*sin(alpha); the q-map |Q| is 2*k0*sin(alpha/2),
+    # larger by ~alpha^2/8
     q = backend.sin(alpha) * k0
 
     return q

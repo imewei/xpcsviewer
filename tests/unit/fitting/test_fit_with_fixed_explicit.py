@@ -76,6 +76,12 @@ def test_missing_p0_with_fixed_parameter_raises(solver):
 
 
 @pytest.mark.parametrize("solver", SOLVERS)
+def test_p0_shorter_than_fit_flag_raises_value_error(solver):
+    with pytest.raises(ValueError, match="p0 has shape"):
+        _call(solver, [True, True, False], np.array([0.4, 0.9]))
+
+
+@pytest.mark.parametrize("solver", SOLVERS)
 def test_nonfinite_fixed_p0_raises(solver):
     with pytest.raises(ValueError, match="finite"):
         _call(solver, [True, True, False], np.array([0.4, 0.9, np.nan]))

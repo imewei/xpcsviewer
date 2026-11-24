@@ -198,8 +198,8 @@ class MaskFile(MaskBase):
         try:
             with h5py.File(fname, "r") as f:
                 mask = np.asarray(f[key][()])
-        except Exception:
-            logger.error(f"Cannot read HDF file: {fname}, key: {key}")
+        except Exception as exc:
+            logger.error(f"Cannot read HDF file: {fname}, key: {key}: {exc!r}")
             return False
 
         # Handle transposed masks (swap only an exact transpose, so the error

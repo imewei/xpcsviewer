@@ -103,8 +103,8 @@ def group_index_map(shape, rois):
     """Label each pixel with the group_index of the inclusive ROI covering it.
 
     Exclusive ROIs and ungrouped inclusive ROIs (group_index == 0) are ignored.
-    On overlap between grouped ROIs, last-write-wins (same convention as
-    MaskParameter.group_index_map in core/mask.py).
+    On overlap between grouped ROIs, last-write-wins (the later ROI in `rois`
+    owns the pixel).
     """
     gmap = np.zeros(shape, dtype=np.uint32)
     for roi in rois:

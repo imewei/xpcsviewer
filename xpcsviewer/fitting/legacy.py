@@ -215,6 +215,10 @@ def _resolve_full_p0(
             raise ValueError("fixed parameters require explicit p0 values")
         return np.mean(bounds, axis=0)
     full_p0 = np.array(p0, dtype=float)
+    if full_p0.shape != fit_flag.shape:
+        raise ValueError(
+            f"p0 has shape {full_p0.shape} but fit_flag has shape {fit_flag.shape}"
+        )
     if not np.all(np.isfinite(full_p0[~fit_flag])):
         raise ValueError("fixed parameters require finite explicit p0 values")
     return full_p0
@@ -263,12 +267,21 @@ def fit_with_fixed(
     fit_x : array
         X values for output curve
     p0 : array, optional
-        Initial parameter values
+        Starting values, one per parameter. Required, and finite, for every
+        parameter with ``fit_flag`` False: such a parameter is held at its
+        ``p0`` value. With every parameter free it may be omitted and the
+        bounds midpoint is used.
 
     Returns
     -------
     tuple
         (fit_line, fit_params)
+
+    Raises
+    ------
+    ValueError
+        If ``p0`` is missing or non-finite for a fixed parameter, or its shape
+        differs from ``fit_flag``.
     """
     # Ensure numpy arrays at nlsq boundary
     x = ensure_numpy(x)

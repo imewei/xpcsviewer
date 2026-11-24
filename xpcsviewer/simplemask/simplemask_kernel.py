@@ -395,10 +395,6 @@ class SimpleMaskKernel:
                 drawn.append((roi.sl_mode, filled))
         return drawn
 
-    def pending_roi_count(self) -> int:
-        """Number of pending drawing ROIs that `apply_drawing` would rasterise."""
-        return len(self.drawable_masks())
-
     def apply_drawing(
         self, drawn: list[tuple[str, np.ndarray]] | None = None
     ) -> np.ndarray:
