@@ -32,7 +32,8 @@ class BatchBayesianCoordinator(QObject):
     """
 
     progress = Signal(int, int, str)  # (completed, total, message)
-    all_finished = Signal(dict)  # {q_idx: result_dict | None}
+    # Signal(dict) converts to QVariantMap on PySide6 and drops int keys.
+    all_finished = Signal(object)  # {q_idx: result_dict | None}
     single_q_finished = Signal(int, object)  # (q_idx, result_dict)
     single_q_error = Signal(int, str)  # (q_idx, error_message)
 

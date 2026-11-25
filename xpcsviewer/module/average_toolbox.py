@@ -28,6 +28,49 @@ from ..xpcs_file import XpcsFile as XF
 logger = get_logger(__name__)
 
 
+# Fields whose rows are delay/Q-bin ordered; saxs_1d is ordered by sqlist.
+_TIME_FIELDS = frozenset({"g2", "g2_err", "G2", "IP", "IF"})
+
+
+def _coords_of(xf, fields):
+    """Physical coordinates (delay, Q) that the averaged ``fields`` are indexed by."""
+    coords = {}
+    if _TIME_FIELDS.intersection(fields):
+        coords["t_el"] = getattr(xf, "t_el", None)
+        coords["dqlist"] = getattr(xf, "dqlist", None)
+    if "saxs_1d" in fields:
+        coords["sqlist"] = getattr(xf, "sqlist", None)
+    return coords
+
+
+def _accept_coords(ref, path, coords):
+    """True if ``coords`` match the reference; the first caller becomes the reference."""
+    if not ref:
+        ref.update(path=path, coords=coords)
+        return True
+    for key, a in ref["coords"].items():
+        b = coords.get(key)
+        if a is None and b is None:
+            continue
+        if a is None or b is None:
+            return False
+        a, b = np.asarray(a), np.asarray(b)
+        if a.shape != b.shape or not np.allclose(a, b, equal_nan=True):
+            return False
+    return True
+
+
+def _check_output_not_input(save_path, input_paths):
+    """Raise if ``save_path`` is (a link to) one of the input files."""
+    for p in input_paths:
+        if os.path.exists(save_path) and os.path.exists(p):
+            same = os.path.samefile(save_path, p)
+        else:
+            same = os.path.realpath(save_path) == os.path.realpath(p)
+        if same:
+            raise ValueError(f"output path {save_path} is an input file ({p})")
+
+
 class WorkerSignal(QObject):
     progress = QtCore.Signal(tuple)
     values = QtCore.Signal(tuple)
@@ -127,6 +170,16 @@ class AverageToolbox(QtCore.QRunnable):
         self.stime = time.strftime("%H:%M:%S")
         self.status = "running"
         self.n_accepted = 0
+        self._ref = {}  # first accepted file: template path and coordinates
+        if save_path is not None:
+            try:
+                _check_output_not_input(
+                    save_path, [os.path.join(self.work_dir, f) for f in self.model[:]]
+                )
+            except ValueError as e:
+                logger.error("refusing to average: %s", e)
+                self._finish(0)
+                return
         logger.info("average job %s starts", self.jid)
         tot_num = len(self.model)
         steps = (tot_num + chunk_size - 1) // chunk_size
@@ -222,7 +275,8 @@ class AverageToolbox(QtCore.QRunnable):
         )
 
         logger.info(f"create file: {save_path}")
-        copyfile(self.origin_path, save_path)
+        # template = first accepted file, so metadata matches the averaged coordinates
+        copyfile(self._ref.get("path", self.origin_path), save_path)
         put(save_path, result, ftype="nexus", mode="alias")
 
         # Final cleanup to release memory
@@ -316,6 +370,17 @@ class AverageToolbox(QtCore.QRunnable):
                         result[key] is None or result[key].shape == file_data[key].shape
                         for key in fields
                     )
+                    if shapes_ok and not _accept_coords(
+                        self._ref,
+                        os.path.join(self.work_dir, fname),
+                        _coords_of(xf, fields),
+                    ):
+                        logger.warning(
+                            f"delay/Q coordinates do not match, skipping {fname}"
+                        )
+                        shapes_ok = False
+                    elif not shapes_ok:
+                        logger.info(f"data shape does not match, skipping {fname}")
                     if shapes_ok:
                         for key in fields:
                             if result[key] is None:
@@ -325,8 +390,6 @@ class AverageToolbox(QtCore.QRunnable):
                             else:
                                 result[key] += file_data[key]
                         mask[m] = 1
-                    else:
-                        logger.info(f"data shape does not match, skipping {fname}")
 
                 # Clear the XpcsFile to release memory immediately
                 if "xf" in locals():
@@ -419,11 +482,25 @@ class AverageToolbox(QtCore.QRunnable):
                         # All-or-nothing, as in the sequential path, so mask[m]
                         # means every field of file m was summed.
                         if file_result is not None:
-                            if all(
+                            if not all(
                                 result[key] is None
                                 or result[key].shape == file_result[key].shape
                                 for key in fields
                             ):
+                                logger.info(
+                                    "data shape does not match, skipping %s",
+                                    self.model[m],
+                                )
+                            elif not _accept_coords(
+                                self._ref,
+                                os.path.join(self.work_dir, self.model[m]),
+                                file_result["_coords"],
+                            ):
+                                logger.warning(
+                                    "delay/Q coordinates do not match, skipping %s",
+                                    self.model[m],
+                                )
+                            else:
                                 for key in fields:
                                     if result[key] is None:
                                         result[key] = np.array(
@@ -433,11 +510,6 @@ class AverageToolbox(QtCore.QRunnable):
                                         result[key] += file_result[key]
                                 # counted only after every field was summed
                                 mask[m] = 1
-                            else:
-                                logger.info(
-                                    "data shape does not match, skipping %s",
-                                    self.model[m],
-                                )
 
                         self.signals.values.emit((self.jid, baseline_val))
 
@@ -487,6 +559,7 @@ class AverageToolbox(QtCore.QRunnable):
                             file_result[key] = getattr(xf, key)
                         else:
                             file_result[key] = getattr(xf, "saxs_1d")["data_raw"]
+                    file_result["_coords"] = _coords_of(xf, fields)
                     batch_results.append(file_result)
                 else:
                     batch_results.append(None)
@@ -582,6 +655,7 @@ def _process_file_for_average(args):
                         scale = 1.0
                     result[key] = data * scale
 
+            result["_coords"] = _coords_of(xf, fields)
             scale = xf.abs_cross_section_scale if "saxs_1d" in fields else 1.0
             return True, val, result, scale if scale is not None else 1.0
         return False, val, None, 1.0
@@ -632,6 +706,9 @@ def do_average(
 
     tot_num = len(flist)
 
+    if save_path is not None:
+        _check_output_not_input(save_path, [os.path.join(work_dir, f) for f in flist])
+
     # Monitor memory before starting
     initial_memory_mb, _ = MemoryMonitor.get_memory_usage()
     logger.info(
@@ -645,6 +722,32 @@ def do_average(
     result = {}
     for key in fields:
         result[key] = None
+
+    ref = {}  # first accepted file: template path and coordinates
+
+    def _accumulate(result, m, file_result):
+        # All-or-nothing: include this file only if every field is
+        # shape-compatible and on the reference delay/Q grid, so per-key
+        # normalization stays consistent.
+        if not all(
+            result[key] is None or result[key].shape == file_result[key].shape
+            for key in fields
+        ):
+            logger.info(f"data shape does not match, skipping {flist[m]}")
+            return False
+        if not _accept_coords(
+            ref, os.path.join(work_dir, flist[m]), file_result["_coords"]
+        ):
+            logger.warning(f"delay/Q coordinates do not match, skipping {flist[m]}")
+            return False
+        mask[m] = 1
+        for key in fields:
+            data = file_result[key]
+            if result[key] is None:
+                result[key] = data
+            else:
+                result[key] += data
+        return True
 
     # Determine number of workers
     if n_jobs is None:
@@ -674,30 +777,21 @@ def do_average(
             for m, (flag, val, file_result, scale) in enumerate(results_parallel):
                 baseline[m] = val
 
-                if flag and file_result is not None:
-                    # All-or-nothing: include this file only if every field is
-                    # shape-compatible, so per-key normalization stays consistent.
-                    shapes_ok = all(
-                        result[key] is None
-                        or result[key].shape == file_result[key].shape
-                        for key in fields
-                    )
-                    if shapes_ok:
-                        mask[m] = 1
-                        for key in fields:
-                            data = file_result[key]
-                            if key == "saxs_1d":
-                                abs_cs_scale_tot += scale
-                            if result[key] is None:
-                                result[key] = data
-                            else:
-                                result[key] += data
-                    else:
-                        logger.info(f"data shape does not match, skipping {flist[m]}")
+                if (
+                    flag
+                    and file_result is not None
+                    and _accumulate(result, m, file_result)
+                ):
+                    abs_cs_scale_tot += scale if "saxs_1d" in fields else 0.0
 
         except Exception as e:
             logger.warning(f"Parallel processing failed, falling back to serial: {e}")
-            # Fall back to sequential processing
+            # Fall back to sequential processing; drop anything the failed
+            # parallel pass already summed so no file is counted twice.
+            result = dict.fromkeys(fields)
+            mask[:] = 0
+            abs_cs_scale_tot = 0.0
+            ref.clear()
             for m in trange(tot_num):
                 flag, val, file_result, scale = _process_file_for_average(
                     (
@@ -712,26 +806,12 @@ def do_average(
                 )
                 baseline[m] = val
 
-                if flag and file_result is not None:
-                    # All-or-nothing: include this file only if every field is
-                    # shape-compatible, so per-key normalization stays consistent.
-                    shapes_ok = all(
-                        result[key] is None
-                        or result[key].shape == file_result[key].shape
-                        for key in fields
-                    )
-                    if shapes_ok:
-                        mask[m] = 1
-                        for key in fields:
-                            data = file_result[key]
-                            if key == "saxs_1d":
-                                abs_cs_scale_tot += scale
-                            if result[key] is None:
-                                result[key] = data
-                            else:
-                                result[key] += data
-                    else:
-                        logger.info(f"data shape does not match, skipping {flist[m]}")
+                if (
+                    flag
+                    and file_result is not None
+                    and _accumulate(result, m, file_result)
+                ):
+                    abs_cs_scale_tot += scale if "saxs_1d" in fields else 0.0
     else:
         # Sequential processing for small datasets
         logger.info("Using sequential processing")
@@ -749,25 +829,8 @@ def do_average(
             )
             baseline[m] = val
 
-            if flag and file_result is not None:
-                # All-or-nothing: include this file only if every field is
-                # shape-compatible, so per-key normalization stays consistent.
-                shapes_ok = all(
-                    result[key] is None or result[key].shape == file_result[key].shape
-                    for key in fields
-                )
-                if shapes_ok:
-                    mask[m] = 1
-                    for key in fields:
-                        data = file_result[key]
-                        if key == "saxs_1d":
-                            abs_cs_scale_tot += scale
-                        if result[key] is None:
-                            result[key] = data
-                        else:
-                            result[key] += data
-                else:
-                    logger.info(f"data shape does not match, skipping {flist[m]}")
+            if flag and file_result is not None and _accumulate(result, m, file_result):
+                abs_cs_scale_tot += scale if "saxs_1d" in fields else 0.0
 
     if np.sum(mask) == 0:
         logger.info("no dataset is valid; check the baseline criteria.")
@@ -796,9 +859,10 @@ def do_average(
         f"(final: {final_memory_mb:.1f}MB)"
     )
 
-    original_file = os.path.join(work_dir, flist[0])
+    original_file = ref["path"]  # first accepted file, matches the averaged grid
     if save_path is None:
         save_path = "AVG" + os.path.basename(flist[0])
+        _check_output_not_input(save_path, [os.path.join(work_dir, f) for f in flist])
     logger.info(f"create file: {save_path}")
     copyfile(original_file, save_path)
     put(save_path, result, ftype="nexus", mode="alias")

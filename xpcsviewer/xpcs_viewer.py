@@ -213,6 +213,7 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
 
         # Track active async operations
         self.active_plot_operations = {}  # operation_id -> plot_type
+        self._plot_op_requests = {}  # operation_id -> kwargs it was started with
         self._g2_fit_bounds_initialized = False
 
         # list widget models
@@ -287,6 +288,9 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
 
         # Bayesian fitting state — G2 (single-Q)
         self._g2_bayesian_results: dict[int, object] = {}
+        # q_idx -> (file name, actual Q value) each cached fit was computed for
+        self._g2_bayesian_context: dict[int, tuple[str | None, float]] = {}
+        self._g2_bayesian_fit_fname: str | None = None
         self._g2_diagnosis_window = None
         self._g2_bayesian_worker_active: bool = False
         self._g2_bayesian_worker: object | None = None  # current single-Q worker
@@ -1416,6 +1420,19 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         # Remove from active operations — pop() avoids KeyError if on_async_plot_ready
         # already removed the entry (P1-02).
         self.active_plot_operations.pop(operation_id, None)
+        self._plot_op_requests.pop(operation_id, None)
+
+    def _plot_request_is_stale(self, plot_type, request) -> bool:
+        """True if the current selection no longer yields *request*'s kwargs."""
+        try:
+            current = getattr(self, "plot_" + plot_type)(dryrun=True)
+            if not current:
+                return True
+            current["target_timestamp"] = self.vk.timestamp
+            return bool(current != request)
+        except Exception:
+            logger.debug("stale-plot check failed for %s", plot_type, exc_info=True)
+            return False
 
     def on_async_plot_ready(self, operation_id: str, result):
         """Handle async plot completion."""
@@ -1423,6 +1440,16 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             return
 
         plot_type = self.active_plot_operations[operation_id]
+
+        # Selection/targets changed while the worker ran: drop the result and
+        # queue a refresh for the newest selection instead of painting old data.
+        request = self._plot_op_requests.pop(operation_id, None)
+        if request is not None and self._plot_request_is_stale(plot_type, request):
+            logger.info("Discarding stale %s plot result", plot_type)
+            self.active_plot_operations.pop(operation_id, None)
+            self.progress_manager.complete_operation(operation_id, True)
+            self.update_plot_async(plot_type)
+            return
 
         try:
             # Apply the plot result to the GUI
@@ -1472,6 +1499,7 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         self.toast_manager.show_error(f"Operation failed: {error_msg}")
 
         # Clean up
+        self._plot_op_requests.pop(operation_id, None)
         if operation_id in self.active_plot_operations:
             del self.active_plot_operations[operation_id]
 
@@ -2011,6 +2039,7 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
 
             # Track this operation
             self.active_plot_operations[operation_id] = tab_name
+            self._plot_op_requests[operation_id] = kwargs
 
             # Map tab names to async methods
             # Note: twotime is included here for manual async calls but is
@@ -2641,6 +2670,12 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             self._simplemask_window.qmap_exported.connect(self.import_partition)
             logger.info("Created new SimpleMask window")
 
+        if self._simplemask_window.isVisible():
+            # Reloading would discard the editor's unsaved mask edits; just focus.
+            self._simplemask_window.raise_()
+            self._simplemask_window.activateWindow()
+            return
+
         # Get detector image and metadata from current file
         detector_image, metadata = self._get_simplemask_data()
 
@@ -2680,12 +2715,15 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             ):
                 detector_image = detector_image[0]
 
-            # Extract geometry metadata
+            # Extract geometry metadata. QMap stores lengths in metres; the
+            # SimpleMask kernel expects millimetres.
+            det_dist = getattr(xf, "det_dist", None)
+            pix_dim = getattr(xf, "pixel_size", None)
             metadata = {
                 "bcx": getattr(xf, "bcx", None),
                 "bcy": getattr(xf, "bcy", None),
-                "det_dist": getattr(xf, "det_dist", None),
-                "pix_dim": getattr(xf, "pix_dim_x", None),
+                "det_dist": det_dist * 1000.0 if det_dist is not None else None,
+                "pix_dim": pix_dim * 1000.0 if pix_dim is not None else None,
                 "energy": getattr(xf, "X_energy", None),
                 "shape": detector_image.shape if detector_image is not None else None,
             }
@@ -3825,6 +3863,8 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         folder = os.path.abspath(folder)
         self._close_g2_regroup()
         self._reset_g2_fit_bounds()
+        # New directory: no in-flight plot (any tab) may repaint the new workspace.
+        self._retire_plot_operations()
         self.work_dir.setText(folder)
         logger.info(f"Loading data from: {sanitize_path(folder)}")
 
@@ -3861,6 +3901,7 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
 
         # Clear Bayesian fitting state from previous dataset
         self._g2_bayesian_results = {}
+        self._g2_bayesian_context = {}
         self._g2_bayesian_data = None
         self._g2_bayesian_model_func = None
         self._g2_bayesian_worker = None
@@ -4147,14 +4188,18 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             self.reset_gui()
         self.update_box(self.vk.target, mode="target")
 
-    def _reset_g2_fit_bounds(self) -> None:
-        for operation_id, plot_type in list(self.active_plot_operations.items()):
-            if plot_type != "g2":
+    def _retire_plot_operations(self, plot_type: str | None = None) -> None:
+        """Cancel in-flight plot operations (all, or only those of *plot_type*)."""
+        for operation_id, op_type in list(self.active_plot_operations.items()):
+            if plot_type is not None and op_type != plot_type:
                 continue
             if self.progress_manager.is_operation_active(operation_id):
                 self.progress_manager.cancel_operation_ui(operation_id)
             else:
                 self.cancel_async_operation(operation_id)
+
+    def _reset_g2_fit_bounds(self) -> None:
+        self._retire_plot_operations("g2")
         self._g2_fit_bounds_initialized = False
 
     def reset_gui(self):
@@ -4385,6 +4430,20 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         _, _, fit_func_name = self.check_g2_fitting_number()
         return x[valid], y[valid], yerr[valid], q_idx, q_value, fit_func_name
 
+    def _g2_first_fname(self):
+        """File name of the first selected file (the one Bayesian fits use)."""
+        xf_list = self.vk.get_xf_list(self.get_selected_rows())
+        return xf_list[0].fname if xf_list else None
+
+    def _g2_fit_matches_current(self, q_idx, q_value):
+        """True if the cached fit for *q_idx* was made for the current file and Q."""
+        ctx = self._g2_bayesian_context.get(q_idx)
+        return (
+            ctx is not None
+            and ctx[0] == self._g2_first_fname()
+            and bool(np.isclose(ctx[1], q_value))
+        )
+
     def _on_g2_qbin_changed(self, q_idx):
         """Handle Q-bin spinbox value change in g2 fitting tab.
 
@@ -4435,9 +4494,13 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
                 extracted = self._extract_g2_for_bayesian()
                 if extracted is not None:
                     x, y, yerr, _, q_value, _ = extracted
-                    fit_result = self._g2_bayesian_results[q_idx]
-                    self._g2_bayesian_data = (x, y, yerr, q_idx, q_value)
-                    self._update_g2_diagnosis(fit_result, x, y, yerr, q_value)
+                    if self._g2_fit_matches_current(q_idx, q_value):
+                        fit_result = self._g2_bayesian_results[q_idx]
+                        self._g2_bayesian_data = (x, y, yerr, q_idx, q_value)
+                        self._update_g2_diagnosis(fit_result, x, y, yerr, q_value)
+                    else:
+                        title = f"G2 Bayesian Diagnosis — Q-bin {q_idx} (stale fit)"
+                        self._g2_diagnosis_window.setWindowTitle(title)
             else:
                 # Show placeholder in diagnosis window title
                 title = f"G2 Bayesian Diagnosis \u2014 Q-bin {q_idx} (no fit yet)"
@@ -4543,6 +4606,7 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             self._g2_bayesian_model_func = double_exp_func
 
         self._g2_bayesian_data = (x, y, yerr, q_idx, q_value)
+        self._g2_bayesian_fit_fname = self._g2_first_fname()
 
         warmup = self.sb_g2_bayesian_warmup.value()
         samples = self.sb_g2_bayesian_samples.value()
@@ -4595,6 +4659,10 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         q_value = result["q_value"]
 
         self._g2_bayesian_results[q_idx] = fit_result
+        self._g2_bayesian_context[q_idx] = (
+            self._g2_bayesian_fit_fname,
+            float(q_value),
+        )
 
         # Enable diagnosis only if the CURRENT spinbox Q-bin has a result
         # (user may have changed spinbox while the fit was running)
@@ -4778,8 +4846,14 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
 
     def _on_g2_batch_single_q_done(self, q_idx, result):
         """Store individual Q-bin result for diagnosis access."""
-        if result is not None:
+        # q_arr is None when the dataset was reset mid-batch; drop the stale result
+        if result is not None and getattr(self, "_g2_batch_q_arr", None) is not None:
             self._g2_bayesian_results[q_idx] = result.get("fit_result")
+            xf = getattr(self, "_g2_batch_target_xf", None)
+            self._g2_bayesian_context[q_idx] = (
+                xf.fname if xf is not None else None,
+                float(self._g2_batch_q_arr[q_idx]),
+            )
 
     def _on_g2_batch_single_q_error(self, q_idx, error_msg):
         """Log individual Q-bin failure."""
@@ -5091,6 +5165,16 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
                 )
                 return
             q_idx = extracted_q_idx
+
+        # The cache is keyed by relative index only; refuse a fit that was
+        # computed for another file or another actual Q value.
+        if not self._g2_fit_matches_current(q_idx, q_value):
+            self.statusbar.showMessage(
+                f"Cached fit for Q-bin {q_idx} belongs to a different file or Q "
+                "value — re-run Fit",
+                4000,
+            )
+            return
 
         self._g2_bayesian_data = (x, y, yerr, q_idx, q_value)
         self._update_g2_diagnosis(fit_result, x, y, yerr, q_value)

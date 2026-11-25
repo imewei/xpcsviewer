@@ -2,6 +2,7 @@ from __future__ import annotations
 
 # Standard library imports
 import multiprocessing as mp
+import re
 from collections.abc import Callable
 from concurrent.futures import ProcessPoolExecutor
 from functools import lru_cache
@@ -521,7 +522,25 @@ def get_single_c2_from_hdf(
     with _connection_pool.get_connection(full_path, "r") as f:
         if c2_prefix not in f:
             return None
-        idxstr = list(f[c2_prefix])[selection]
+        names = list(f[c2_prefix])
+        bins_key = key_map_nexus["c2_processed_bins"]
+        if bins_key in f:
+            # HDF5 iterates names alphabetically, but selection (and the packed
+            # G2 columns) follow processed_bins: match the dataset by its bin ID.
+            bin_id = int(np.ravel(f[bins_key][()])[selection])
+            matches = [
+                n
+                for n in names
+                if (m := re.search(r"(\d+)$", n)) and int(m.group(1)) == bin_id
+            ]
+            if len(matches) != 1:
+                raise ValueError(
+                    f"expected one C2 dataset for processed bin {bin_id} in "
+                    f"{full_path}, found {matches}"
+                )
+            idxstr = matches[0]
+        else:  # legacy files without processed_bins
+            idxstr = names[selection]
 
         # Read C2 data using shared file handle (use 5 args to avoid legacy mode)
         c2_mat, sampling_rate = read_single_c2(

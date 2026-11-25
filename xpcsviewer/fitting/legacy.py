@@ -246,8 +246,9 @@ def fit_with_fixed(
     fit_flag: NDArray[np.bool_],
     fit_x: NDArray[np.floating[Any]],
     p0: NDArray[np.floating[Any]] | None = None,
+    return_status: bool = False,
     **kwargs: Any,
-) -> tuple[NDArray[np.floating[Any]], NDArray[np.floating[Any]]]:
+) -> tuple[NDArray[Any], ...]:
     """Fitting with fixed parameters using nlsq.curve_fit.
 
     Parameters
@@ -271,11 +272,16 @@ def fit_with_fixed(
         parameter with ``fit_flag`` False: such a parameter is held at its
         ``p0`` value. With every parameter free it may be omitted and the
         bounds midpoint is used.
+    return_status : bool, optional
+        If True, also return a per-column boolean array that is False where the
+        solver raised. Such columns hold bounds-midpoint placeholders with zero
+        errors, which are not a fit result.
 
     Returns
     -------
     tuple
-        (fit_line, fit_params)
+        (fit_line, fit_params), or (fit_line, fit_params, success) when
+        ``return_status`` is True.
 
     Raises
     ------
@@ -308,6 +314,7 @@ def fit_with_fixed(
     p0 = full_p0[fit_flag]
 
     fit_val = np.zeros((y.shape[1], 2, num_args))
+    success = np.ones(y.shape[1], dtype=bool)
 
     # Fixed parameter values: use initial guess (semantically correct)
     fixed_values = full_p0.tolist()
@@ -353,6 +360,7 @@ def fit_with_fixed(
 
         except Exception as e:
             logger.warning(f"Fitting failed for column {n}: {e}")
+            success[n] = False
             fit_val[n, 0, :] = np.mean(bounds, axis=0)
             fit_val[n, 0, fix_flag] = full_p0[fix_flag]
             fit_val[n, 1, :] = 0
@@ -362,6 +370,8 @@ def fit_with_fixed(
     for n in range(y.shape[1]):
         fit_line[n] = ensure_numpy(base_func(fit_x, *fit_val[n, 0, :]))
 
+    if return_status:
+        return fit_line, fit_val, success
     return fit_line, fit_val
 
 

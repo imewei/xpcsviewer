@@ -1072,8 +1072,11 @@ class ViewerKernel(FileLocator):
                         f.write("\n")
 
                         # Write fitting parameters
+                        # row i of the fit belongs to the fit's own q_val, which
+                        # is a subset of the exported q_val when the fit was cropped
                         fit_val = xf.fit_summary["fit_val"]
-                        for i, q in enumerate(q_val):
+                        fit_q = np.asarray(xf.fit_summary["q_val"])
+                        for i, q in enumerate(fit_q):
                             if i < fit_val.shape[0]:
                                 f.write(f"{q:.6f}\t")
                                 for j in range(len(param_names)):
@@ -1098,17 +1101,14 @@ class ViewerKernel(FileLocator):
                         fit_line = xf.fit_summary["fit_line"]
 
                         # Create header for fitted curves
+                        # only curves that exist; one column per fitted q
+                        n_curves = min(len(fit_q), fit_line.shape[0])
                         header = "tau(s)"
-                        for i, q in enumerate(q_val):
-                            header += f"\tG2_fit_q{i:03d}(q={q:.6f})"
+                        for i in range(n_curves):
+                            header += f"\tG2_fit_q{i:03d}(q={fit_q[i]:.6f})"
 
-                        # Prepare fitted curve data
                         curve_data = [fit_x]
-                        for i in range(len(q_val)):
-                            if i < fit_line.shape[0]:
-                                curve_data.append(fit_line[i, :])
-                            else:
-                                curve_data.append(np.ones_like(fit_x))
+                        curve_data.extend(fit_line[i, :] for i in range(n_curves))
 
                         curve_matrix = np.column_stack(curve_data)
                         np.savetxt(

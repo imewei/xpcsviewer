@@ -188,6 +188,11 @@ class HDF5ConnectionPool:
         # LRU cache for connections
         self._pool: OrderedDict[str, PooledConnection] = OrderedDict()
         self._pool_lock = threading.RLock()
+        # Active borrows per pooled connection (id -> count) and connections
+        # removed from the pool while borrowed (closed by the last releaser).
+        # Both are guarded by ``_pool_lock``.
+        self._borrowed: dict[int, int] = {}
+        self._retired: dict[int, PooledConnection] = {}
         self._file_locks: dict[str, threading.RLock] = {}
         self._file_locks_lock = threading.RLock()
         # Track last-access time per file lock to prune stale entries (BUG-032)
@@ -315,18 +320,34 @@ class HDF5ConnectionPool:
         except Exception as e:
             logger.warning(f"Failed to adapt pool size to memory pressure: {e}")
 
-    def _evict_lru_connections(self, count: int = 1) -> int:
-        """Evict least recently used connections.
+    def _close_if_idle(self, connection: PooledConnection) -> None:
+        """Close ``connection`` now, or when its last borrower releases it.
 
-        The pool is an OrderedDict with move_to_end() on access,
-        so the front is always the LRU entry — O(1) eviction.
+        Must be called with ``_pool_lock`` held.
+        """
+        if self._borrowed.get(id(connection), 0) > 0:
+            self._retired[id(connection)] = connection
+        else:
+            connection.close()
+
+    def _evict_lru_connections(self, count: int = 1) -> int:
+        """Evict up to ``count`` least recently used *idle* connections.
+
+        The pool is an OrderedDict with move_to_end() on access, so iterating
+        from the front visits LRU entries first. Borrowed connections are
+        skipped, so fewer than ``count`` (possibly zero) may be evicted.
 
         Must be called with ``_pool_lock`` held, or will acquire it.
         """
         evicted = 0
         with self._pool_lock:
-            for _ in range(min(count, len(self._pool))):
-                fname, connection = self._pool.popitem(last=False)
+            for fname in list(self._pool):
+                if evicted >= count:
+                    break
+                connection = self._pool[fname]
+                if self._borrowed.get(id(connection), 0) > 0:
+                    continue
+                del self._pool[fname]
                 connection.close()
                 self.stats.record_connection_evicted()
                 logger.debug(f"Evicted LRU connection: {fname}")
@@ -369,7 +390,7 @@ class HDF5ConnectionPool:
             # Remove unhealthy connections
             for fname in unhealthy_connections:
                 if fname in self._pool:
-                    self._pool[fname].close()
+                    self._close_if_idle(self._pool[fname])
                     del self._pool[fname]
                     logger.info(f"Removed unhealthy connection: {fname}")
 
@@ -377,7 +398,7 @@ class HDF5ConnectionPool:
             for fname in aged_connections:
                 if fname in self._pool:
                     connection_age = current_time - self._pool[fname].created_at
-                    self._pool[fname].close()
+                    self._close_if_idle(self._pool[fname])
                     del self._pool[fname]
                     logger.info(
                         f"Removed aged connection: {fname} (age: {connection_age:.1f}s)"
@@ -462,7 +483,7 @@ class HDF5ConnectionPool:
                         file_handle_to_yield = connection.file_handle
                     else:
                         logger.info(f"Removing unhealthy connection: {fname}")
-                        connection.close()
+                        self._close_if_idle(connection)
                         del self._pool[fname]
                         self._unhealthy_files.add(fname)
                         connection = None
@@ -471,25 +492,34 @@ class HDF5ConnectionPool:
                     # Need a new connection.
                     self.stats.record_cache_miss()
 
-                    if len(self._pool) >= self.max_pool_size:
-                        self._evict_lru_connections(1)
-
                     try:
-                        logger.debug(f"Creating new connection for {fname}")
-                        fh = h5py.File(fname, mode)
-                        connection = PooledConnection(fh, fname)
-                        self._pool[fname] = connection
-                        self.stats.record_connection_created()
-                        file_handle_to_yield = fh
+                        if (
+                            len(self._pool) >= self.max_pool_size
+                            and self._evict_lru_connections(1) == 0
+                        ):
+                            # Every slot is borrowed: serve an uncached handle
+                            # rather than closing one that is in use.
+                            logger.debug(f"Pool busy; direct connection for {fname}")
+                            file_handle_to_yield = h5py.File(fname, mode)
+                            is_direct_connection = True
+                        else:
+                            logger.debug(f"Creating new connection for {fname}")
+                            fh = h5py.File(fname, mode)
+                            connection = PooledConnection(fh, fname)
+                            self._pool[fname] = connection
+                            self.stats.record_connection_created()
+                            file_handle_to_yield = fh
                     except Exception as e:
                         logger.error(f"Failed to open HDF5 file {fname}: {e}")
                         self._unhealthy_files.add(fname)
                         raise
 
-        # --- Phase 3: yield the file handle (no lock held) ---
-        if connection is not None:
-            connection.touch()
+                if connection is not None:
+                    connection.touch()
+                    key = id(connection)
+                    self._borrowed[key] = self._borrowed.get(key, 0) + 1
 
+        # --- Phase 3: yield the file handle (no lock held) ---
         try:
             yield file_handle_to_yield
             # On success, clear the unhealthy flag for direct connections.
@@ -497,16 +527,29 @@ class HDF5ConnectionPool:
                 self._unhealthy_files.discard(fname)
         except Exception:
             # Mark pooled connection as potentially unhealthy on error.
-            if not is_direct_connection:
+            if connection is not None:
                 with self._pool_lock:
-                    if fname in self._pool:
+                    # Retire only the handle this borrower used; a borrower on
+                    # a different/newer handle for the same path is unaffected.
+                    if self._pool.get(fname) is connection:
                         logger.warning(
                             f"Removing connection due to usage error: {fname}"
                         )
-                        self._pool[fname].close()
                         del self._pool[fname]
+                        self._close_if_idle(connection)
             raise
         finally:
+            if connection is not None:
+                with self._pool_lock:
+                    key = id(connection)
+                    remaining = self._borrowed.get(key, 0) - 1
+                    if remaining > 0:
+                        self._borrowed[key] = remaining
+                    else:
+                        self._borrowed.pop(key, None)
+                        retired = self._retired.pop(key, None)
+                        if retired is not None:
+                            retired.close()
             if is_direct_connection and file_handle_to_yield is not None:
                 file_handle_to_yield.close()
 
@@ -527,7 +570,7 @@ class HDF5ConnectionPool:
 
             for fname, connection in self._pool.items():
                 try:
-                    connection.close()
+                    self._close_if_idle(connection)
                 except Exception as e:
                     if not from_destructor:
                         logger.debug(f"Error closing connection {fname}: {e}")

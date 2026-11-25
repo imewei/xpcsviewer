@@ -396,24 +396,22 @@ class QMap:
         shape = (num_samples, len(self.sqlist), len(self.splist))
         compressed_data = compressed_data_raw.reshape(num_samples, -1)
 
-        if shape[2] == 1:
-            labels = [label]
-            avg = compressed_data.reshape(shape[0], -1)
-        else:
-            full_data = np.full((shape[0], shape[1] * shape[2]), fill_value=np.nan)
-            for i in range(num_samples):
-                full_data[i, self.static_index_mapping] = compressed_data[i]
-            full_data = full_data.reshape(shape)
+        # Always expand through static_index_mapping (also for a single azimuth
+        # bin) so empty static bins stay NaN and the result aligns with sqlist.
+        full_data = np.full((shape[0], shape[1] * shape[2]), fill_value=np.nan)
+        for i in range(num_samples):
+            full_data[i, self.static_index_mapping] = compressed_data[i]
+        full_data = full_data.reshape(shape)
 
-            # Handle empty slice warning by avoiding the problematic call when data is all NaN
-            with warnings.catch_warnings():
-                warnings.filterwarnings(
-                    "ignore", category=RuntimeWarning, message=".*Mean of empty slice.*"
-                )
-                warnings.filterwarnings("ignore", message="Mean of empty slice")
-                # Also use numpy error state suppression as backup
-                with np.errstate(all="ignore"):
-                    avg = np.nanmean(full_data, axis=2)
+        # Handle empty slice warning by avoiding the problematic call when data is all NaN
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore", category=RuntimeWarning, message=".*Mean of empty slice.*"
+            )
+            warnings.filterwarnings("ignore", message="Mean of empty slice")
+            # Also use numpy error state suppression as backup
+            with np.errstate(all="ignore"):
+                avg = np.nanmean(full_data, axis=2)
 
         if mode == "saxs_1d":
             if num_samples != 1:
@@ -613,8 +611,9 @@ class QMap:
         valid_mask = qselected_flat[index_nature]
         qbin_valid = index_compressed[valid_mask]
 
-        # Get corresponding q-values efficiently
-        qvalues = qlist.flatten()[qselected_flat]
+        # q-values for exactly the occupied bins in qbin_valid (same mapping and
+        # mask), so qvalues[i] labels curve qbin_valid[i] even for sparse maps.
+        qvalues = qlist.flatten()[index_nature[valid_mask]]
 
         if not zero_based:
             qbin_valid = qbin_valid + 1

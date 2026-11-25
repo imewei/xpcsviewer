@@ -215,8 +215,12 @@ class G2PlotWorker(BaseAsyncWorker):
         self.emit_progress(6, 6, "G2 data preparation complete")
         return plot_data
 
-    def _perform_g2_fitting(self, xf_list, q_range, t_range) -> dict | None:
-        """Perform G2 fitting with progress updates."""
+    def _perform_g2_fitting(self, xf_list, q_range, t_range) -> list | None:
+        """Perform G2 fitting with progress updates.
+
+        Returns a list aligned with ``xf_list`` positions (the renderer indexes
+        by file position); a failed fit is ``None``.
+        """
         bounds = self.plot_kwargs.get("bounds")
         fit_flag = self.plot_kwargs.get("fit_flag")
         fit_func = self.plot_kwargs.get("fit_func", "single")
@@ -224,7 +228,7 @@ class G2PlotWorker(BaseAsyncWorker):
         if not bounds or not fit_flag or not any(fit_flag):
             return None
 
-        fit_results = {}
+        fit_results: list = []
         total_files = len(xf_list)
 
         for i, xf in enumerate(xf_list):
@@ -232,11 +236,12 @@ class G2PlotWorker(BaseAsyncWorker):
             self.emit_status(f"Fitting file {i + 1}/{total_files}: {xf.label}")
 
             try:
-                fit_summary = xf.fit_g2(q_range, t_range, bounds, fit_flag, fit_func)
-                fit_results[xf.label] = fit_summary
+                fit_results.append(
+                    xf.fit_g2(q_range, t_range, bounds, fit_flag, fit_func)
+                )
             except Exception as e:
                 logger.warning(f"G2 fitting failed for {xf.label}: {e}")
-                fit_results[xf.label] = None
+                fit_results.append(None)
 
         return fit_results
 

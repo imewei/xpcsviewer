@@ -54,7 +54,7 @@ from .fileIO.hdf_reader_enhanced import get_enhanced_hdf5_reader
 from .fileIO.qmap_utils import Q_UNIT_DISPLAY, get_qmap
 from .module.twotime_utils import get_c2_stream, get_single_c2_from_hdf
 from .utils.exceptions import XPCSFileError, convert_exception
-from .utils.lazy_loader import LazyHDF5Array, get_lazy_loader, register_lazy_hdf5
+from .utils.lazy_loader import LazyHDF5Array, get_lazy_loader
 from .utils.log_utils import log_timing
 from .utils.logging_config import get_logger
 from .utils.memory_manager import CacheType, MemoryPressure, get_memory_manager
@@ -655,28 +655,9 @@ class XpcsFile:
                 logger.warning("High memory pressure - performing aggressive cleanup")
                 self._memory_manager._aggressive_cleanup()
 
-        # Decide whether to use lazy loading based on dataset size and memory pressure
-        use_lazy_loading = (
-            self._use_lazy_loading
-            and estimated_saxs_size_mb > 200  # Use lazy loading for datasets > 200MB
-            and prediction.pressure_level
-            in [MemoryPressure.MODERATE, MemoryPressure.HIGH, MemoryPressure.CRITICAL]
-        )
-
-        if use_lazy_loading:
-            logger.info(
-                f"Using lazy loading for large SAXS dataset ({estimated_saxs_size_mb:.1f}MB)"
-            )
-            # Register for lazy loading instead of immediate loading
-            lazy_key = f"{self._cache_prefix}_saxs_2d_lazy"
-            self.saxs_2d_data = register_lazy_hdf5(
-                data_key=lazy_key,
-                hdf5_path=self.fname,
-                dataset_path="/xpcs/scattering_2d",
-                estimated_size_mb=estimated_saxs_size_mb,
-            )
-            # Skip the rest of the loading process
-            return
+        # No lazy branch: LazyHDF5Array lacks ndim/size/dtype that callers use, and
+        # the log image needs the full array anyway. Always use the chunked/eager
+        # readers below (they honour use_memory_mapping/chunk_processing).
 
         # Check if we should use unified memory manager cache
         cache_key = f"{self._cache_prefix}_saxs_2d"
@@ -1153,16 +1134,29 @@ class XpcsFile:
             # Use Twotime data as fallback
             logger.info("Using Twotime G2 data for plotting")
 
-            # Validate qindex_selected bounds for twotime data
-            max_q_index_c2 = self.c2_g2.shape[1] - 1
-            valid_qindex = [
-                idx for idx in qindex_selected if 0 <= idx <= max_q_index_c2
-            ]
+            # Packed c2_g2 columns follow c2_processed_bins (1-based detector bin
+            # IDs), not the dynamic Q-bin index, so map index -> column explicitly.
+            n_cols = self.c2_g2.shape[1]
+            processed = getattr(self, "c2_processed_bins", None)
+            if processed is None:  # legacy files: every bin packed in order
+                col_of = {i: i for i in range(n_cols)}
+            else:
+                if np.size(processed) != n_cols:
+                    logger.warning(
+                        f"c2_processed_bins ({np.size(processed)}) and c2_g2 "
+                        f"columns ({n_cols}) differ for {self.label}"
+                    )
+                col_of = {
+                    int(b) - 1: c
+                    for c, b in enumerate(np.ravel(processed))
+                    if c < n_cols
+                }
+            valid_qindex = [idx for idx in qindex_selected if int(idx) in col_of]
             invalid_qindex = [idx for idx in qindex_selected if idx not in valid_qindex]
 
             if invalid_qindex:
                 logger.warning(
-                    f"Filtering out invalid Q indices {invalid_qindex} (max valid: {max_q_index_c2}) for twotime file {self.label}"
+                    f"Filtering out unprocessed Q indices {invalid_qindex} for twotime file {self.label}"
                 )
 
             if not valid_qindex:
@@ -1170,23 +1164,23 @@ class XpcsFile:
                     f"No valid Q indices found in qindex_selected {qindex_selected} for twotime file {self.label}"
                 )
 
-            g2 = self.c2_g2[:, valid_qindex]
+            cols = [col_of[int(idx)] for idx in valid_qindex]
+            g2 = self.c2_g2[:, cols]
 
             # For twotime, we might not have error data - create placeholder
             if hasattr(self, "c2_g2_err"):
                 # Validate error array bounds too
                 max_q_index_err = self.c2_g2_err.shape[1] - 1
-                valid_qindex_err = [
-                    idx for idx in valid_qindex if idx <= max_q_index_err
-                ]
-                if len(valid_qindex_err) != len(valid_qindex):
+                keep = [i for i, c in enumerate(cols) if c <= max_q_index_err]
+                if len(keep) != len(cols):
                     logger.warning(
                         f"Error array has different size, using available indices for {self.label}"
                     )
-                    valid_qindex = valid_qindex_err
-                    g2 = self.c2_g2[:, valid_qindex]
+                    valid_qindex = [valid_qindex[i] for i in keep]
+                    cols = [cols[i] for i in keep]
+                    g2 = self.c2_g2[:, cols]
 
-                g2_err = self.c2_g2_err[:, valid_qindex]
+                g2_err = self.c2_g2_err[:, cols]
             else:
                 logger.warning("No Twotime G2 error data available - using zeros")
                 g2_err = np.zeros_like(g2)
@@ -1451,7 +1445,8 @@ class XpcsFile:
             return dqmap, saxs, None
 
         qindex_max = np.max(dqmap)
-        dqlist = np.unique(dqmap)[1:]
+        dqlist = np.unique(dqmap)
+        dqlist = dqlist[dqlist > 0]
 
         # Validate dqlist is not empty
         if len(dqlist) == 0:
@@ -1473,14 +1468,22 @@ class XpcsFile:
             x, y = highlight_xy
             if x >= 0 and y >= 0 and x < dqmap.shape[1] and y < dqmap.shape[0]:
                 dq_bin = dqmap_disp[y, x]
-        elif selection is not None and selection < len(dqlist):
-            dq_bin = dqlist[selection]
+        # The selection is a position in c2_processed_bins (the C2 dataset order),
+        # so resolve detector bin IDs against it, not against the pixels' IDs.
+        processed = getattr(self, "c2_processed_bins", None)
+        bins = dqlist if processed is None else np.ravel(processed)
+        if highlight_xy is None and selection is not None and selection < len(bins):
+            dq_bin = bins[selection]
 
-        if dq_bin is not None and not np.isnan(dq_bin) and dq_bin > 0:
-            # highlight the selected qbin if it's valid
+        matching_indices = (
+            np.where(bins == dq_bin)[0]
+            if dq_bin is not None and not np.isnan(dq_bin) and dq_bin > 0
+            else []
+        )
+        if len(matching_indices) > 0:
+            # highlight the selected qbin only if it was processed
             dqmap_disp[dqmap_disp == dq_bin] = qindex_max + 1
-            matching_indices = np.where(dqlist == dq_bin)[0]
-            selection = matching_indices[0] if len(matching_indices) > 0 else None
+            selection = matching_indices[0]
         else:
             selection = None
         return dqmap_disp, saxs, selection
@@ -1517,7 +1520,7 @@ class XpcsFile:
             self.fname,
             selection=selection,
             max_size=max_size,
-            t0=self.t0,
+            t0=self.c2_t0,  # effective period: t0 * c2_stride_frame * c2_avg_frame
             correct_diag=correct_diag,
         )
         self.c2_all_data = c2_result
@@ -2407,7 +2410,7 @@ class XpcsFile:
         from xpcsviewer.fitting import fit_with_fixed
         from xpcsviewer.xpcs_file.fitting import power_law
 
-        fit_line, fit_val = fit_with_fixed(
+        fit_line, fit_val, solver_ok = fit_with_fixed(
             power_law,
             x_valid,
             y_reshaped,
@@ -2416,12 +2419,15 @@ class XpcsFile:
             fit_flag,
             fit_x,
             p0=p0,
+            return_status=True,
         )
 
         # Store tauq fitting results
-        # Check if fitting was successful by validating the results
+        # The solver's own status comes first: on failure fit_with_fixed returns
+        # finite bounds-midpoint placeholders that must not be reported as a fit.
         fitting_success = (
-            fit_line is not None
+            bool(np.all(solver_ok))
+            and fit_line is not None
             and fit_val is not None
             and fit_line.shape[0] > 0
             and fit_val.shape[0] > 0
@@ -3086,7 +3092,8 @@ class XpcsFile:
                 key_parts.append("None")
             elif isinstance(arg, (list, tuple)):
                 # Handle lists/tuples by converting to string
-                key_parts.append(str(sorted(arg) if isinstance(arg, list) else arg))
+                # Order matters (e.g. fit_flag [T, F] vs [F, T]); never sort.
+                key_parts.append(str(arg))
             elif isinstance(arg, (dict,)):
                 # Handle dictionaries by sorting keys
                 key_parts.append(str(sorted(arg.items())))

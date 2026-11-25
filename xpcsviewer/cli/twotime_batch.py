@@ -319,22 +319,35 @@ def create_twotime_plot_matplotlib(
 
 
 def generate_output_filename(
-    input_path: str, q_value: float, phi_value: float, output_format: str = "png"
+    input_path: str,
+    q_value: float,
+    phi_value: float,
+    output_format: str = "png",
+    qbin_index: int | None = None,
+    root: str | None = None,
 ) -> str:
     """
     Generate standardized output filename.
+
+    The name is unique per input file (path relative to ``root``, including its
+    extension) and per Q-bin (``qbin_index``), because the rounded q/phi values
+    alone can coincide for different files or bins.
 
     Args:
         input_path: Input HDF file path
         q_value: Q-value
         phi_value: Phi-value
         output_format: Image format
+        qbin_index: Q-bin index within the file; part of the name when given
+        root: Batch root directory; the input path is made relative to it
 
     Returns:
         Generated filename
     """
-    basename = Path(input_path).stem
-    return f"{basename}_q{q_value:.4f}_phi{phi_value:.1f}.{output_format}"
+    rel = os.path.relpath(input_path, root) if root else Path(input_path).name
+    basename = rel.replace(os.sep, "__").replace(".", "_")
+    qbin = f"_bin{qbin_index:04d}" if qbin_index is not None else ""
+    return f"{basename}{qbin}_q{q_value:.4f}_phi{phi_value:.1f}.{output_format}"
 
 
 def process_single_file(file_path: str, args) -> int:
@@ -424,7 +437,12 @@ def process_single_file(file_path: str, args) -> int:
 
                     # Save image
                     output_filename = generate_output_filename(
-                        file_path, q_value, phi_value, args.format
+                        file_path,
+                        q_value,
+                        phi_value,
+                        args.format,
+                        qbin_index=qbin_index,
+                        root=args.input if os.path.isdir(args.input) else None,
                     )
                     output_path = os.path.join(args.output, output_filename)
 
