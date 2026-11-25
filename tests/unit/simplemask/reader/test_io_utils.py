@@ -1,5 +1,7 @@
 """Unit tests for reader/io_utils.py frame-range resolution and averaging."""
 
+import multiprocessing
+
 import h5py
 import numpy as np
 import pytest
@@ -117,3 +119,70 @@ class TestAverageFramesParallel:
             f.create_dataset("/entry/data/data", data=np.zeros((4, 4)))
         with pytest.raises(ValueError):
             average_frames_parallel(fname)
+
+
+needs_fork = pytest.mark.skipif(
+    "fork" not in multiprocessing.get_all_start_methods(),
+    reason="fork start method unavailable",
+)
+
+
+def _write_stack(path, stack):
+    with h5py.File(path, "w") as f:
+        f["/entry/data/data"] = stack
+
+
+class TestAverageFramesPrecision:
+    @needs_fork
+    def test_multiprocess_matches_single_process(self, tmp_path, monkeypatch):
+        from multiprocessing import get_context
+
+        from xpcsviewer.simplemask.reader import io_utils
+
+        # the sandbox forbids the default pool; fork works everywhere we run
+        monkeypatch.setattr(io_utils, "Pool", get_context("fork").Pool)
+        stack = np.full((64, 1, 1), 1_000_000, dtype=np.uint32)
+        stack[31] = 1_000_002
+        stack[63] = 1_000_001
+        path = str(tmp_path / "stack.h5")
+        _write_stack(path, stack)
+
+        one = average_frames_parallel(path, num_frames=64, num_processes=1)
+        two = average_frames_parallel(path, num_frames=64, num_processes=2)
+
+        expected = np.float32(stack.mean(dtype=np.float64))  # 1000000.046875
+        assert one.dtype == two.dtype == np.float32
+        np.testing.assert_array_equal(one, expected)
+        np.testing.assert_array_equal(two, expected)
+
+
+class TestAverageFramesLogsRange:
+    def test_subset_is_logged(self, tmp_path, caplog):
+        path = str(tmp_path / "stack.h5")
+        _write_stack(path, np.ones((6000, 2, 2), dtype=np.uint16))
+        caplog.set_level("INFO", logger="xpcsviewer.simplemask.reader.io_utils")
+        average_frames_parallel(path, num_frames=-1, num_processes=1)
+        assert "Averaging frames [0, 1200) of 6000 (representative subset)" in (
+            caplog.text
+        )
+
+    def test_full_range_is_logged_without_subset_note(self, tmp_path, caplog):
+        path = str(tmp_path / "stack.h5")
+        _write_stack(path, np.ones((40, 2, 2), dtype=np.uint16))
+        caplog.set_level("INFO", logger="xpcsviewer.simplemask.reader.io_utils")
+        average_frames_parallel(path, num_frames=0, num_processes=1)
+        assert "Averaging frames [0, 40) of 40" in caplog.text
+        assert "representative subset" not in caplog.text
+
+    @needs_fork
+    def test_pool_branch_is_logged(self, tmp_path, monkeypatch, caplog):
+        from multiprocessing import get_context
+
+        from xpcsviewer.simplemask.reader import io_utils
+
+        monkeypatch.setattr(io_utils, "Pool", get_context("fork").Pool)
+        path = str(tmp_path / "stack.h5")
+        _write_stack(path, np.ones((64, 2, 2), dtype=np.uint16))
+        caplog.set_level("INFO", logger="xpcsviewer.simplemask.reader.io_utils")
+        average_frames_parallel(path, num_frames=64, num_processes=2)
+        assert "Averaging frames [0, 64) of 64" in caplog.text
