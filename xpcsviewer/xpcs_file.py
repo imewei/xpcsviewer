@@ -2325,6 +2325,19 @@ class XpcsFile:
             self.fit_summary.update(tauq_result)
             return self.fit_summary
 
+        # a*q**b needs two distinct q to separate a from b; one q is rank-deficient.
+        if np.unique(x[valid_idx]).size < 2 and np.all(fit_flag):
+            logger.warning(
+                "fit_tauq: fewer than 2 distinct positive q values; "
+                "cannot fit both parameters"
+            )
+            tauq_result = {"tauq_success": False}
+            self._memory_manager.cache_put(
+                tauq_full_cache_key, tauq_result, CacheType.COMPUTATION
+            )
+            self.fit_summary.update(tauq_result)
+            return self.fit_summary
+
         # Apply filtering efficiently
         x_valid = x[valid_idx]
         y_valid = y[valid_idx]
