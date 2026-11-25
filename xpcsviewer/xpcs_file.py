@@ -65,6 +65,7 @@ from .utils.memory_predictor import (
     predict_operation_memory,
     record_operation_memory,
 )
+from .utils.qmap_notice import PLACEHOLDER_QMAP_WARNING, has_placeholder_qmap
 from .utils.streaming_processor import AdaptiveChunkSizer, process_saxs_log_streaming
 
 logger = get_logger(__name__)
@@ -1464,6 +1465,8 @@ class XpcsFile:
             q, Iq = self.saxs_1d["q"], self.saxs_1d["Iq"]
         else:
             q, Iq = self.saxs_1d["q"], self.Iqp
+        #: why the last call did not subtract its background (None: it did / none)
+        self.background_refusal: str | None = None
         if bkg_xf is not None:
             bkg_q, bkg_iq = bkg_xf.saxs_1d["q"], bkg_xf.saxs_1d["Iq"]
             # Compare shapes before values: allclose raises on different Q counts.
@@ -1484,6 +1487,7 @@ class XpcsFile:
                 Iq = Iq - bkg_weight * bkg_iq
                 Iq[Iq < 0] = np.nan
             else:
+                self.background_refusal = problem
                 logger.warning(
                     "background subtraction is not applied for %s because %s; "
                     "the sample trace is kept",
@@ -2929,6 +2933,7 @@ class XpcsFile:
         if basename is None:
             basename = os.path.splitext(os.path.basename(source))[0]
         q_label = self._q_header_label()
+        warn = f"{PLACEHOLDER_QMAP_WARNING}\n" if has_placeholder_qmap(self) else ""
         # export ROI
         for idx, roi in enumerate(roi_list):
             profile = self.get_roi_data(roi)
@@ -2943,7 +2948,7 @@ class XpcsFile:
             else:
                 header = f"{q_label} Intensity"
             guard.claim(fname, source=source)
-            np.savetxt(fname, np.vstack(profile).T, header=header)
+            np.savetxt(fname, np.vstack(profile).T, header=warn + header)
 
         # export all saxs1d
         fname = os.path.join(folder, basename + "_" + "saxs1d.txt")
@@ -2952,7 +2957,7 @@ class XpcsFile:
         for n in range(Iq.shape[0] - 1):
             header += f" Intensity_phi{n + 1:03d}"
         guard.claim(fname, source=source)
-        np.savetxt(fname, np.vstack([q, Iq]).T, header=header)
+        np.savetxt(fname, np.vstack([q, Iq]).T, header=warn + header)
 
     def get_pg_tree(self):
         data = self.load_data()

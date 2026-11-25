@@ -307,7 +307,9 @@ def main():
     selection_group.add_argument(
         "--q",
         type=float,
-        help="Q-value to process (saves images at all phi angles for this q)",
+        help="Q-value to process (saves images at all phi angles for this q), "
+        "in inverse angstrom unless --q-unit says otherwise; it is converted "
+        "to each file's own Q unit",
     )
     selection_group.add_argument(
         "--phi",
@@ -317,7 +319,16 @@ def main():
     selection_group.add_argument(
         "--q-phi",
         type=str,
-        help="Specific q-phi pair as 'q,phi' (saves single image for this exact combination)",
+        help="Specific q-phi pair as 'q,phi' (saves single image for this exact "
+        "combination); q is in the --q-unit unit (inverse angstrom by default), "
+        "phi in degrees",
+    )
+    twotime_parser.add_argument(
+        "--q-unit",
+        type=str,
+        default=None,
+        help="Unit of the --q / --q-phi value, e.g. 'A^-1' or 'nm^-1' "
+        "(default: inverse angstrom); use 'px' for a Cartesian map in pixels",
     )
 
     twotime_parser.add_argument(

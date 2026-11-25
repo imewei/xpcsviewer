@@ -18,7 +18,12 @@ import pyqtgraph as pg
 from numpy.typing import ArrayLike
 
 from xpcsviewer.backends._conversions import ensure_numpy
-from xpcsviewer.fileIO.qmap_utils import convert_q, map_axis
+from xpcsviewer.fileIO.qmap_utils import (
+    axis_mismatch,
+    convert_q,
+    convert_q_range,
+    map_axis,
+)
 from xpcsviewer.plothandler.plot_constants import MATPLOTLIB_COLORS_RGB as colors
 
 # Local imports
@@ -70,14 +75,65 @@ def q_range_in_file_unit(xf, q_range, shared):
     same range back. Raises ``ValueError`` for a file whose dynamic axis has
     another name or is not a reciprocal length convertible to ``shared``.
     """
-    name, unit = map_axis(getattr(xf, "qmap", None), 0)
-    if name != shared[0]:
-        raise ValueError(f"its dynamic axis is {name!r}, not {shared[0]!r}")
-    convert_q(1.0, shared[1], unit)  # ValueError when the units are not compatible
-    if q_range is None or unit == shared[1]:
-        return q_range
-    lo, hi = convert_q(q_range, shared[1], unit)
-    return (float(lo), float(hi))
+    axis = map_axis(getattr(xf, "qmap", None), 0)
+    why = axis_mismatch(axis, shared)
+    if why is not None:
+        raise ValueError(f"its dynamic axis: {why}")
+    return convert_q_range(q_range, shared[1], axis[1])
+
+
+def left_out_files(xf_list) -> dict[str, str]:
+    """``{label: reason}`` of the files ``get_data`` leaves out of the shared axis.
+
+    The same predicate as ``q_range_in_file_unit``; GUI-free, so the GUI
+    boundary (kernel / viewer) can tell the user which files are missing.
+    """
+    if not xf_list:
+        return {}
+    shared = _shared_q_axis(xf_list)
+    out = {}
+    for xf in xf_list:
+        why = axis_mismatch(map_axis(getattr(xf, "qmap", None), 0), shared)
+        if why is not None:
+            out[str(getattr(xf, "label", xf))] = why
+    return out
+
+
+class _BinLabels(list):
+    """Display labels of one file's G2 bins plus the numeric key of each bin.
+
+    ``second`` / ``second_axis``: the value of each bin on the map's second axis
+    and that axis' ``(name, unit)``, both ``None`` for a one-axis map. Panels are
+    matched on these numbers (and the Q array), never on the label text, which
+    holds the file's own formatted values and unit.
+    """
+
+    second = None
+    second_axis = None
+
+
+def _labelled(labels, fc, own_q_range, shared2, n_cols):
+    """``labels`` as ``_BinLabels`` keyed by the bins' second-axis coordinate."""
+    try:
+        qmap = fc.qmap
+        axis = map_axis(qmap, 1)
+        out = _BinLabels(labels)
+        if int(qmap.dynamic_num_pts[1]) == 1:
+            return out
+        sel, _ = qmap.get_qbin_in_qrange(own_q_range, zero_based=True)
+        dplist = np.asarray(qmap.dplist, dtype=float)
+        values = dplist[np.asarray(qmap.dynamic_index_mapping)[sel] % len(dplist)]
+        if len(values) != n_cols:
+            return labels
+        if shared2 is not None and axis[1] != shared2[1] and axis[0] == shared2[0]:
+            try:  # e.g. a Cartesian pair in inverse nm next to one in inverse A
+                values, axis = convert_q(values, axis[1], shared2[1]), shared2
+            except ValueError:
+                pass
+        out.second, out.second_axis = values, axis
+        return out
+    except (AttributeError, IndexError, TypeError, ValueError):
+        return labels  # not a loaded file: the label text is all there is
 
 
 def get_data(xf_list, q_range=None, t_range=None):
@@ -165,7 +221,13 @@ def get_data(xf_list, q_range=None, t_range=None):
         tel[i] = _tel
         g2[i] = _g2
         g2_err[i] = _g2_err
-        labels[i] = _labels
+        labels[i] = _labelled(
+            _labels,
+            fc,
+            file_q_range,
+            map_axis(getattr(xf_list[0], "qmap", None), 1),
+            _n_q(_g2),
+        )
 
     _log_array_dims("get_data g2", g2[0] if g2 else None)
     logger.debug(f"get_data: exit with {num_files} datasets")
@@ -414,13 +476,16 @@ def _q_panel_indices(q, m, n_curves, labels=None, ref=0):
     """Map each curve of file ``m`` to the Q-bin panel defined by file ``ref``.
 
     A curve belongs to a panel only if it is the same physical bin: its numeric
-    Q equals the panel's within ``_Q_RTOL`` (relative) AND, when both files
-    carry bin labels, the full labels are equal (the label also holds the
-    azimuth, which the renderers are not given numerically).  Neither the
-    rounded label nor Q alone can alias two bins.  Identical ordered grids map
-    positionally; otherwise curves are matched one-to-one in order.  Returns
-    one panel index per curve, or ``None`` (after logging a warning) where no
-    free panel matches, so a curve is never drawn under another bin.
+    Q (in the shared unit; ``get_data`` converts) equals the panel's within
+    ``_Q_RTOL`` (relative) AND its value on the map's second axis equals the
+    panel's (``_BinLabels.second``, same axis name and unit, relative
+    ``_Q_RTOL`` / absolute 1e-9).  Labels are display text in each file's own
+    unit and never decide a match, except for plain label lists that carry no
+    numeric key (compared for equality as before).  Neither the rounded label
+    nor Q alone can alias two bins.  Identical ordered grids map positionally;
+    otherwise curves are matched one-to-one in order.  Returns one panel index
+    per curve, or ``None`` (after logging a warning) where no free panel
+    matches, so a curve is never drawn under another bin.
     """
     if m == ref:
         return list(range(n_curves))
@@ -434,10 +499,27 @@ def _q_panel_indices(q, m, n_curves, labels=None, ref=0):
         and len(ref_lab) == ref_q.size
         and len(own_lab) == own.size
     )
+    numeric = (
+        use_labels
+        and isinstance(ref_lab, _BinLabels)
+        and isinstance(own_lab, _BinLabels)
+    )
+
+    def same_second(i, j):
+        if not numeric:
+            return not use_labels or ref_lab[i] == own_lab[j]
+        if ref_lab.second_axis != own_lab.second_axis:
+            return False
+        if ref_lab.second is None:  # both maps have one axis
+            return True
+        return bool(
+            np.isclose(ref_lab.second[i], own_lab.second[j], rtol=_Q_RTOL, atol=1e-9)
+        )
+
     if (
         own.size == ref_q.size == n_curves
         and np.allclose(ref_q, own, rtol=_Q_RTOL, atol=1e-12)
-        and (not use_labels or list(ref_lab) == list(own_lab))
+        and all(same_second(k, k) for k in range(n_curves))
     ):
         return list(range(n_curves))
     taken: set[int] = set()
@@ -448,8 +530,7 @@ def _q_panel_indices(q, m, n_curves, labels=None, ref=0):
             if j < own.size
             else []
         )
-        if use_labels:
-            free = [i for i in free if ref_lab[i] == own_lab[j]]
+        free = [i for i in free if same_second(int(i), j)]
         free = [int(i) for i in free if i not in taken]
         if not free:
             logger.warning(
@@ -565,6 +646,8 @@ def pg_plot(
                 t_range_positive > 0, t_range_positive, np.finfo(float).eps
             )
             t0_range = np.log10(t_range_positive)
+    else:
+        t_auto = True  # no range to apply
     axes = []
     for n in range(num_figs):
         i_col = n % col

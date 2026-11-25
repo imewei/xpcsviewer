@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
+from xpcsviewer.fileIO.qmap_utils import Q_UNIT_DISPLAY, q_axis_label
 from xpcsviewer.utils.export_guard import ExportGuard
 
 if TYPE_CHECKING:
@@ -147,7 +148,14 @@ def plot_bayesian_all_q(
 
     sm = ScalarMappable(cmap=cmap, norm=norm)
     sm.set_array([])
-    fig.colorbar(sm, ax=ax, pad=0.02).set_label(r"Q ($\AA^{-1}$)")
+    # the plotted values are the file's own: name its axis and unit, never assume
+    bin_axes = bayesian_summary.get("bin_axes")
+    name, unit = (
+        (bin_axes["names"][0], bin_axes["units"][0])
+        if bin_axes is not None
+        else ("Q", Q_UNIT_DISPLAY)
+    )
+    fig.colorbar(sm, ax=ax, pad=0.02).set_label(q_axis_label(name, unit, mathtext=True))
 
     fig.tight_layout()
     return fig
@@ -167,6 +175,7 @@ def export_bayesian_csv(
     bin_ids: Any = None,
     bin_phi: Any = None,
     bin_axes: dict[str, Any] | None = None,
+    placeholder_q: bool = False,
     guard: ExportGuard | None = None,
 ) -> None:
     """Export Bayesian fit parameters to CSV.
@@ -221,6 +230,8 @@ def export_bayesian_csv(
             header.append("phi")
         if bin_axes is not None:
             header.extend(_AXIS_COLUMNS)
+        if placeholder_q:  # Q values come from the substituted default Q map
+            header.append("q_map_placeholder")
         writer.writerow(header)
 
         for qi in range(len(q_val)):
@@ -253,6 +264,8 @@ def export_bayesian_csv(
                         units[1] if two else "",
                     ]
                 )
+            if placeholder_q:
+                row.append("1")
             writer.writerow(row)
 
     logger.info("Exported Bayesian parameters to %s", path)
@@ -293,6 +306,7 @@ def export_bayesian_diagnostics(
     bin_phi: Any = None,
     bin_axes: dict[str, Any] | None = None,
     source: str | None = None,
+    placeholder_q: bool = False,
     guard: ExportGuard | None = None,
 ) -> list[Path]:
     """Export ArviZ DataTree to netCDF for the measured Q-bins.
@@ -382,6 +396,8 @@ def export_bayesian_diagnostics(
             attrs["q_value"] = float(q_val[q_idx])
         if bin_phi is not None and q_idx < len(bin_phi) and np.isfinite(bin_phi[q_idx]):
             attrs["phi"] = float(bin_phi[q_idx])
+        if placeholder_q:
+            attrs["q_map_is_placeholder"] = 1
         if bin_axes is not None and q_idx < len(bin_axes["axis1"]):
             names, units = bin_axes["names"], bin_axes["units"]
             attrs["axis0_name"], attrs["axis0_unit"] = names[0], units[0]

@@ -24,6 +24,13 @@ from xpcsviewer.xpcs_viewer import XpcsViewer
 class StubKernel(file_locator.FileLocator):
     reset_kernel = file_locator.FileLocator.clear_target
     submit_job = ViewerKernel.submit_job
+    remove_job = ViewerKernel.remove_job  # submit_job retires a replaced job
+
+    def __init__(self, path):
+        super().__init__(path)
+        self.avg_worker = None
+        self.avg_worker_active = {}
+        self._retired_avg_jobs = set()
 
     def plot_g2(self, **kwargs):
         return [[0.01]], self.delays

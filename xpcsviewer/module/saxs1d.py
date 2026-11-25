@@ -16,7 +16,7 @@ import numpy as np
 import pyqtgraph as pg
 
 from xpcsviewer.backends._conversions import ensure_numpy
-from xpcsviewer.fileIO.qmap_utils import convert_q
+from xpcsviewer.fileIO.qmap_utils import axis_mismatch, convert_q, convert_q_range
 from xpcsviewer.utils.logging_config import get_logger
 
 from ..plothandler.plot_constants import get_color_marker
@@ -365,6 +365,7 @@ def pg_plot(
     # One axis for every curve: the (name, unit) of the first plotted file. The
     # q range, the plotted q and the q^2 / q^4 weighting are all in that unit.
     display = None
+    left_out: dict[str, str] = {}  # label -> why, returned for the GUI to report
 
     # Batch data extraction for parallel processing potential
     plot_data = []
@@ -372,17 +373,19 @@ def pg_plot(
         try:
             axis = fi._static_axis() if hasattr(fi, "_static_axis") else None
             scale, q_range = 1.0, (qmin, qmax)
-            if display is not None and axis is not None and axis[1] != display[1]:
-                try:
-                    scale = float(convert_q(1.0, axis[1], display[1]))
-                    q_range = tuple(convert_q(q_range, display[1], axis[1]))
-                except ValueError:
+            if display is not None and axis is not None:
+                # the one axis rule: same NAME and a convertible unit
+                why = axis_mismatch(axis, display)
+                if why is not None:
                     logger.warning(
-                        f"SAXS 1D: skipping {fi.label}: its q axis is {axis[0]} in "
-                        f"{axis[1]}, which cannot be shown on the {display[0]} in "
-                        f"{display[1]} axis of the first plotted file"
+                        f"SAXS 1D: skipping {fi.label}: {why}; the plot is on "
+                        f"{display[0]} in {display[1]} (the first plotted file)"
                     )
+                    left_out[fi.label] = why
                     continue
+                if axis[1] != display[1]:
+                    scale = float(convert_q(1.0, axis[1], display[1]))
+                    q_range = convert_q_range(q_range, display[1], axis[1])
             q, Iq, xlabel, ylabel = fi.get_saxs1d_data(
                 bkg_xf=bkg_file,
                 bkg_weight=weight,
@@ -453,6 +456,7 @@ def pg_plot(
         plot_item.setLabel("left", ylabel)
 
     plot_item.showGrid(x=True, y=True, alpha=0.3)
+    return left_out
 
 
 def vectorized_q_binning(q_values, intensities, q_min, q_max, num_bins):

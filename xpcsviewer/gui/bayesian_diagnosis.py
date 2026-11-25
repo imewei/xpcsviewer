@@ -262,6 +262,7 @@ class BayesianDiagnosisWindow(QMainWindow):
         self._y_data: np.ndarray | None = None
         self._yerr: np.ndarray | None = None
         self._q_value: float | None = None
+        self._q_axis: tuple[str, str] | None = None  # (name, unit) of _q_value
         self._identity: DiagnosisIdentity | None = None
         self._set_exports_enabled(False)
 
@@ -307,6 +308,7 @@ class BayesianDiagnosisWindow(QMainWindow):
         self._model_func = None
         self._x_data = self._y_data = self._yerr = None
         self._q_value = None
+        self._q_axis = None
         self._pp_canvas.figure.clear()
         self._pp_canvas.draw()
         for canvas in self._arviz_canvases.values():
@@ -315,6 +317,14 @@ class BayesianDiagnosisWindow(QMainWindow):
         self._summary.clear()
         self._set_exports_enabled(False)
         self.setWindowTitle(title)
+
+    def _q_text(self, q_value: float | None) -> str:
+        """``q_value`` with the axis name and unit it is on (``Q = v`` if unknown)."""
+        if q_value is None:
+            return ""
+        if self._q_axis is None:
+            return f"Q = {q_value:.4g}"
+        return f"{self._q_axis[0]} = {q_value:.4g} {self._q_axis[1]}"
 
     def _set_exports_enabled(self, enabled: bool) -> None:
         for button in (
@@ -341,6 +351,7 @@ class BayesianDiagnosisWindow(QMainWindow):
         title: str | None = None,
         *,
         identity: DiagnosisIdentity,
+        q_axis: tuple[str, str] | None = None,
     ) -> None:
         """Refresh all panels with new fit results.
 
@@ -361,6 +372,9 @@ class BayesianDiagnosisWindow(QMainWindow):
         identity : DiagnosisIdentity
             What the result belongs to (file, revision, bin, bundle); the
             window answers :meth:`shows` / :meth:`matches` from it.
+        q_axis : (name, unit), optional
+            The file axis ``q_value`` is on; it is named wherever the value is
+            shown or exported.
         """
         if title is not None:
             self.setWindowTitle(title)
@@ -373,6 +387,7 @@ class BayesianDiagnosisWindow(QMainWindow):
         self._y_data = np.asarray(y_data)
         self._yerr = np.asarray(yerr) if yerr is not None else None
         self._q_value = q_value
+        self._q_axis = q_axis
         self._update_posterior_predictive(
             result, model_func, x_data, y_data, yerr, q_value
         )
@@ -447,7 +462,7 @@ class BayesianDiagnosisWindow(QMainWindow):
         ax.set_xscale("log")
         ax.set_xlabel(self._xlabel)
         ax.set_ylabel(self._ylabel)
-        subtitle = f"Q = {q_value:.4g}" if q_value is not None else ""
+        subtitle = self._q_text(q_value)
         ax.set_title(f"Posterior Predictive {subtitle}".strip())
 
         fig.tight_layout()
@@ -593,7 +608,10 @@ class BayesianDiagnosisWindow(QMainWindow):
         with Path(path).open("w", newline="") as f:
             writer = csv.writer(f)
             # Header with metadata comment
-            f.write(f"# Q = {self._q_value}\n" if self._q_value is not None else "")
+            if self._q_value is not None:
+                unit = f" {self._q_axis[1]}" if self._q_axis else ""
+                name = self._q_axis[0] if self._q_axis else "Q"
+                f.write(f"# {name} = {self._q_value}{unit}\n")
             if not result.diagnostics.converged:
                 f.write("# NOT CONVERGED: not a measurement (diagnosis only)\n")
             header = [
@@ -671,6 +689,8 @@ class BayesianDiagnosisWindow(QMainWindow):
                 pass
         if self._q_value is not None:
             attrs["q_value"] = float(self._q_value)
+            if self._q_axis is not None:  # the value is meaningless without these
+                attrs["axis0_name"], attrs["axis0_unit"] = self._q_axis
         data = _tagged(self._result.arviz_data, attrs)
         if getattr(data, "attrs", {}).get("bin_status") != attrs["bin_status"]:
             # the posterior could not be tagged: never write an unmarked file

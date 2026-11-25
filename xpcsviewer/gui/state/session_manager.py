@@ -66,7 +66,11 @@ class AnalysisParameters:
     diffusion_model: str = "free"
 
     # Tab 6: Two-time
-    twotime_selected_q: int = 0
+    twotime_selected_q: int = 0  # POSITION in the combo; legacy fallback only
+    # Identity of the selected bin: the file it belongs to (absolute path) and its
+    # absolute processed-bin ID. Absent in older session files (-1 / empty).
+    twotime_source_file: str = ""
+    twotime_selected_bin: int = -1
     twotime_colormap: str = "viridis"
     twotime_symmetric: bool = True
 
@@ -235,6 +239,19 @@ class SessionManager:
                 g2_show_fit=params_data.get("g2_show_fit", True),
                 diffusion_model=params_data.get("diffusion_model", "free"),
                 twotime_selected_q=params_data.get("twotime_selected_q", 0),
+                twotime_source_file=(
+                    source
+                    if isinstance(source := params_data.get("twotime_source_file"), str)
+                    else ""
+                ),
+                twotime_selected_bin=(
+                    bin_id
+                    if isinstance(
+                        bin_id := params_data.get("twotime_selected_bin"), int
+                    )
+                    and not isinstance(bin_id, bool)
+                    else -1
+                ),
                 twotime_colormap=params_data.get("twotime_colormap", "viridis"),
                 twotime_symmetric=params_data.get("twotime_symmetric", True),
                 qmap_colormap=params_data.get("qmap_colormap", "viridis"),

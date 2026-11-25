@@ -124,6 +124,63 @@ def map_axis(qmap, index: int = 0) -> tuple[str, str]:
     return name, unit
 
 
+def normalize_unit(unit) -> str:
+    """Canonical spelling of a unit string (``1/A`` -> ``Å⁻¹``, ``1/nm`` -> ``nm⁻¹``)."""
+    return _normalize_unit(str(unit))
+
+
+def axis_mismatch(axis, shared) -> str | None:
+    """Why a file on ``axis`` cannot share the plot axis ``shared``; None if it can.
+
+    Both are ``(name, unit)``. THE one compatibility rule of every shared-axis
+    consumer (G2 panels, SAXS-1D overlays, the G2 fit ranges): the axis NAME
+    must be equal (``x`` and ``y`` in the same unit are different coordinates)
+    and the units must be equal or both reciprocal lengths (``convert_q``).
+    """
+    if axis[0] != shared[0]:
+        return f"its axis is {axis[0]!r}, not {shared[0]!r}"
+    try:
+        convert_q(1.0, axis[1], shared[1])
+    except ValueError:
+        return f"its unit {axis[1]!r} cannot be converted to {shared[1]!r}"
+    return None
+
+
+# Converting an inclusive bound between units leaves float64 roundoff (0.28 * 10
+# is 2.8000000000000003), which would drop a bin stored exactly at the bound.
+_Q_RANGE_RTOL = 1e-12
+
+
+def convert_q_range(q_range, from_unit: str, to_unit: str):
+    """``(lo, hi)`` of an INCLUSIVE Q range in ``to_unit``; ``None`` stays ``None``.
+
+    The ONE range conversion. A range already in ``to_unit`` is returned as given;
+    a converted one is widened by ``_Q_RANGE_RTOL`` (relative) per side so a bin
+    stored at the bound in the other unit is still inside. Raises ``ValueError``
+    when the units are not both reciprocal lengths.
+    """
+    if q_range is None or _normalize_unit(str(from_unit)) == _normalize_unit(
+        str(to_unit)
+    ):
+        return q_range
+    lo, hi = (float(v) for v in convert_q(q_range, from_unit, to_unit))
+    return (lo - abs(lo) * _Q_RANGE_RTOL, hi + abs(hi) * _Q_RANGE_RTOL)
+
+
+def q_axis_label(name: str, unit: str, *, mathtext: bool = False) -> str:
+    """Axis / colour-bar label ``name (unit)`` of a Q-like coordinate.
+
+    The one display helper for a file's coordinate: it states the file's OWN
+    axis name and unit. ``mathtext`` renders the inverse units for matplotlib.
+    """
+    unit = _normalize_unit(str(unit))
+    if mathtext:
+        unit = {Q_UNIT_DISPLAY: r"$\AA^{-1}$", "nm⁻¹": r"$\mathrm{nm}^{-1}$"}.get(
+            unit, unit
+        )
+    return f"{name} ({unit})"
+
+
 # Detector and beam constants
 DEFAULT_DETECTOR_SIZE = 1024
 DEFAULT_BEAM_CENTER = DEFAULT_DETECTOR_SIZE // 2  # 512

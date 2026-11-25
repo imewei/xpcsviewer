@@ -13,9 +13,15 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from xpcsviewer.fileIO.hdf_reader import clear_connection_pool
-from xpcsviewer.fileIO.qmap_utils import map_axis
+from xpcsviewer.fileIO.qmap_utils import (
+    Q_UNIT_DISPLAY,
+    convert_q,
+    map_axis,
+    normalize_unit,
+)
 from xpcsviewer.utils.export_guard import ExportCollisionError, ExportGuard
 from xpcsviewer.utils.logging_config import get_logger
+from xpcsviewer.utils.qmap_notice import PLACEHOLDER_QMAP_WARNING, has_placeholder_qmap
 from xpcsviewer.xpcs_file import XpcsFile
 
 # Use non-interactive backend for batch processing
@@ -91,15 +97,46 @@ def _plain_axes(qmap) -> bool:
     return bool({"q", "phi"} & names)
 
 
-def _axis_names(qmap) -> tuple[str, str | None] | None:
-    """File-name words of a map that is not (q, phi): its two axis names.
+def _axis_names(qmap) -> tuple[tuple[str, str], tuple[str, str] | None] | None:
+    """File-name words of a map that is not (q, phi): its two ``(name, unit)`` axes.
 
-    ``None`` for a plain map; the second name is ``None`` for a one-axis map.
+    ``None`` for a plain map; the second axis is ``None`` for a one-axis map.
     """
     if _plain_axes(qmap):
         return None
     second = int(qmap.dynamic_num_pts[1]) != 1
-    return map_axis(qmap, 0)[0], map_axis(qmap, 1)[0] if second else None
+    return map_axis(qmap, 0), map_axis(qmap, 1) if second else None
+
+
+def _unit_word(unit: str) -> str:
+    """ASCII file-name token of a unit (``Å⁻¹`` -> ``invA``, ``px`` -> ``px``)."""
+    unit = normalize_unit(unit)
+    return {Q_UNIT_DISPLAY: "invA", "nm⁻¹": "invnm"}.get(unit) or re.sub(
+        r"[^0-9A-Za-z]", "", unit
+    )
+
+
+def target_q_in_file_unit(xfile: XpcsFile, value: float, q_unit: str) -> float:
+    """``--q`` / ``--q-phi`` value ``value``, typed in ``q_unit``, in this file's unit.
+
+    The one conversion of a CLI Q selector: the selector is a physical value in
+    the unit the user declared (``--q-unit``, inverse angstrom by default); each
+    file is queried in ITS OWN axis unit. Raises ``ValueError`` for a file whose
+    first axis cannot hold that value: not a reciprocal length (e.g. pixels, for
+    which the user must declare ``--q-unit px``) or a radial ``q`` that is not
+    positive. A signed value is valid on a signed axis (``qx``, ``qy``).
+    """
+    name, unit = map_axis(getattr(xfile, "qmap", None), 0)
+    try:
+        own = float(convert_q(value, q_unit, unit))
+    except ValueError as exc:
+        raise ValueError(
+            f"its first axis is {name} in {unit}; the selector is in {q_unit} "
+            f"(set --q-unit): {exc}"
+        ) from exc
+    if name == "q" and own <= 0:
+        raise ValueError(f"the radial q must be positive, got {value} {q_unit}")
+    return own
 
 
 def _collect_valid_qbins(
@@ -382,7 +419,7 @@ def generate_output_filename(
     output_format: str = "png",
     qbin_index: int | None = None,
     root: str | None = None,
-    axes: tuple[str, str | None] | None = None,
+    axes: tuple[tuple[str, str], tuple[str, str] | None] | None = None,
 ) -> str:
     """
     Generate the output path of one image, relative to the output directory.
@@ -400,10 +437,11 @@ def generate_output_filename(
         output_format: Image format
         qbin_index: Q-bin index within the file; part of the name when given
         root: Batch root directory; the input path is made relative to it
-        axes: Names of the two axes of a map that is not (q, phi) (``_axis_names``);
-            the bin is then named by BOTH coordinates, ``_x40.0000_y120.0000``,
-            instead of ``_q..._phi...`` (``q_value`` / ``phi_value`` are then the
-            first- and second-axis values)
+        axes: ``(name, unit)`` of the two axes of a map that is not (q, phi)
+            (``_axis_names``); the bin is then named by BOTH coordinates and
+            their units, ``_x40.0000px_y120.0000px``, instead of ``_q..._phi...``
+            (``q_value`` / ``phi_value`` are then the first- and second-axis
+            values)
 
     Returns:
         Output path relative to the output directory
@@ -411,10 +449,14 @@ def generate_output_filename(
     rel = os.path.relpath(input_path, root) if root else Path(input_path).name
     qbin = f"_bin{qbin_index:04d}" if qbin_index is not None else ""
     if axes is not None:
-        words = [re.sub(r"\W", "", str(n)) or "axis" for n in axes if n is not None]
+        words = [
+            (re.sub(r"\W", "", str(a[0])) or "axis", _unit_word(a[1]))
+            for a in axes
+            if a is not None
+        ]
         coords = "".join(
-            f"_{w}{v:.4f}"
-            for w, v in zip(words, (q_value, phi_value), strict=False)
+            f"_{w}{v:.4f}{u}"
+            for (w, u), v in zip(words, (q_value, phi_value), strict=False)
             if v is not None
         )
         return f"{rel}{qbin}{coords}.{output_format}"
@@ -459,6 +501,8 @@ def process_single_file(
     try:
         # Load XpcsFile
         xfile = XpcsFile(file_path)
+        if has_placeholder_qmap(xfile):
+            logger.warning(f"{file_path}: {PLACEHOLDER_QMAP_WARNING}")
 
         # Verify this is a twotime file
         if "Twotime" not in xfile.atype:
@@ -480,18 +524,29 @@ def process_single_file(
         # Determine qbins to process based on selection mode
         qbins_to_process: Sequence[tuple[int, str, float, float | None]] = []
 
-        if args.q is not None:
-            # Mode 1: All phi angles at specific q
-            qbins_to_process = find_qbins_for_q(xfile, args.q)
-        elif args.phi is not None:
-            # Mode 2: All q values at specific phi
-            qbins_to_process = find_qbins_for_phi(xfile, args.phi)
-        elif args.q_phi is not None:
-            # Mode 3: Specific q-phi pair
-            target_q, target_phi = parse_q_phi_pair(args.q_phi)
-            qbin_match = find_qbin_for_qphi(xfile, target_q, target_phi)
-            if qbin_match:
-                qbins_to_process = [qbin_match]
+        # The selector is a physical Q in the unit the user declared; every file
+        # is queried in its own unit (``target_q_in_file_unit``).
+        q_unit = getattr(args, "q_unit", None) or Q_UNIT_DISPLAY
+        try:
+            if args.q is not None:
+                # Mode 1: All phi angles at specific q
+                qbins_to_process = find_qbins_for_q(
+                    xfile, target_q_in_file_unit(xfile, args.q, q_unit)
+                )
+            elif args.phi is not None:
+                # Mode 2: All q values at specific phi
+                qbins_to_process = find_qbins_for_phi(xfile, args.phi)
+            elif args.q_phi is not None:
+                # Mode 3: Specific q-phi pair
+                target_q, target_phi = parse_q_phi_pair(args.q_phi)
+                qbin_match = find_qbin_for_qphi(
+                    xfile, target_q_in_file_unit(xfile, target_q, q_unit), target_phi
+                )
+                if qbin_match:
+                    qbins_to_process = [qbin_match]
+        except ValueError as exc:
+            logger.error(f"{file_path}: the Q selection cannot be applied: {exc}")
+            return 0
 
         if not qbins_to_process:
             logger.warning(f"No matching qbins found for file {file_path}")
@@ -683,10 +738,10 @@ def run_twotime_batch(args) -> int:
             logger.error(f"{name}-value must be finite, got: {value}")
             return 1
 
-    if args.q is not None and args.q <= 0:
-        logger.error(f"Q-value must be positive, got: {args.q}")
-        return 1
-
+    # The sign of a Q is not judged here: a radial ``q`` must be positive, but
+    # ``qx`` / ``qy`` of a Cartesian map are signed. Each file checks its own axis
+    # (``target_q_in_file_unit``); a batch where no file accepts it generates
+    # no image and fails.
     max_phi = 360
     if args.phi is not None and not (0 <= args.phi <= max_phi):
         logger.warning(f"Phi-value {args.phi}° is outside typical range [0, 360]°")
@@ -694,9 +749,6 @@ def run_twotime_batch(args) -> int:
     if args.q_phi is not None:
         try:
             q_val, phi_val = parse_q_phi_pair(args.q_phi)
-            if q_val <= 0:
-                logger.error(f"Q-value in q-phi pair must be positive, got: {q_val}")
-                return 1
             logger.info(f"Validated q-phi pair: q={q_val}, phi={phi_val}")
         except ValueError as e:
             logger.error(f"Invalid q-phi pair format: {e}")

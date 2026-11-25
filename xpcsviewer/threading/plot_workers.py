@@ -201,6 +201,8 @@ class G2PlotWorker(BaseAsyncWorker):
             "num_lines": num_lines,
             "fit_results": fit_results,
             "plot_params": self.plot_kwargs,
+            # files on another Q axis, for the GUI boundary to report
+            "left_out": g2mod.left_out_files(xf_list),
         }
 
         self.emit_progress(6, 6, "G2 data preparation complete")

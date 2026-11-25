@@ -51,6 +51,15 @@ class BayesianBundle:
     result: Any = None
     # Q range the observations were selected with (diffusion fits); None for G2.
     q_range: tuple[float, float] | None = None
+    # (name, unit) of the file axis ``q_value`` is on (``map_axis``); None: unknown
+    q_axis: tuple[str, str] | None = None
+
+    @property
+    def q_text(self) -> str:
+        """``q_value`` with the file's own axis name and unit, for messages and titles."""
+        if self.q_axis is None:
+            return f"Q={self.q_value:.4g}"
+        return f"{self.q_axis[0]}={self.q_value:.4g} {self.q_axis[1]}"
 
     @classmethod
     def create(
@@ -64,6 +73,7 @@ class BayesianBundle:
         y: Any,
         yerr: Any = None,
         q_range: tuple[float, float] | None = None,
+        q_axis: tuple[str, str] | None = None,
     ) -> BayesianBundle:
         return cls(
             fname,
@@ -75,6 +85,7 @@ class BayesianBundle:
             _frozen(y),
             None if yerr is None else _frozen(yerr),
             q_range=None if q_range is None else (float(q_range[0]), float(q_range[1])),
+            q_axis=None if q_axis is None else (str(q_axis[0]), str(q_axis[1])),
         )
 
     @property

@@ -22,6 +22,7 @@ from .fileIO.qmap_utils import Q_UNIT_DISPLAY, convert_q, map_axis
 from .utils.export_guard import ExportCollisionError, ExportGuard
 from .utils.log_utils import log_timing
 from .utils.logging_config import get_logger
+from .utils.qmap_notice import PLACEHOLDER_QMAP_WARNING, has_placeholder_qmap
 from .xpcs_file import MemoryMonitor, XpcsFile
 
 # Lazy-loaded modules cache
@@ -369,6 +370,9 @@ class ViewerKernel(FileLocator):
         # Plotting and analysis state
         self.avg_worker: AverageToolbox | None = None
         self.avg_worker_active: dict[int, Any] = {}
+        # Jobs taken out of the list: queued worker messages that still arrive for
+        # them are dropped instead of recreating their progress record.
+        self._retired_avg_jobs: set[Any] = set()
 
         # Memory-aware caching for current_dset with weak references.
         # Lock guards all reads/writes: WeakValueDictionary is not thread-safe
@@ -608,6 +612,22 @@ class ViewerKernel(FileLocator):
         tree.resize(1024, 800)
         return tree
 
+    def report_left_out(self, what: str, left_out: dict | None) -> None:
+        """Tell the user which files a shared-axis plot or fit leaves out.
+
+        ``left_out`` is ``{file label: reason}`` as returned by
+        ``g2mod.left_out_files`` / ``saxs1d.pg_plot``; the modules are GUI-free,
+        so the status bar message is made here, at the GUI boundary.
+        """
+        if not left_out or not isinstance(left_out, dict):
+            return
+        text = f"{what}: left out " + "; ".join(
+            f"{label} ({why})" for label, why in left_out.items()
+        )
+        logger.warning(text)
+        if self.statusbar is not None:
+            self.statusbar.showMessage(text, 10000)
+
     @log_timing(threshold_ms=500)
     def plot_g2(self, handler, q_range, t_range, y_range, rows=None, **kwargs):
         """
@@ -648,6 +668,7 @@ class ViewerKernel(FileLocator):
         xf_list = self.get_xf_list(rows=rows, filter_atype="Multitau")
         if xf_list:
             g2_module = self.get_module("g2mod")
+            self.report_left_out("G2", g2_module.left_out_files(xf_list))
             g2_module.pg_plot(handler, xf_list, q_range, t_range, y_range, **kwargs)
             q, tel, *_unused = g2_module.get_data(xf_list)
             return q, tel
@@ -1079,7 +1100,7 @@ class ViewerKernel(FileLocator):
             xf_list, position = self.get_xf_list(), {}
         if xf_list:
             roi_list = pg_hdl.get_roi_list()
-            self.get_module("saxs1d").pg_plot(
+            left_out = self.get_module("saxs1d").pg_plot(
                 xf_list,
                 mp_hdl,
                 rows=None
@@ -1089,6 +1110,18 @@ class ViewerKernel(FileLocator):
                 roi_list=roi_list,
                 **kwargs,
             )
+            self.report_left_out("SAXS 1D", left_out)
+            # a background on other axes is refused by the file: say so on screen
+            refused = [
+                f"{xf.label}: {xf.background_refusal}"
+                for xf in xf_list
+                if isinstance(getattr(xf, "background_refusal", None), str)
+            ]
+            if refused and self.statusbar is not None:
+                text = "Background NOT subtracted (" + "; ".join(refused) + ")"
+                if left_out:  # keep report_left_out's message, do not replace it
+                    text = f"{self.statusbar.currentMessage()} | {text}"
+                self.statusbar.showMessage(text, 10000)
 
     def export_saxs_1d(self, pg_hdl, folder):
         xf_list = self.get_xf_list()
@@ -1281,6 +1314,7 @@ class ViewerKernel(FileLocator):
             return
         worker = _get_module("average_toolbox")(self.path, flist=self.target)
         worker.setup(*args, **kwargs)
+        self.remove_job()  # a replaced job is retired like a removed one
         self.avg_worker = worker
         logger.info("create average job, ID = %s", worker.jid)
         # the worker copied the names; the loaded files of the emptied target
@@ -1289,8 +1323,14 @@ class ViewerKernel(FileLocator):
 
     def remove_job(self):
         # the job is gone from the list: its progress record goes with it
-        if self.avg_worker is not None:
-            self.avg_worker_active.pop(self.avg_worker.jid, None)
+        worker = self.avg_worker
+        if worker is not None:
+            self._retired_avg_jobs.add(worker.jid)
+            self.avg_worker_active.pop(worker.jid, None)
+            # messages already queued are dropped by update_avg_values; a job that
+            # was never started has nothing connected
+            with contextlib.suppress(RuntimeError, TypeError):
+                worker.signals.values.disconnect(self.update_avg_values)
         self.avg_worker = None
 
     def update_avg_info(self):
@@ -1321,6 +1361,8 @@ class ViewerKernel(FileLocator):
         memory pressure to prevent out-of-memory conditions.
         """
         key, val = data[0], data[1]
+        if key in self._retired_avg_jobs:
+            return
         # .get() so a worker update for a key the GUI never pre-seeded (e.g. when
         # driven headlessly) initializes the record instead of raising KeyError.
         if self.avg_worker_active.get(key) is None:
@@ -1433,6 +1475,10 @@ class ViewerKernel(FileLocator):
                 axes = _g2_axes(xf)
                 axis0 = axes[0][0] if axes else "q"
                 axes_line = _axes_comment(xf)
+                # a placeholder Q map: every file below says so on its first line
+                warn = (
+                    f"{PLACEHOLDER_QMAP_WARNING}\n" if has_placeholder_qmap(xf) else ""
+                )
 
                 # Create header: the plain Q labels stay, the bin's full identity
                 # (dynamic bin, map position, both axis values) is appended
@@ -1452,7 +1498,9 @@ class ViewerKernel(FileLocator):
                     data_array.append(g2_err[:, i])
 
                 data_matrix = np.column_stack(data_array)
-                np.savetxt(g2_filename, data_matrix, header=header, delimiter="\t")
+                np.savetxt(
+                    g2_filename, data_matrix, header=warn + header, delimiter="\t"
+                )
                 logger.info(f"G2 export kernel: Saved G2 data file: {g2_filename}")
 
                 # Export fitting results if available
@@ -1462,6 +1510,8 @@ class ViewerKernel(FileLocator):
 
                     with open(fit_filename, "w") as f:
                         f.write(f"# G2 Fitting Results for {xf.label}\n")
+                        if warn:
+                            f.write(f"# {warn}")
                         if axes_line:
                             f.write(f"# {axes_line}\n")
                         f.write(f"# Fitting function: {xf.fit_summary['fit_func']}\n")
@@ -1546,7 +1596,10 @@ class ViewerKernel(FileLocator):
 
                         curve_matrix = np.column_stack(curve_data)
                         np.savetxt(
-                            curve_filename, curve_matrix, header=header, delimiter="\t"
+                            curve_filename,
+                            curve_matrix,
+                            header=warn + header,
+                            delimiter="\t",
                         )
                         logger.info(
                             f"G2 export kernel: Saved fitted curves file: {curve_filename}"
@@ -1671,6 +1724,8 @@ class ViewerKernel(FileLocator):
                     f.write(f"# Power Law Fitting Results for {xf.label}\n")
                     f.write("# Model: tau = a * q^b\n")
                     f.write(f"# File: {xf.fname}\n")
+                    if has_placeholder_qmap(xf):
+                        f.write(f"# {PLACEHOLDER_QMAP_WARNING}\n")
                     axis_name, axis_unit = map_axis(getattr(xf, "qmap", None), 0)
                     f.write(
                         f"# Q unit: {fs.get('tauq_q_unit', 'not recorded')} "
@@ -1730,6 +1785,9 @@ class ViewerKernel(FileLocator):
                 f.write("# Model: tau = a * q^b\n")
                 f.write(f"# Export date: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
                 f.write(f"# Total files: {len(written)}\n")
+                for xf in written:
+                    if has_placeholder_qmap(xf):
+                        f.write(f"# {PLACEHOLDER_QMAP_WARNING}: {xf.label}\n")
                 for method in sorted({m for _, m in fits.values()}):
                     f.write(f"# Fit method {method}:\n")
                     for line in _DIFFUSION_PROVENANCE[method]:

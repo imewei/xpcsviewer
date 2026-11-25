@@ -783,9 +783,14 @@ def test_r6_16_collect_and_restore_cover_the_same_fields():
         "twotime_symmetric",
         "qmap_show_rings",
     }
+    # R7-07: the identity of the selected two-time bin (file path + absolute bin
+    # ID) is collected beside the table row of its combo position and applied by
+    # that row's setter (see test_review_r7_state)
+    identity = {"twotime_source_file", "twotime_selected_bin"}
     mapped = {row[0] for row in _SESSION_CONTROLS}
-    assert mapped | no_widget == {f.name for f in fields(AnalysisParameters)}
+    assert mapped | no_widget | identity == {f.name for f in fields(AnalysisParameters)}
     assert not mapped & no_widget
+    assert not identity & (mapped | no_widget)
     src = (PKG / "xpcs_viewer.py").read_text()
     assert (
         "_SESSION_CONTROLS"

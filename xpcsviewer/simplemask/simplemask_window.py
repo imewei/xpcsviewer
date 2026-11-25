@@ -85,10 +85,15 @@ class SimpleMaskWindow(QMainWindow):
 
     Signals:
         mask_exported: Emitted with mask array when user clicks "Apply to Viewer"
+        mask_applied: The same click, with the context the viewer needs to tell
+            the user's edits from the file's own exclusions: (mask, seed mask the
+            editor started from or None, path of the file the editor displays or
+            None). Emitted right after ``mask_exported``.
         qmap_exported: Emitted with partition dict when user exports Q-map
     """
 
     mask_exported = Signal(np.ndarray)
+    mask_applied = Signal(np.ndarray, object, object)
     qmap_exported = Signal(dict)
 
     # UI Components (injected by setup_ui)
@@ -458,8 +463,16 @@ class SimpleMaskWindow(QMainWindow):
         logger.info(f"Saved mask to {file_path}")
 
     def _protected_paths(self) -> list[str]:
-        """Files the editor or the viewer has open: no export may write to them."""
+        """Files the editor or the viewer has open: no export may write to them.
+
+        ``metadata["source_file"]`` (the analysis file the editor was opened on)
+        stays protected for as long as the editor displays its data, whether or
+        not the viewer still holds that file; only loading other data clears it.
+        """
         paths = [self._raw_source_path] if self._raw_source_path else []
+        source = self.kernel.metadata.get("source_file") if self.kernel else None
+        if isinstance(source, str) and source:
+            paths.append(source)
         vk = getattr(self.parent_viewer, "vk", None)
         if vk is not None:
             paths += [os.path.join(vk.path, name) for name in vk.target.copy()]
@@ -1444,6 +1457,9 @@ class SimpleMaskWindow(QMainWindow):
                 )
                 return
             self.mask_exported.emit(mask)
+            self.mask_applied.emit(
+                mask, self.kernel.seed_mask, self.kernel.metadata.get("source_file")
+            )
             logger.info("Mask exported to viewer")
             self.status_bar.showMessage("Mask exported to XPCS Viewer")
 

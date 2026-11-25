@@ -34,7 +34,7 @@ from .backends._conversions import ensure_numpy
 from .constants import MIN_AVERAGING_FILES
 from .fileIO.g2_regroup import G2RegroupResult
 from .fileIO.hdf_reader import _file_identity
-from .fileIO.qmap_utils import Q_UNIT_DISPLAY, convert_q, map_axis
+from .fileIO.qmap_utils import Q_UNIT_DISPLAY, convert_q, map_axis, q_axis_label
 from .gui.g2_regroup_dialog import G2RegroupDialog, G2RegroupExportWorker
 from .gui.layout_helpers import apply_all_layout_improvements
 from .gui.shortcuts.shortcut_manager import ShortcutManager
@@ -62,6 +62,7 @@ from .threading.async_kernel import AsyncDataPreloader, AsyncViewerKernel
 from .threading.progress_manager import ProgressManager
 from .utils import get_logger, log_system_info, sanitize_path, setup_exception_logging
 from .utils.log_utils import RateLimitedLogger
+from .utils.qmap_notice import PLACEHOLDER_QMAP_WARNING, has_placeholder_qmap
 from .viewer_kernel import ViewerKernel
 from .viewer_ui import Ui_mainWindow as Ui
 
@@ -153,10 +154,47 @@ def _get_index(widget):
     return widget.currentIndex()
 
 
+def _restore_twotime_bin(viewer, widget, source, bin_id):
+    """Select the saved two-time bin by its absolute processed-bin ID in the file
+    it was chosen on (a position would name another bin once the file is
+    reprocessed in a different bin order). A bin that is gone selects the first."""
+    vk = viewer.vk
+    if vk is None:
+        return
+    source = os.path.abspath(source)
+    row = next(
+        (
+            r
+            for r in range(len(vk.target))
+            if os.path.abspath(os.path.join(vk.path, str(vk.target[r]))) == source
+        ),
+        None,
+    )
+    xf_list = [] if row is None else vk.get_xf_list([row], filter_atype="Twotime")
+    if not xf_list:
+        return  # that file is not in this workspace: nothing to follow
+    xf = xf_list[0]
+    bins = tuple(np.ravel(getattr(xf, "c2_processed_bins", [])).tolist())
+    if bin_id not in bins:
+        logger.warning("saved two-time bin %s is not in %s: first bin", bin_id, source)
+    ordinal = bins.index(bin_id) if bin_id in bins else 0
+    # the ordinal is recorded together with the bins it is a position in
+    _remember_twotime_qbin(viewer._twotime_qbin_memory, xf.fname, ordinal)
+    _remember_twotime_qbin(viewer._twotime_qbin_bins, xf.fname, bins)
+    if viewer._current_twotime_fname() == xf.fname and ordinal < widget.count():
+        widget.setCurrentIndex(ordinal)
+
+
 def _set_twotime_q(viewer, widget, value):
-    """The saved Q-bin position belongs to the file shown then: remember it for
-    the current two-time file (plot_twotime resolves it against the loaded
-    revision) and show it if the combo already lists that many bins."""
+    """Restore the two-time Q bin. A session that saved the bin's identity
+    (``viewer._session_twotime_bin``: file path and absolute bin ID) restores it
+    by ID; an older session only holds a position, which is remembered for the
+    current two-time file (plot_twotime resolves it against the loaded revision)
+    and shown if the combo already lists that many bins."""
+    identity = getattr(viewer, "_session_twotime_bin", None)
+    if identity is not None:
+        _restore_twotime_bin(viewer, widget, *identity)
+        return
     if not isinstance(value, int) or value < 0:
         return
     fname = viewer._current_twotime_fname()
@@ -243,6 +281,14 @@ def _detector_shape(xf) -> tuple[int, ...] | None:
     """Shape of the file's detector image (None if it has none)."""
     image = getattr(xf, "saxs_2d", None)
     return None if image is None else tuple(np.shape(image))
+
+
+def _same_file(a, b) -> bool:
+    """True if two paths name one file (by identity, else by resolved name)."""
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return os.path.realpath(str(a)) == os.path.realpath(str(b))
 
 
 def _split_by_detector_shape(xf_list, arrays):
@@ -550,6 +596,7 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         self.list_view_target.clicked.connect(self.update_plot)
 
         self.mp_2t_hdls = None
+        self._placeholder_qmap_label: QtWidgets.QLabel | None = None
         # fname -> last selected qbin index; bounded LRU so a long session
         # analyzing many files doesn't grow this without limit.
         self._twotime_qbin_memory: OrderedDict[str, int] = OrderedDict()
@@ -1454,7 +1501,10 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             widget = getattr(self, attr, None)
             if widget is not None:
                 param_values[fld] = getter(widget)
-        analysis_params = AnalysisParameters(**param_values)
+        source, bin_id = self._twotime_session_identity()
+        analysis_params = AnalysisParameters(
+            **param_values, twotime_source_file=source, twotime_selected_bin=bin_id
+        )
 
         return SessionState(
             data_path=(
@@ -1467,6 +1517,17 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             window_geometry=window_geometry,
             analysis_params=analysis_params,
         )
+
+    def _twotime_session_identity(self) -> tuple[str, int]:
+        """``(absolute path, absolute processed-bin ID)`` of the two-time bin the
+        combo shows, or ``("", -1)``. The bins are the tuple the combo was filled
+        from (what the user chose among), not a fresh read of the file."""
+        fname = self._twotime_last_fname
+        bins = self._twotime_qbin_bins.get(fname) if fname is not None else None
+        index = self.comboBox_twotime_selection.currentIndex()
+        if bins is None or not 0 <= index < len(bins):
+            return "", -1
+        return os.path.abspath(fname), int(bins[index])
 
     def _restore_session(self) -> None:
         """Restore workspace state from saved session."""
@@ -1545,6 +1606,16 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         params = session.analysis_params
         saved = getattr(session, "saved_params", None)  # None: every field is saved
         restored = []
+        # the saved bin's identity, when this session file holds one
+        identity_saved = saved is None or {
+            "twotime_source_file",
+            "twotime_selected_bin",
+        } <= set(saved)
+        source = getattr(params, "twotime_source_file", "")
+        bin_id = getattr(params, "twotime_selected_bin", -1)
+        self._session_twotime_bin = (
+            (source, bin_id) if identity_saved and source and bin_id >= 0 else None
+        )
         for fld, attr, _getter, setter, sync in _SESSION_CONTROLS:
             widget = getattr(self, attr, None)
             value = getattr(params, fld, None)
@@ -1562,6 +1633,7 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             if sync is not None:
                 sync(self)
             restored.append(fld)
+        self._session_twotime_bin = None
         if restored and self.vk is not None and self.vk.target:
             self.update_plot()
 
@@ -1754,6 +1826,7 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             return
 
         plot_type = self.active_plot_operations[operation_id]
+        self._update_placeholder_qmap_notice()  # the worker has loaded its files
 
         # Selection/targets changed while the worker ran: drop the result and
         # queue a refresh for the newest selection instead of painting old data.
@@ -1898,6 +1971,8 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
                 },
             )
             self._initialize_g2_fit_bounds(result.get("fit_delay_extent"))
+            # a file on another Q axis is not drawn: say so where the user looks
+            self.vk.report_left_out("G2", result.get("left_out"))
             logger.info("G2 plot applied successfully from async worker result")
 
         except Exception as e:
@@ -2163,6 +2238,33 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         self._release_g2_regroup_export(message)
         self.toast_manager.show_error(message)
 
+    def _update_placeholder_qmap_notice(self) -> None:
+        """Permanent status-bar warning while a selected file runs on the
+        substituted placeholder Q map (``QMap.is_default``); hidden otherwise.
+        Looks at the files already loaded only (it loads nothing: it runs on every
+        tab switch) and never raises: it must not stop a plot."""
+        names: list[str] = []
+        try:
+            if self.vk is not None and self.vk.target:
+                for row in self.get_selected_rows():
+                    path = os.path.normpath(
+                        os.path.join(self.vk.path, self.vk.target[row])
+                    )
+                    xf = self.vk.cache.get(path)
+                    if xf is not None and has_placeholder_qmap(xf):
+                        names.append(str(xf.label))
+        except Exception:
+            logger.debug("placeholder Q-map check failed", exc_info=True)
+        label = getattr(self, "_placeholder_qmap_label", None)  # first call is in init
+        if label is None and names:
+            label = QtWidgets.QLabel()
+            label.setStyleSheet("color: #d9534f; font-weight: bold;")
+            self.statusbar.addPermanentWidget(label)
+            self._placeholder_qmap_label = label
+        if label is not None:
+            label.setText(f"{PLACEHOLDER_QMAP_WARNING}: {', '.join(names)}")
+            label.setVisible(bool(names))
+
     def update_plot(self):
         """
         Update plot display based on current tab and selected files.
@@ -2183,6 +2285,7 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         tab_name = tab_mapping.get(idx, "")
         logger.debug(f"update_plot called for tab: {tab_name} (index: {idx})")
 
+        self._update_placeholder_qmap_notice()
         if not tab_name:
             logger.debug(f"No tab mapping for index {idx}, skipping update")
             return
@@ -2232,6 +2335,7 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             self.update_plot_async(tab_name)
         else:
             self.update_plot_sync(tab_name)
+            self._update_placeholder_qmap_notice()  # the plot has loaded its files
 
     def _plot_request(self, kwargs: dict) -> dict:
         """The plot kwargs plus everything else that decides what is drawn.
@@ -3036,7 +3140,8 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         # Create window if it doesn't exist (reuse existing instance if open)
         if self._simplemask_window is None:
             self._simplemask_window = SimpleMaskWindow(parent_viewer=self)
-            self._simplemask_window.mask_exported.connect(self.import_mask)
+            # mask_applied carries the seed and the source file along with the mask
+            self._simplemask_window.mask_applied.connect(self.import_mask)
             self._simplemask_window.qmap_exported.connect(self.import_partition)
             logger.info("Created new SimpleMask window")
 
@@ -3099,6 +3204,9 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
                 "pix_dim": pix_dim * 1000.0 if pix_dim is not None else None,
                 "energy": getattr(xf, "X_energy", None),
                 "shape": detector_image.shape if detector_image is not None else None,
+                # The editor protects this file from Save Mask/Partition for as
+                # long as it shows its data, whatever the viewer later does with it.
+                "source_file": str(xf.fname),
             }
             # The EFFECTIVE mask the viewer applies to this file right now (an
             # imported mask, else the file's own): the editor starts from it, so
@@ -3122,11 +3230,22 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             logger.error(f"Failed to get SimpleMask data: {e}")
             return None, None
 
-    def import_mask(self, mask: np.ndarray) -> None:
+    def import_mask(
+        self,
+        mask: np.ndarray,
+        seed: np.ndarray | None = None,
+        source: str | None = None,
+    ) -> None:
         """Import mask from SimpleMask into current analysis.
 
         Args:
             mask: Boolean mask array from SimpleMask (True = keep, False = masked)
+            seed: The mask the editor started from (the source file's applied
+                mask), or None for an all-valid start (a caller that sends only
+                a mask: every pixel the mask excludes counts as an edit)
+            source: Path of the file the editor was opened on, or None when the
+                editor shows no viewer file (then every target is treated as the
+                source, the behaviour before the editor was seeded)
         """
         if not self.vk or not self.vk.target or len(self.vk.target) == 0:
             QtWidgets.QMessageBox.warning(
@@ -3158,20 +3277,61 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
                 )
                 return
 
-            # Apply mask to the matching loaded XpcsFile objects (BUG-001 fix).
-            # Rule: a target never gets a pixel re-enabled that ITS OWN canonical
-            # detector mask (xf.qmap.mask) excludes, so the mask assigned is
-            # (editor mask AND the file's canonical mask), per target.
+            # RULE (R7-01). The editor's mask holds the SOURCE file's own
+            # exclusions (its seed) plus the user's edits.
+            #  * The source file (captured at hand-off, not the selected row)
+            #    receives the editor's mask.
+            #  * Every other target loses only what the user excluded beyond the
+            #    seed (editor False where seed True) and gains nothing: its new
+            #    mask is its BASE mask minus those edits.
+            #  * No target ever gets a pixel its own canonical mask (xf.qmap.mask)
+            #    excludes.
+            # BASE of another target = the mask it had before the previous Apply
+            # of THIS editor session (so Apply -> undo -> Apply returns it to
+            # where it started); otherwise its current mask, which keeps any mask
+            # imported by other means.
+            import weakref
+
+            # per file: (base, mask this method assigned, seed of that Apply)
+            records = self.__dict__.setdefault(
+                "_mask_import_records", weakref.WeakKeyDictionary()
+            )
+            keep = np.asarray(mask) != 0
+            edits = ~keep  # no usable seed: an all-valid seed
+            if seed is not None and np.shape(seed) == keep.shape:
+                edits = (np.asarray(seed) != 0) & ~keep
             for xf in accepted:
                 canonical = getattr(getattr(xf, "qmap", None), "mask", None)
-                combined = np.asarray(mask) != 0
-                if canonical is not None and np.shape(canonical) == combined.shape:
-                    narrowed = combined & (np.asarray(canonical) != 0)
-                    # nothing re-enabled: the editor's own array is kept as is
-                    combined = mask if np.array_equal(narrowed, combined) else narrowed
+                canonical = None if canonical is None else np.asarray(canonical) != 0
+                if canonical is not None and canonical.shape != np.shape(mask):
+                    canonical = None
+                if source is None or _same_file(xf.fname, source):
+                    combined = np.asarray(mask) != 0
+                    if canonical is not None:
+                        narrowed = combined & canonical
+                        # nothing re-enabled: the editor's own array is kept as is
+                        combined = (
+                            mask if np.array_equal(narrowed, combined) else narrowed
+                        )
+                    else:
+                        combined = mask
+                    xf.mask = combined
+                    continue
+                record = records.get(xf)
+                if (
+                    record is not None
+                    and seed is not None
+                    and record[2] is seed
+                    and xf.mask is record[1]
+                ):
+                    base = record[0]
                 else:
-                    combined = mask
-                xf.mask = combined
+                    base = xf.mask
+                result = (np.asarray(base) != 0) & ~edits
+                if canonical is not None:
+                    result &= canonical
+                xf.mask = result
+                records[xf] = (base, result, seed)
 
             logger.info(
                 f"Mask exported from SimpleMask: shape {mask.shape}, "
@@ -3632,27 +3792,51 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             rows = self.get_selected_rows()
             xf_list = self.vk.get_xf_list(rows)
 
-            # Force fresh G2 fitting for all files to ensure fresh input data
-            for xf in xf_list:
-                if hasattr(xf, "fit_summary") and xf.fit_summary is not None:
-                    # Get current G2 parameters from UI
-                    g2_bounds, g2_fit_flag, g2_fit_func = self.check_g2_fitting_number()
-                    g2_params = self.check_g2_number()
-                    g2_q_range = (g2_params[0], g2_params[1])
-                    g2_t_range = (g2_params[2], g2_params[3])
+            # Force fresh G2 fitting for all files to ensure fresh input data.
+            # The G2 Q boxes are in the FIRST file's unit (like every G2 plot):
+            # each file is refitted with the range in its own unit, and a file
+            # with no Q bin in it is set aside individually (it keeps its
+            # previous results) instead of aborting the whole rebuild.
+            from .module import g2mod
 
-                    # Force fresh G2 fitting to provide fresh input for tau-q
-                    logger.info(
-                        f"Forcing fresh G2 fitting for {xf.label} before tau-q analysis"
-                    )
+            g2_bounds, g2_fit_flag, g2_fit_func = self.check_g2_fitting_number()
+            g2_params = self.check_g2_number()
+            g2_q_range = (
+                None if self.g2_qauto.isChecked() else (g2_params[0], g2_params[1])
+            )
+            g2_t_range = (
+                None if self.g2_tauto.isChecked() else (g2_params[2], g2_params[3])
+            )
+            shared = g2mod._shared_q_axis(xf_list) if xf_list else None
+            refits, not_refitted = [], {}
+            for xf in xf_list:
+                if not (hasattr(xf, "fit_summary") and xf.fit_summary is not None):
+                    continue
+                try:
+                    own_range = g2mod.q_range_in_file_unit(xf, g2_q_range, shared)
+                    if not len(xf.qmap.get_qbin_in_qrange(own_range)[0]):
+                        raise ValueError(f"no Q bins in range {g2_q_range}")
+                except ValueError as exc:
+                    not_refitted[xf.label] = str(exc)
+                    continue
+                refits.append((xf, own_range))
+            for xf, own_range in refits:
+                # Force fresh G2 fitting to provide fresh input for tau-q
+                logger.info(
+                    f"Forcing fresh G2 fitting for {xf.label} before tau-q analysis"
+                )
+                try:
                     xf.fit_g2(
-                        g2_q_range,
+                        own_range,
                         g2_t_range,
                         g2_bounds,
                         g2_fit_flag,
                         g2_fit_func,
                         force_refit=True,
                     )
+                except Exception as exc:
+                    logger.exception("G2 refit of %s failed", xf.label)
+                    not_refitted[xf.label] = str(exc)
 
             # Now force fresh tau-q fitting with the fresh G2 results
             kwargs["force_refit"] = True
@@ -3666,6 +3850,14 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             # ALSO update left panel parameter plots with fresh data
             logger.info("Updating diffusion parameter plots with fresh results")
             self.init_diffusion()
+
+            if not_refitted:
+                self.statusbar.showMessage(
+                    "Diffusion: G2 not refitted for "
+                    + "; ".join(f"{name} ({why})" for name, why in not_refitted.items())
+                    + " - its previous fit is kept",
+                    10000,
+                )
 
             logger.info("plot_diffusion completed successfully")
             return None
@@ -5078,6 +5270,13 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             logger.debug("Could not resolve the G2 Q-bin table", exc_info=True)
             return None
 
+    def _g2_first_axis(self):
+        """``(name, unit)`` of the dynamic axis of the first selected file, the
+        one ``_g2_bin_table`` and the Bayesian fits read their Q values in."""
+        rows = self.get_selected_rows()
+        xf_list = self.vk.get_xf_list(rows) if self.vk and rows else []
+        return map_axis(getattr(xf_list[0], "qmap", None) if xf_list else None, 0)
+
     def _g2_current_bundle(self):
         """Stored Bayesian bundle of the currently selected physical bin, or
         ``None`` (no fit yet for *this* bin of *this* file)."""
@@ -5156,6 +5355,7 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             x[valid],
             y[valid],
             yerr[valid],
+            q_axis=map_axis(getattr(xf_list[0], "qmap", None), 0),
         )
         return bundle, q_idx
 
@@ -5204,7 +5404,9 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         table = self._g2_bin_table()
         if table is not None and 0 <= q_idx < len(table[1]):
             _, q_bin, label = table[1][q_idx]
-            q_label = f"q = {q_bin:.4g} {Q_UNIT_DISPLAY} ({label})"
+            # the bin's value is in the FILE's own axis name and unit
+            axis_name, axis_unit = self._g2_first_axis()
+            q_label = f"{axis_name} = {q_bin:.4g} {axis_unit} ({label})"
 
         if q_label:
             self.statusbar.showMessage(f"Q-bin {q_idx}: {q_label}", 3000)
@@ -5355,7 +5557,7 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         self._g2_bayesian_worker = worker
         self._g2_bayesian_worker_active = True
         self.btn_g2_bayesian.setText(f"Cancel Q-{q_idx}")
-        self.statusbar.showMessage(f"Bayesian fit running for Q={q_value:.4g}...", 0)
+        self.statusbar.showMessage(f"Bayesian fit running for {bundle.q_text}...", 0)
         self.thread_pool.start(worker)
 
     def _on_g2_bayesian_finished(self, result):
@@ -5388,7 +5590,6 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             return
 
         fit_result = result["fit_result"]
-        q_value = launch.q_value
 
         # Commit posterior + the observations/bin it was fitted to as one unit,
         # keyed by the file revision it was fitted from.
@@ -5406,7 +5607,7 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             else f"Diagnosis Q-{q_idx_current} (no fit)"
         )
 
-        self._announce_bayesian_fit(f"Q={q_value:.4g}", fit_result)
+        self._announce_bayesian_fit(launch.q_text, fit_result)
 
     def _announce_bayesian_fit(self, what: str, fit_result) -> None:
         """Status-bar text (and a warning toast) for a finished Bayesian fit.
@@ -5543,6 +5744,7 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
                 x[valid],
                 y[valid],
                 yerr[valid],
+                q_axis=map_axis(getattr(xf_list[0], "qmap", None), 0),
             )
             specs.append(
                 {
@@ -5930,6 +6132,9 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         guard = ExportGuard([snapshot.fname] if snapshot.fname else [])
         failures: list[str] = []
         refused: list[str] = []
+        placeholder = self._has_placeholder_qmap_file(snapshot.fname)
+        if placeholder:
+            logger.warning("%s: %s", snapshot.fname, PLACEHOLDER_QMAP_WARNING)
 
         # 1. CSV parameters
         try:
@@ -5943,6 +6148,7 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
                 bin_ids=bfs.get("bin_ids"),
                 bin_phi=bfs.get("bin_phi"),
                 bin_axes=bfs.get("bin_axes"),
+                placeholder_q=placeholder,
                 guard=guard,
             )
         except ExportCollisionError as exc:
@@ -5960,16 +6166,36 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             logger.warning("Figure was already closed; skipping figure export")
             failures.append("PDF/PNG")
         else:
-            for name, dpi in (("bayesian_all_q.pdf", 300), ("bayesian_all_q.png", 150)):
-                try:
-                    guard.claim(out_dir / name, "All-Q figure")
-                    fig.savefig(out_dir / name, dpi=dpi, bbox_inches="tight")
-                except ExportCollisionError as exc:
-                    logger.error("Figure export refused: %s", exc)
-                    refused.append(str(exc))
-                except Exception:
-                    logger.exception("Figure export failed")
-                    failures.append("PDF/PNG")
+            # the figure's Q labels are the file's: a placeholder map says so on it
+            note = (
+                fig.text(
+                    0.5,
+                    1.0,
+                    PLACEHOLDER_QMAP_WARNING,
+                    color="red",
+                    ha="center",
+                    va="top",
+                )
+                if placeholder
+                else None
+            )
+            try:
+                for name, dpi in (
+                    ("bayesian_all_q.pdf", 300),
+                    ("bayesian_all_q.png", 150),
+                ):
+                    try:
+                        guard.claim(out_dir / name, "All-Q figure")
+                        fig.savefig(out_dir / name, dpi=dpi, bbox_inches="tight")
+                    except ExportCollisionError as exc:
+                        logger.error("Figure export refused: %s", exc)
+                        refused.append(str(exc))
+                    except Exception:
+                        logger.exception("Figure export failed")
+                        failures.append("PDF/PNG")
+            finally:
+                if note is not None:
+                    note.remove()
 
         # 3. netCDF diagnostics (skipped, not failed, when no backend is
         # installed).  The writer drops the bins the summary marks failed.
@@ -5984,6 +6210,7 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
                     q_val=bfs.get("q_val"),
                     bin_phi=bfs.get("bin_phi"),
                     bin_axes=bfs.get("bin_axes"),
+                    placeholder_q=placeholder,
                     source=snapshot.fname,
                     guard=guard,
                 )
@@ -6013,7 +6240,26 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
                 8000,
             )
         else:
-            self.statusbar.showMessage(f"Exported Bayesian results to {out_dir}", 5000)
+            self.statusbar.showMessage(
+                f"Exported Bayesian results to {out_dir}"
+                + (f" ({PLACEHOLDER_QMAP_WARNING})" if placeholder else ""),
+                10000 if placeholder else 5000,
+            )
+
+    def _has_placeholder_qmap_file(self, fname) -> bool:
+        """True if the loaded file *fname* runs on the placeholder Q map."""
+        if self.vk is None or not fname:
+            return False
+        target = os.path.normpath(str(fname))
+        try:
+            return any(
+                has_placeholder_qmap(xf)
+                for xf in self.vk.get_xf_list()
+                if os.path.normpath(str(xf.fname)) == target
+            )
+        except Exception:  # a note is never worth failing an export for
+            logger.debug("placeholder Q-map check failed", exc_info=True)
+            return False
 
     def _show_g2_diagnosis(self):
         """Show or create the G2 Bayesian diagnosis window.
@@ -6072,8 +6318,9 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             y_data=y,
             yerr=yerr,
             q_value=q_value,
+            q_axis=bundle.q_axis,
             title=(
-                f"G2 Bayesian Diagnosis - Q={q_value:.4g} "
+                f"G2 Bayesian Diagnosis - {bundle.q_text} "
                 f"({bundle.label}, bin {bundle.bin_id})"
             ),
             identity=DiagnosisIdentity(
@@ -6347,7 +6594,8 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             )
 
         win = self._diff_diagnosis_window
-        win.set_axis_labels("Q (1/A)", "tau (s)")
+        # the rows were converted to inverse angstrom (_extract_diffusion_for_bayesian)
+        win.set_axis_labels(q_axis_label("Q", Q_UNIT_DISPLAY), "tau (s)")
         win.update_results(
             result=fit_result,
             model_func=power_law_func,

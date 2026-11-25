@@ -207,6 +207,7 @@ def _plot_stub(request, current):
         _retiring_plots=False,
         plot_kwargs_record={},
         _plot_request=lambda kwargs: kwargs,  # no revision part in these stubs
+        _update_placeholder_qmap_notice=lambda: None,
     )
     stub._plot_request_is_stale = lambda *a: XpcsViewer._plot_request_is_stale(stub, *a)
     stub._settle_plot_operation = lambda *a, **k: XpcsViewer._settle_plot_operation(
@@ -291,6 +292,7 @@ def test_r1_17_simplemask_metadata_is_in_millimetres():
         det_dist=5.0,  # QMap: metres
         pixel_size=75e-6,  # QMap: metres
         X_energy=10.0,
+        fname="a.h5",  # sent to the editor as its protected source file
     )
     stub = SimpleNamespace(
         vk=SimpleNamespace(target=[0], get_xf_list=lambda rows=None: [xf]),

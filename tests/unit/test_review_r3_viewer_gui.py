@@ -121,6 +121,7 @@ def _viewer(xf, *, q_range=(0.0, 1.0), q_idx=1):
     return _bind(
         st,
         "_g2_bin_table",
+        "_g2_first_axis",
         "_g2_current_bundle",
         "_extract_g2_for_bayesian",
         "_g2_resolved_bins",

@@ -311,10 +311,11 @@ def test_r6_17_cli_bins_of_a_cartesian_map_are_identified_by_both_axes(tmp_path)
     bins = tb._collect_valid_qbins(xf)
     assert [(b[2], b[3]) for b in bins] == [(40.0, 120.0), (40.0, 130.0)]
     out = tmp_path / "out"
-    assert tb.run_twotime_batch(r4cli._args(path, out, q=40.0)) == 0
+    # R7-05: the selector's unit is declared (pixels here), and the names carry units
+    assert tb.run_twotime_batch(r4cli._args(path, out, q=40.0, q_unit="px")) == 0
     assert sorted(p.name for p in out.glob("*.png")) == [
-        "cart.h5_bin0000_x40.0000_y120.0000.png",
-        "cart.h5_bin0001_x40.0000_y130.0000.png",
+        "cart.h5_bin0000_x40.0000px_y120.0000px.png",
+        "cart.h5_bin0001_x40.0000px_y130.0000px.png",
     ]
 
 

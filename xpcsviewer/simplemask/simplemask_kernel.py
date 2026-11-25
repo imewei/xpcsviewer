@@ -60,6 +60,8 @@ class SimpleMaskKernel:
         qmap: Dictionary of Q-map arrays
         qmap_unit: Dictionary of Q-map units
         metadata: Geometry metadata dictionary
+        seed_mask: The mask the editor started from (the file's applied mask),
+            or None when it started with every pixel valid
     """
 
     def __init__(
@@ -78,6 +80,7 @@ class SimpleMaskKernel:
         self.qmap: dict[str, np.ndarray] | None = None
         self.qmap_unit: dict[str, str] | None = None
         self.mask: np.ndarray | None = None
+        self.seed_mask: np.ndarray | None = None
         self.mask_kernel: MaskAssemble | None = None
         self.new_partition: dict | None = None
         self._geometry_pending = False
@@ -112,6 +115,7 @@ class SimpleMaskKernel:
         self.invalidate_partition()
         self.set_geometry_pending(False)
         self.detector_image = self.shape = self.mask = self.mask_kernel = None
+        self.seed_mask = None
         self.qmap = self.qmap_unit = None
         self.metadata = {}
 
@@ -134,8 +138,11 @@ class SimpleMaskKernel:
                 - energy: X-ray energy (keV)
                 - shape: Detector shape (height, width)
                 - mask: optional 2-D array of ``shape`` (nonzero = valid pixel),
-                  the file's own mask; it is the editor's base layer. A missing
-                  key or a different shape starts with every pixel accepted.
+                  the file's own mask; it is the editor's base layer (kept as
+                  ``seed_mask``). A missing key or a different shape starts with
+                  every pixel accepted.
+                - source_file: optional path of the analysis file the image
+                  came from; no export may overwrite it (``_claim_output``).
             qmap_result: Precomputed Q-map and units for the supplied geometry.
 
         Returns:
@@ -181,6 +188,7 @@ class SimpleMaskKernel:
         self.clear_data()
         self.detector_image, self.shape, self.metadata = image, shape, metadata
         self.mask = mask
+        self.seed_mask = None if base_mask is None else base_mask.copy()
         if qmap_result is None:
             self._apply_geometry(metadata)
         else:

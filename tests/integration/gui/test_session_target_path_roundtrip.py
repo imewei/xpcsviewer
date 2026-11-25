@@ -91,6 +91,7 @@ def test_target_files_survive_restart_from_other_cwd(
         isMaximized=lambda: False,
         tabWidget=_make_tab_widget(),
         work_dir=SimpleNamespace(text=lambda: str(data_dir)),
+        _twotime_session_identity=lambda: ("", -1),  # no two-time bin shown
     )
     state = XpcsViewer._collect_session_state(saver)
 
@@ -125,6 +126,7 @@ def test_target_files_survive_restart_from_other_cwd(
         geometry=_make_geometry,
         isMaximized=lambda: False,
         work_dir=SimpleNamespace(text=lambda: str(data_dir)),
+        _twotime_session_identity=lambda: ("", -1),  # no two-time bin shown
     )
     XpcsViewer._restore_session(restorer)
 
@@ -168,6 +170,7 @@ def test_relative_data_path_persists_as_absolute(tmp_path, monkeypatch, loadable
         isMaximized=lambda: False,
         tabWidget=_make_tab_widget(),
         work_dir=SimpleNamespace(text=lambda: rel_path),
+        _twotime_session_identity=lambda: ("", -1),  # no two-time bin shown
     )
     state = XpcsViewer._collect_session_state(saver)
 
