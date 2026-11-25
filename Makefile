@@ -516,11 +516,18 @@ ifeq ($(PLATFORM),linux)
 	fi; \
 	echo "System CUDA: $$CUDA_FULL"; \
 	\
-	SM_VERSION=$$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '.'); \
-	SM_DISPLAY=$$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1); \
-	GPU_NAME=$$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1); \
+	# nvidia-smi reports NVML errors on stdout, so gate on its exit status, not its output. \
+	GPU_INFO=$$(nvidia-smi --query-gpu=name,compute_cap --format=csv,noheader 2>&1) || { \
+		echo "$(RED)Error: Could not detect GPU (nvidia-smi failed): $$GPU_INFO$(RESET)"; \
+		echo "A driver/library version mismatch means the NVIDIA driver was updated"; \
+		echo "but the old kernel module is still loaded: reboot, then re-run."; \
+		exit 1; \
+	}; \
+	GPU_NAME=$$(echo "$$GPU_INFO" | head -1 | cut -d, -f1); \
+	SM_DISPLAY=$$(echo "$$GPU_INFO" | head -1 | cut -d, -f2 | tr -d ' '); \
+	SM_VERSION=$$(echo "$$SM_DISPLAY" | tr -d '.'); \
 	if [ -z "$$SM_VERSION" ]; then \
-		echo "$(RED)Error: Could not detect GPU (nvidia-smi failed)$(RESET)"; \
+		echo "$(RED)Error: Could not detect GPU (nvidia-smi returned no devices)$(RESET)"; \
 		exit 1; \
 	fi; \
 	if [ "$$SM_VERSION" -lt $(MIN_SM) ]; then \
@@ -645,4 +652,4 @@ gpu-diagnose:
 	@echo ""
 	@echo "5. GPU hardware:"
 	@nvidia-smi --query-gpu=name,compute_cap,driver_version --format=csv,noheader 2>/dev/null \
-		|| echo "  nvidia-smi not found"
+		|| echo "  nvidia-smi failed or not found"
