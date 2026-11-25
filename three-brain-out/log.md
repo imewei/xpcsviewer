@@ -1,1 +1,0 @@
-[2026-11-24 10:50] route=consensus target=v0.1.11 spec + Stage 4 plan status=ok duration=long outputs=12 summary="Codex 4 rounds, Agy 7 rounds; both READY on final text after fixes to layer history, fit p0, import/average UX, swung q-map, probes."
