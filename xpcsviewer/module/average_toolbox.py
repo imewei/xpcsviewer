@@ -120,6 +120,10 @@ class AverageToolbox(QtCore.QRunnable):
     ):
         if fields is None:
             fields = ["saxs_2d"]
+        if self.is_killed.is_set():
+            # killed while still queued: never open a file
+            self.status = "killed"
+            return
         self.stime = time.strftime("%H:%M:%S")
         self.status = "running"
         self.n_accepted = 0
@@ -313,12 +317,14 @@ class AverageToolbox(QtCore.QRunnable):
                         for key in fields
                     )
                     if shapes_ok:
-                        mask[m] = 1
                         for key in fields:
                             if result[key] is None:
-                                result[key] = file_data[key].copy()
+                                # float64 so an integer-typed first file
+                                # cannot truncate or reject later additions
+                                result[key] = np.array(file_data[key], dtype=np.float64)
                             else:
                                 result[key] += file_data[key]
+                        mask[m] = 1
                     else:
                         logger.info(f"data shape does not match, skipping {fname}")
 
@@ -418,12 +424,15 @@ class AverageToolbox(QtCore.QRunnable):
                                 or result[key].shape == file_result[key].shape
                                 for key in fields
                             ):
-                                mask[m] = 1
                                 for key in fields:
                                     if result[key] is None:
-                                        result[key] = file_result[key].copy()
+                                        result[key] = np.array(
+                                            file_result[key], dtype=np.float64
+                                        )
                                     else:
                                         result[key] += file_result[key]
+                                # counted only after every field was summed
+                                mask[m] = 1
                             else:
                                 logger.info(
                                     "data shape does not match, skipping %s",

@@ -3317,7 +3317,7 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         if worker is None:
             self.statusbar.showMessage("no averaging job exists", 1000)
             return
-        if worker.status != "running":
+        if worker.status not in ("queued", "running"):
             self.statusbar.showMessage("the selected job isn't running", 1000)
             return
         worker.kill()
