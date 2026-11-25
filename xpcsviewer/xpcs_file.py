@@ -18,6 +18,7 @@ import os
 import re
 import uuid
 import warnings
+from typing import ClassVar
 
 # Third-party imports
 import numpy as np
@@ -55,6 +56,7 @@ from .fileIO.hdf_reader_enhanced import get_enhanced_hdf5_reader
 from .fileIO.qmap_utils import Q_UNIT_DISPLAY, get_qmap
 from .module.twotime_utils import get_c2_stream, get_single_c2_from_hdf
 from .utils.exceptions import XPCSFileError, convert_exception
+from .utils.export_guard import ExportGuard
 from .utils.lazy_loader import LazyHDF5Array, get_lazy_loader
 from .utils.log_utils import log_timing
 from .utils.logging_config import get_logger
@@ -1526,10 +1528,26 @@ class XpcsFile:
         q, Iq, xlabel, ylabel = self.norm_saxs_data(q, Iq, norm_method=norm_method)
         return q, Iq, xlabel, ylabel
 
+    def _static_axis(self):
+        """``(name, unit)`` of the file's static-map axis the SAXS q values are on.
+
+        The numbers in ``saxs_1d["q"]``, ``sqlist`` and the Pie profile are
+        stored in this unit (``1/A``, ``1/nm``, ...); they are labelled with it
+        and never converted. Falls back to ``q`` / inverse angstrom only when
+        the file's map carries no axis names or units.
+        """
+        qmap = getattr(self, "qmap", None)  # a bare object may carry no map
+        names = getattr(qmap, "map_names", None)
+        units = getattr(qmap, "map_units", None)
+        name = str(names[0]) if names is not None and len(names) else "q"
+        unit = str(units[0]) if units is not None and len(units) else Q_UNIT_DISPLAY
+        return name, unit
+
     def norm_saxs_data(self, q, Iq, norm_method=None):
         assert norm_method in (None, "q2", "q4", "I0")
+        name, unit = self._static_axis()
         if norm_method is None:
-            return q, Iq, f"q ({Q_UNIT_DISPLAY})", "Intensity"
+            return q, Iq, f"{name} ({unit})", "Intensity"
         ylabel = "Intensity"
         if norm_method == "q2":
             Iq = Iq * np.square(q)
@@ -1548,7 +1566,7 @@ class XpcsFile:
             with np.errstate(invalid="ignore"):
                 Iq = Iq / ref
             ylabel = ylabel + " / I_0"
-        xlabel = f"q ({Q_UNIT_DISPLAY})"
+        xlabel = f"{name} ({unit})"
         return q, Iq, xlabel, ylabel
 
     def get_twotime_qbin_labels(self):
@@ -2631,7 +2649,8 @@ class XpcsFile:
           ``static_index_mapping[k - 1]`` of the row-major
           ``(len(sqlist), len(splist))`` static grid (the layout of
           ``QMap.reshape_phi_analysis``), i.e. q bin ``index // len(splist)``.
-        - ``qlist``: q of each static q bin [1/Angstrom]
+        - ``qlist``: q of each static q bin [the file's static-axis unit, see
+          ``_static_axis``]
         - ``mask``: detector mask (> 0 is a valid pixel)
         """
         maps = self.qmap.qmap
@@ -2677,24 +2696,61 @@ class XpcsFile:
             count += np.bincount(idx, minlength=nbins + 1)[1:]
         return np.divide(total, count, out=np.full(nbins, np.nan), where=count > 0)
 
-    @staticmethod
-    def _pixels_in_polygon(polygon, shape, origin=(0.0, 0.0), rotation=0.0):
+    # The frame a ROI is DRAWN in. ``ImageItem`` draws pixel (row, col) over the
+    # square [col, col+1] x [row, row+1] of its own coordinates, so that pixel's
+    # centre is (col + 0.5, row + 0.5) there, and a ROI added to the same view
+    # lives in the image item's PARENT frame, reached through the item's
+    # transform. ``ImageViewDev.get_roi_list`` reads that mapping from the real
+    # item and puts it in each descriptor as ``pixel_frame``; this default is the
+    # frame of an unmodified item (identity transform), used only for a
+    # descriptor that carries none. ``origin`` is where pixel (0, 0)'s centre is,
+    # ``col_step`` / ``row_step`` are the displacements for one more column / row.
+    #
+    # Calibration (``QMap.compute_qmap``) puts pixel i at offset ``i - bcx``, i.e.
+    # the beam centre is in a pixel-INDEX frame where pixel i's centre is i. The
+    # display frame differs from that by a constant half pixel. Nothing in the
+    # file says whether the stored ``bcx`` / ``bcy`` follow the index convention
+    # (centre of pixel 0 at 0) or the display convention (corner of pixel 0 at
+    # 0), so the export does not guess: it selects what is drawn, and the Q of
+    # each selected pixel is the file's own ``sqmap`` bin.
+    _DISPLAY_PIXEL_FRAME: ClassVar[dict[str, tuple[float, float]]] = {
+        "origin": (0.5, 0.5),
+        "col_step": (1.0, 0.0),
+        "row_step": (0.0, 1.0),
+    }
+
+    @classmethod
+    def _pixel_centres(cls, shape, pixel_frame=None):
+        """``(x, y)`` arrays of shape ``shape``: each pixel centre in the ROI frame."""
+        frame = pixel_frame or cls._DISPLAY_PIXEL_FRAME
+        rows, cols = np.indices(shape)
+        (ox, oy), (cx, cy), (rx, ry) = (
+            frame["origin"],
+            frame["col_step"],
+            frame["row_step"],
+        )
+        return ox + cols * cx + rows * rx, oy + cols * cy + rows * ry
+
+    @classmethod
+    def _pixels_in_polygon(
+        cls, polygon, shape, origin=(0.0, 0.0), rotation=0.0, pixel_frame=None
+    ):
         """Boolean ``shape = (rows, cols)`` mask of the pixels inside a polygon.
 
         ``polygon`` is ``[(x, y), ...]`` in a local frame that sits at ``origin``
-        in the image frame and is rotated by ``rotation`` [degree], exactly as a
-        ``pg.ROI``: ``image = origin + R(rotation) @ local`` with
-        ``R = [[cos, -sin], [sin, cos]]``. The image frame is x = column,
-        y = row [pixel]; pixel (row, col) sits at (col, row), as in
-        ``QMap.r_pixel``. Each pixel is moved into the local frame and tested
-        with the even-odd rule and scan-conversion convention of
-        ``QPainterPath.contains`` (a ray towards -x; an edge counts for
-        ``y1 <= y < y2``; crossings at ``x <= px``; horizontal edges ignored), so
-        a pixel exactly on an edge is decided as Qt decides it for the drawn
+        in the view frame and is rotated by ``rotation`` [degree], exactly as a
+        ``pg.ROI``: ``view = origin + R(rotation) @ local`` with
+        ``R = [[cos, -sin], [sin, cos]]``. A pixel belongs to the polygon iff its
+        CENTRE, placed in the view frame by ``pixel_frame`` (see
+        ``_DISPLAY_PIXEL_FRAME``), is inside it. Each centre is moved into the
+        local frame and tested with the even-odd rule and scan-conversion
+        convention of ``QPainterPath.contains`` (a ray towards -x; an edge counts
+        for ``y1 <= y < y2``; crossings at ``x <= px``; horizontal edges ignored),
+        so a centre exactly on an edge is decided as Qt decides it for the drawn
         shape. (Qt's rotation is exact for multiples of 90 degrees; so is this.)
         """
         pts = np.asarray(polygon, dtype=float)
-        rows, cols = np.indices(shape)
+        centre_x, centre_y = cls._pixel_centres(shape, pixel_frame)
         turn = float(rotation) % 360.0
         exact = {
             0.0: (1.0, 0.0),
@@ -2706,7 +2762,7 @@ class XpcsFile:
             np.cos(np.radians(turn)),
             np.sin(np.radians(turn)),
         )
-        dx, dy = cols - origin[0], rows - origin[1]
+        dx, dy = centre_x - origin[0], centre_y - origin[1]
         px, py = dx * cos + dy * sin, -dx * sin + dy * cos  # R(-rotation) @ (dx, dy)
         winding = np.zeros(shape, dtype=np.int32)
         for (x1, y1), (x2, y2) in zip(pts, np.roll(pts, -1, axis=0), strict=True):
@@ -2744,6 +2800,7 @@ class XpcsFile:
                 qbin.shape,
                 roi_parameter.get("origin", (0.0, 0.0)),
                 roi_parameter.get("rotation", 0.0),
+                roi_parameter.get("pixel_frame"),
             )
             y = self._binned_mean(
                 np.where(inside & (mask > 0), qbin, 0).ravel(), saxs, len(qlist), chunk
@@ -2752,7 +2809,16 @@ class XpcsFile:
 
         if sl_type == "Pie":
             # Legacy descriptor without the drawn polygon: an angular wedge about
-            # the beam centre cut at `dist`.
+            # the beam centre cut at `dist`. The cut-off below is a q in inverse
+            # angstrom, so it can only be compared with a static axis in that
+            # unit; no GUI path produces this descriptor any more.
+            _, unit = self._static_axis()
+            if unit != Q_UNIT_DISPLAY:
+                raise ValueError(
+                    f"{self.fname}: a Pie ROI without its drawn polygon is cut at a "
+                    f"q in {Q_UNIT_DISPLAY}, but this file's static q axis is in "
+                    f"{unit}; draw the Pie ROI in the viewer instead"
+                )
             # `angle_range` [degree] is in the frame of PieROI.get_parameter:
             # the direction (column, row) of the pixel from the beam centre,
             # theta = atan2(row, column), measured from 6 o'clock, theta - 90.
@@ -2778,13 +2844,24 @@ class XpcsFile:
 
         rmin, rmax = sorted(roi_parameter["radius"])  # pixels
         if roi_parameter.get("center") is not None:
-            # Annulus about the CENTRE THAT WAS DRAWN (x = column, y = row,
-            # pixel-index frame), not necessarily this file's beam centre; r and
-            # phi follow QMap.compute_qmap: phi = -atan2(row - cy, col - cx).
+            # Annulus about the CENTRE THAT WAS DRAWN, in the frame it was drawn
+            # in (view x = column direction, y = row direction), tested at each
+            # pixel's centre in that frame (see _DISPLAY_PIXEL_FRAME). It is not
+            # necessarily this file's beam centre; phi follows QMap.compute_qmap:
+            # phi = -atan2(y - cy, x - cx).
             cx, cy = roi_parameter["center"]
+            frame = roi_parameter.get("pixel_frame") or self._DISPLAY_PIXEL_FRAME
+            px, py = self._pixel_centres(r_pixel.shape, frame)
+            r_pixel = np.hypot(px - cx, py - cy)
+            # phi is the azimuth in the DETECTOR frame (QMap phi), so the drawn
+            # centre goes back to (column, row) through the display mapping: a
+            # rotated display must not rotate phi.
+            steps = np.array([frame["col_step"], frame["row_step"]], dtype=float).T
+            col0, row0 = np.linalg.solve(
+                steps, np.array([cx, cy]) - np.asarray(frame["origin"], dtype=float)
+            )
             rows, cols = np.indices(r_pixel.shape)
-            r_pixel = np.hypot(cols - cx, rows - cy)
-            phi = np.mod(-np.degrees(np.arctan2(rows - cy, cols - cx)), 360.0)
+            phi = np.mod(-np.degrees(np.arctan2(rows - row0, cols - col0)), 360.0)
         annulus = (r_pixel >= rmin) & (r_pixel < rmax) & (mask > 0)
         if not annulus.any():
             logger.warning(f"Ring ROI radius {(rmin, rmax)} contains no pixels")
@@ -2799,11 +2876,14 @@ class XpcsFile:
         return x, self._binned_mean(index, saxs, phi_num, chunk)
 
     def get_roi_data(self, roi_parameter, phi_num=180):
-        """Profile of a Pie ROI (I vs q [1/Angstrom]) or Ring ROI (I vs phi [degree]).
+        """Profile of a Pie ROI (I vs q) or Ring ROI (I vs phi [degree]).
 
-        ``roi_parameter`` is a ROI descriptor from ``ImageViewDev.get_roi_list``:
-        Pie ``{"sl_type", "angle_range" [degree], "dist" [pixel]}`` and Ring
-        ``{"sl_type", "radius" [pixel]}``. Returns None for other ROI types.
+        q is in the file's static-axis unit (``_static_axis``). ``roi_parameter``
+        is a ROI descriptor from ``ImageViewDev.get_roi_list``: Pie
+        ``{"sl_type", "polygon", "origin", "rotation", "pixel_frame", ...}`` and
+        Ring ``{"sl_type", "radius", "center", "pixel_frame"}`` (the drawn region
+        and the image item's pixel-centre frame, see ``_DISPLAY_PIXEL_FRAME``).
+        Returns None for other ROI types.
         """
         memory_before_mb, _ = MemoryMonitor.get_memory_usage()
 
@@ -2843,15 +2923,30 @@ class XpcsFile:
         chunk = max(1, min(1_000_000, np.asarray(self.saxs_2d).size // 10))
         return self._roi_profile(roi_parameter, phi_num, chunk)
 
-    def export_saxs1d(self, roi_list, folder, basename=None):
+    def _q_header_label(self):
+        """``name(unit)`` of the static axis, ASCII only (``np.savetxt`` header)."""
+        name, unit = self._static_axis()
+        ascii_units = {Q_UNIT_DISPLAY: "1/Angstrom", "nm⁻¹": "1/nm"}
+        unit = ascii_units.get(unit) or unit.encode("ascii", "replace").decode()
+        return f"{name}({unit.replace(' ', '_')})"
+
+    def export_saxs1d(
+        self, roi_list, folder, basename=None, guard: ExportGuard | None = None
+    ):
         """Write ROI profiles and the full SAXS 1D curves into ``folder``.
 
         ``basename`` prefixes every output name. ViewerKernel passes a stem that
         is unique across the whole export; the default is the source file's own
-        name (display labels are not unique).
+        name (display labels are not unique). Every destination is claimed on
+        ``guard`` before it is written: the kernel passes one guard per export
+        run; without one, this file is the only protected input.
         """
+        if guard is None:
+            guard = ExportGuard([self.fname])
+        source = str(self.fname)
         if basename is None:
-            basename = os.path.splitext(os.path.basename(str(self.fname)))[0]
+            basename = os.path.splitext(os.path.basename(source))[0]
+        q_label = self._q_header_label()
         # export ROI
         for idx, roi in enumerate(roi_list):
             profile = self.get_roi_data(roi)
@@ -2864,15 +2959,17 @@ class XpcsFile:
             if roi["sl_type"] == "Ring":
                 header = "phi(degree) Intensity"
             else:
-                header = "q(1/Angstrom) Intensity"
+                header = f"{q_label} Intensity"
+            guard.claim(fname, source=source)
             np.savetxt(fname, np.vstack(profile).T, header=header)
 
         # export all saxs1d
         fname = os.path.join(folder, basename + "_" + "saxs1d.txt")
         Iq, q = self.saxs_1d["Iq"], self.saxs_1d["q"]
-        header = "q(1/Angstrom) Intensity"
+        header = f"{q_label} Intensity"
         for n in range(Iq.shape[0] - 1):
             header += f" Intensity_phi{n + 1:03d}"
+        guard.claim(fname, source=source)
         np.savetxt(fname, np.vstack([q, Iq]).T, header=header)
 
     def get_pg_tree(self):

@@ -11,6 +11,9 @@ and the Diffusion tab.  Contains:
 from __future__ import annotations
 
 import logging
+import os
+from collections.abc import Callable, Hashable
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -34,6 +37,7 @@ from xpcsviewer.gui.qt_compat import (
     QVBoxLayout,
     QWidget,
 )
+from xpcsviewer.utils.export_guard import ExportCollisionError, ExportGuard
 
 if TYPE_CHECKING:
     from xpcsviewer.fitting.results import FitDiagnostics, FitResult
@@ -42,6 +46,30 @@ logger = logging.getLogger(__name__)
 
 # NOTE: Do not call matplotlib.use() here — backend is managed by
 # plothandler/matplot_qt.py or the application entry point.
+
+
+# ---------------------------------------------------------------------------
+# What a window shows
+# ---------------------------------------------------------------------------
+
+_ANY: Any = object()  # "any bin" for BayesianDiagnosisWindow.shows
+
+
+@dataclass(frozen=True, eq=False)
+class DiagnosisIdentity:
+    """The identity of what a diagnosis window shows.
+
+    ``path`` / ``revision``: the data file and its on-disk revision the
+    posterior was fitted from; ``bin_id``: absolute bin ID (``None`` for a
+    diffusion fit); ``bundle``: the posterior with the observations it was
+    fitted to.  Invalidation and navigation ask the window about this identity,
+    never a store that may hold a newer object by now.
+    """
+
+    path: str | None
+    revision: tuple[int, ...] | None
+    bin_id: Hashable | None
+    bundle: Any = None
 
 
 # ---------------------------------------------------------------------------
@@ -61,6 +89,9 @@ class ConvergenceSummaryWidget(QWidget):
         self._label.setTextFormat(Qt.TextFormat.RichText)
         self._label.setText("<i>No results yet</i>")
         layout.addWidget(self._label)
+
+    def clear(self) -> None:
+        self._label.setText("<i>No results yet</i>")
 
     def update_diagnostics(self, diag: FitDiagnostics) -> None:
         """Refresh the summary from a ``FitDiagnostics`` instance."""
@@ -98,8 +129,18 @@ class ConvergenceSummaryWidget(QWidget):
             rows.append(
                 f"<b>BFMI:</b> <span style='color:{bfmi_color};'>{diag.bfmi:.3f}</span>"
             )
+        else:
+            # A missing BFMI fails convergence; say so rather than hide the row.
+            rows.append(
+                "<b>BFMI:</b> <span style='color:red;'>unavailable "
+                "(fit not converged)</span>"
+            )
 
         self._label.setText("<br>".join(rows))
+
+
+def _norm(path: str | None) -> str | None:
+    return None if path is None else os.path.normpath(path)
 
 
 # ---------------------------------------------------------------------------
@@ -221,10 +262,68 @@ class BayesianDiagnosisWindow(QMainWindow):
         self._y_data: np.ndarray | None = None
         self._yerr: np.ndarray | None = None
         self._q_value: float | None = None
+        self._identity: DiagnosisIdentity | None = None
+        self._set_exports_enabled(False)
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    @property
+    def identity(self) -> DiagnosisIdentity | None:
+        """What the window shows now; ``None`` when it is empty."""
+        return self._identity
+
+    def shows(
+        self,
+        path: str | None,
+        revision: tuple[int, ...] | None,
+        bin_id: Hashable | None = _ANY,
+    ) -> bool:
+        """True if the window shows a posterior of ``path`` at ``revision``
+        (and, when given, of absolute bin ``bin_id``)."""
+        ident = self._identity
+        if ident is None or self._result is None:
+            return False
+        if _norm(ident.path) != _norm(path) or ident.revision != revision:
+            return False
+        return bin_id is _ANY or ident.bin_id == bin_id
+
+    def matches(self, predicate: Callable[[str | None, tuple | None], bool]) -> bool:
+        """True if the window shows something whose ``(path, revision)``
+        satisfies ``predicate``."""
+        ident = self._identity
+        return (
+            ident is not None
+            and self._result is not None
+            and bool(predicate(ident.path, ident.revision))
+        )
+
+    def clear(self, title: str = "Bayesian Diagnosis") -> None:
+        """Explicit empty state: drop the result, empty every canvas, disable
+        the exports and retitle (nothing of the old posterior stays visible)."""
+        self._identity = None
+        self._result = None
+        self._model_func = None
+        self._x_data = self._y_data = self._yerr = None
+        self._q_value = None
+        self._pp_canvas.figure.clear()
+        self._pp_canvas.draw()
+        for canvas in self._arviz_canvases.values():
+            canvas.figure.clear()
+            canvas.draw()
+        self._summary.clear()
+        self._set_exports_enabled(False)
+        self.setWindowTitle(title)
+
+    def _set_exports_enabled(self, enabled: bool) -> None:
+        for button in (
+            self._btn_export_fit_plot,
+            self._btn_export_fit_data,
+            self._btn_export_diag_plots,
+            self._btn_export_traces,
+        ):
+            button.setEnabled(enabled)
 
     def set_axis_labels(self, xlabel: str, ylabel: str) -> None:
         """Set axis labels for the posterior predictive plot."""
@@ -240,6 +339,8 @@ class BayesianDiagnosisWindow(QMainWindow):
         yerr: Any | None = None,
         q_value: float | None = None,
         title: str | None = None,
+        *,
+        identity: DiagnosisIdentity,
     ) -> None:
         """Refresh all panels with new fit results.
 
@@ -257,10 +358,15 @@ class BayesianDiagnosisWindow(QMainWindow):
             Q value for display in the title.
         title : str, optional
             Window title override.
+        identity : DiagnosisIdentity
+            What the result belongs to (file, revision, bin, bundle); the
+            window answers :meth:`shows` / :meth:`matches` from it.
         """
         if title is not None:
             self.setWindowTitle(title)
 
+        self._identity = identity
+        self._set_exports_enabled(True)
         self._result = result
         self._model_func = model_func
         self._x_data = np.asarray(x_data)
@@ -399,8 +505,25 @@ class BayesianDiagnosisWindow(QMainWindow):
     # Export handlers
     # ------------------------------------------------------------------
 
+    def _new_guard(self) -> ExportGuard:
+        """One guard per export action; the source data file is an input."""
+        ident = self._identity
+        return ExportGuard([ident.path] if ident is not None and ident.path else [])
+
+    def _claim(self, guard: ExportGuard, path: Any, what: str) -> bool:
+        """Claim ``path``; a refusal is logged and shown, nothing is written."""
+        try:
+            guard.claim(path, what)
+        except ExportCollisionError as exc:
+            logger.error("Export refused: %s", exc)
+            self.statusBar().showMessage(f"Export refused: {exc}", 10000)
+            return False
+        return True
+
     def _export_fit_plot(self) -> None:
         """Save the Fit + 95% CI plot to file."""
+        if self._result is None:
+            return
         path, _ = QFileDialog.getSaveFileName(
             self,
             "Export Fit Plot",
@@ -408,6 +531,8 @@ class BayesianDiagnosisWindow(QMainWindow):
             "PNG (*.png);;PDF (*.pdf);;SVG (*.svg)",
         )
         if not path:
+            return
+        if not self._claim(self._new_guard(), path, "fit plot"):
             return
         fig = self._pp_canvas.figure
         note = None
@@ -439,6 +564,8 @@ class BayesianDiagnosisWindow(QMainWindow):
             "CSV (*.csv)",
         )
         if not path:
+            return
+        if not self._claim(self._new_guard(), path, "fit data"):
             return
         import csv
         from pathlib import Path
@@ -497,17 +624,22 @@ class BayesianDiagnosisWindow(QMainWindow):
         """Save all 6 diagnostic plots as individual files."""
         from pathlib import Path
 
+        if self._result is None:
+            return
         dir_path = QFileDialog.getExistingDirectory(self, "Select Export Directory")
         if not dir_path:
             return
         out = Path(dir_path)
+        guard = self._new_guard()
+        written = 0
         for name, canvas in self._arviz_canvases.items():
             fig = canvas.figure
             filepath = out / f"mcmc_{name}.png"
+            if not self._claim(guard, filepath, f"{name} plot"):
+                continue
             fig.savefig(str(filepath), dpi=300, bbox_inches="tight")
-        logger.info(
-            "Exported %d diagnostic plots to %s", len(self._arviz_canvases), out
-        )
+            written += 1
+        logger.info("Exported %d diagnostic plots to %s", written, out)
 
     def _export_traces(self) -> None:
         """Save ArviZ DataTree as netCDF."""
@@ -520,6 +652,8 @@ class BayesianDiagnosisWindow(QMainWindow):
             "netCDF (*.nc)",
         )
         if not path:
+            return
+        if not self._claim(self._new_guard(), path, "traces"):
             return
         try:
             self._result.arviz_data.to_netcdf(path)

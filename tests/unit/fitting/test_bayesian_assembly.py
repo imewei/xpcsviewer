@@ -12,7 +12,7 @@ from xpcsviewer.fitting.bayesian_assembly import (
     _extract_single_exp_params,
     assemble_fit_summary,
 )
-from xpcsviewer.fitting.results import FitResult
+from xpcsviewer.fitting.results import FitDiagnostics, FitResult
 
 
 def _make_fit_result(params: dict[str, float], n_samples: int = 100) -> FitResult:
@@ -22,7 +22,8 @@ def _make_fit_result(params: dict[str, float], n_samples: int = 100) -> FitResul
         name: np.full(n_samples, val) + rng.normal(0, abs(val) * 0.01, n_samples)
         for name, val in params.items()
     }
-    return FitResult(samples=samples)
+    # a computed BFMI: default diagnostics (bfmi=None) no longer count as converged
+    return FitResult(samples=samples, diagnostics=FitDiagnostics(bfmi=0.9))
 
 
 def _identity_model(x, tau, baseline, contrast):

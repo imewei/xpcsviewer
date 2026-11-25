@@ -240,7 +240,8 @@ def test_r3_14_open_diagnosis_follows_physical_bin_without_reextracting():
     st.sb_g2_bayesian_qidx.value.return_value = 2
     st._on_g2_qbin_changed(2)  # another bin: no fit, nothing from bin 1
     st._update_g2_diagnosis.assert_not_called()
-    assert "no fit yet" in win.setWindowTitle.call_args[0][0]
+    # round 5: the window is cleared (not just retitled)
+    assert "no fit yet" in win.clear.call_args[0][0]
 
 
 # ---------------------------------------------------------------------------

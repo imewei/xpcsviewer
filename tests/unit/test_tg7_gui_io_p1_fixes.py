@@ -320,11 +320,15 @@ class TestEnsureNumpyAtPyQtGraphBoundaries:
 
         import inspect
 
-        # Check apply_saxs_2d_result for the pg_saxs.setImage boundary (BUG-027)
-        source = inspect.getsource(XpcsViewer.apply_saxs_2d_result)
+        # The pg_saxs.setImage boundary (BUG-027) is the one SAXS-2D draw
+        # function; apply_saxs_2d_result must go through it, not around it.
+        from xpcsviewer.module import saxs2d
+
+        assert "saxs2d.draw" in inspect.getsource(XpcsViewer.apply_saxs_2d_result)
+        source = inspect.getsource(saxs2d.draw)
         assert "ensure_numpy" in source, (
-            "apply_saxs_2d_result must wrap image_data with ensure_numpy() "
-            "before calling pg_saxs.setImage() (BUG-027)"
+            "saxs2d.draw must wrap the image with ensure_numpy() "
+            "before calling setImage() (BUG-027)"
         )
 
     def test_qmap_boundary_in_xpcs_viewer_uses_ensure_numpy(self):

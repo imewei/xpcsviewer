@@ -14,6 +14,8 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
+from xpcsviewer.utils.export_guard import ExportGuard
+
 if TYPE_CHECKING:
     from matplotlib.figure import Figure
     from numpy.typing import NDArray
@@ -159,6 +161,9 @@ def export_bayesian_csv(
     *,
     failed_mask: NDArray | None = None,
     nonconverged_mask: NDArray | None = None,
+    bin_ids: Any = None,
+    bin_phi: Any = None,
+    guard: ExportGuard | None = None,
 ) -> None:
     """Export Bayesian fit parameters to CSV.
 
@@ -179,9 +184,18 @@ def export_bayesian_csv(
         Subset of ``failed_mask`` that sampled but did not pass the
         convergence diagnostics; written as ``not_converged`` instead of
         ``failed``.
+    bin_ids, bin_phi : sequence or None
+        Absolute bin ID and numeric azimuth (the map's angle unit) of each
+        row. Two bins can share a radial Q, so they are appended as
+        ``bin_id`` / ``phi`` columns after the existing ones (an empty
+        ``phi`` cell: the map has no azimuth for that bin).
+    guard : ExportGuard or None
+        The export action's write gate; ``path`` is claimed through it before
+        anything is written (raises ``ExportCollisionError``).
     """
     cols = _SINGLE_COLS if fit_func_name == "single" else _DOUBLE_COLS
     path = Path(path)
+    (guard if guard is not None else ExportGuard()).claim(path, "Bayesian CSV")
 
     with path.open("w", newline="") as f:
         writer = csv.writer(f)
@@ -190,6 +204,10 @@ def export_bayesian_csv(
             header.extend([f"{col}_mean", f"{col}_std"])
         if failed_mask is not None:
             header.append("status")
+        if bin_ids is not None:
+            header.append("bin_id")
+        if bin_phi is not None:
+            header.append("phi")
         writer.writerow(header)
 
         for qi in range(len(q_val)):
@@ -204,16 +222,53 @@ def export_bayesian_csv(
                     row.append("not_converged")
                 else:
                     row.append("failed")
+            if bin_ids is not None:
+                row.append(str(int(bin_ids[qi])))
+            if bin_phi is not None:
+                phi = float(bin_phi[qi])
+                row.append(f"{phi:.6g}" if np.isfinite(phi) else "")
             writer.writerow(row)
 
     logger.info("Exported Bayesian parameters to %s", path)
 
 
+def _tagged(idata: Any, attrs: dict[str, Any]) -> Any:
+    """A copy of ``idata`` whose root attributes carry ``attrs`` (the caller's
+    FitResult is not modified)."""
+    try:
+        tagged = idata.copy()
+        tagged.attrs.update(attrs)
+    except AttributeError:  # shortcut: object without copy()/attrs (test doubles)
+        return idata
+    return tagged
+
+
+def _is_unmeasured(fr: Any, q_idx: int, mask: NDArray | None) -> bool:
+    """True if bin ``q_idx`` is not a measurement: the summary's mask says so
+    or, without a mask, the result's own diagnostics did not converge."""
+    if mask is not None:
+        return q_idx >= mask.size or bool(mask[q_idx])
+    diag = getattr(fr, "diagnostics", None)
+    return diag is not None and not diag.converged
+
+
+def _is_assessed_ok(fr: Any, mask: NDArray | None) -> bool:
+    diag = getattr(fr, "diagnostics", None)
+    return mask is not None or (diag is not None and diag.converged)
+
+
 def export_bayesian_diagnostics(
     path: Path | str,
     bayesian_results: dict[int, Any],
+    *,
+    failed_mask: NDArray | None = None,
+    bin_ids: Any = None,
+    q_val: Any = None,
+    bin_phi: Any = None,
+    source: str | None = None,
+    guard: ExportGuard | None = None,
 ) -> list[Path]:
-    """Export ArviZ DataTree to netCDF for all Q-bins.
+    """Export ArviZ DataTree to netCDF for the measured Q-bins.
 
     The grouped netCDF4 write needs the optional ``netCDF4`` or ``h5netcdf``
     package (neither is a declared dependency). Without one the format is
@@ -225,7 +280,20 @@ def export_bayesian_diagnostics(
     path : Path
         Output netCDF file path.
     bayesian_results : dict[int, FitResult]
-        Per-Q FitResult objects with arviz_data attribute.
+        Per-Q FitResult objects with arviz_data attribute, keyed by the
+        column index of the summary they belong to.
+    failed_mask : ndarray or None
+        The summary's ``failed_mask`` (True = not a measurement). Bins it marks
+        (or that lie beyond it) are not written: failed and non-converged
+        posteriors stay available in the diagnosis views only. Without a mask a
+        result whose own diagnostics did not converge is skipped the same way.
+    bin_ids, q_val, bin_phi, source : optional
+        Identity of each written bin, recorded as root attributes of its file
+        together with ``bin_status`` (``ok``; ``unassessed`` without a mask)
+        and ``q_index``.
+    guard : ExportGuard or None
+        The export action's write gate; every file is claimed before the
+        first is written.
 
     Returns
     -------
@@ -249,20 +317,49 @@ def export_bayesian_diagnostics(
         )
         return []
 
+    mask = None if failed_mask is None else np.asarray(failed_mask, dtype=bool)
     datasets = {}
+    assessed: dict[int, bool] = {}
+    skipped = 0
     for q_idx, fr in sorted(bayesian_results.items()):
-        if fr is not None and hasattr(fr, "arviz_data") and fr.arviz_data is not None:
-            datasets[q_idx] = fr.arviz_data
+        if fr is None or getattr(fr, "arviz_data", None) is None:
+            continue
+        if _is_unmeasured(fr, q_idx, mask):
+            skipped += 1
+            continue
+        datasets[q_idx] = fr.arviz_data
+        assessed[q_idx] = _is_assessed_ok(fr, mask)
+    if skipped:
+        logger.info("netCDF export: skipped %d failed/non-converged Q-bins", skipped)
 
     if not datasets:
         logger.warning("No ArviZ data available for export")
         return []
 
-    # Write one netCDF file per Q-bin to preserve all diagnostics
-    written: list[Path] = []
+    # One netCDF file per Q-bin to preserve all diagnostics; claim them all
+    # before the first write so a refusal leaves no partial set.
+    guard = guard if guard is not None else ExportGuard()
+    plan = []
     for q_idx, idata in sorted(datasets.items()):
         q_path = path.with_stem(f"{path.stem}_q{q_idx:03d}")
-        idata.to_netcdf(str(q_path))
+        guard.claim(q_path, "Bayesian diagnostics netCDF")
+        attrs: dict[str, Any] = {
+            "bin_status": "ok" if assessed[q_idx] else "unassessed",
+            "q_index": int(q_idx),
+        }
+        if bin_ids is not None and q_idx < len(bin_ids):
+            attrs["bin_id"] = int(bin_ids[q_idx])
+        if q_val is not None and q_idx < len(q_val):
+            attrs["q_value"] = float(q_val[q_idx])
+        if bin_phi is not None and q_idx < len(bin_phi) and np.isfinite(bin_phi[q_idx]):
+            attrs["phi"] = float(bin_phi[q_idx])
+        if source:
+            attrs["source_file"] = str(source)
+        plan.append((q_path, _tagged(idata, attrs)))
+
+    written: list[Path] = []
+    for q_path, tagged in plan:
+        tagged.to_netcdf(str(q_path))
         written.append(q_path)
 
     logger.info(

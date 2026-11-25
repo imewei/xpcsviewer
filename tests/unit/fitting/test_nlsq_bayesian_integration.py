@@ -318,7 +318,12 @@ class TestBugH_ExtractionDataSource:
         np.testing.assert_array_equal(tau, fit_val[:, 0, 1])
 
     def test_extract_source_in_xpcs_viewer(self):
-        """Source inspection: _extract_diffusion_for_bayesian must check tauq_q."""
+        """Source inspection: the rows come from ``_tauq_rows`` with the GUI Q range.
+
+        Round 5 (R5-14): the cached ``tauq_q`` of an earlier deterministic fit
+        must NOT be reused (it may be clipped by another Q range); the
+        deterministic fit's own row selection is applied to the current range.
+        """
         from pathlib import Path
 
         viewer_path = (
@@ -330,8 +335,8 @@ class TestBugH_ExtractionDataSource:
         method_start = source.find("def _extract_diffusion_for_bayesian")
         assert method_start != -1, "_extract_diffusion_for_bayesian not found"
 
-        # Check it references tauq_q for the preference check
-        method_body = source[method_start : method_start + 2000]
-        assert '"tauq_q" in fit_summary' in method_body, (
-            "_extract_diffusion_for_bayesian must check for tauq_q in fit_summary"
+        method_body = source[method_start : method_start + 3000]
+        assert "_tauq_rows(" in method_body
+        assert '"tauq_q" in fit_summary' not in method_body, (
+            "_extract_diffusion_for_bayesian must not reuse cached tauq_q rows"
         )

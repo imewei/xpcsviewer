@@ -17,6 +17,8 @@ import pyqtgraph as pg
 from .backends import ensure_numpy
 from .constants import MEMORY_CLEANUP_TIMEOUT_S
 from .file_locator import FileLocator
+from .fileIO.hdf_reader import _file_identity
+from .utils.export_guard import ExportCollisionError, ExportGuard
 from .utils.log_utils import log_timing
 from .utils.logging_config import get_logger
 from .xpcs_file import MemoryMonitor, XpcsFile
@@ -78,6 +80,93 @@ _DIFFUSION_PROVENANCE = {
         "covariance, NOT credible intervals (no posterior of a, b is sampled).",
     ),
 }
+
+
+def _g2_bin_identities(xf, n_columns: int) -> list[tuple] | None:
+    """``(dynamic_bin_id, map_index, q, phi)`` of each G2 column of ``xf``.
+
+    Column ``j`` of ``xf.get_g2_data()`` is bin ``result[j]``: the dynamic bin ID
+    is the bin's own G2 column in the file, ``map_index`` its absolute position
+    on the file's q x phi map (``dynamic_index_mapping``), and ``q`` / ``phi`` the
+    numbers in the file's own arrays at full precision (``phi`` is None when the
+    map has no azimuth axis). Mirrors ``cli.twotime_batch._bin_coords``, which
+    cannot be imported here (it selects the matplotlib backend on import).
+    ``None`` when the file's map cannot be resolved, so the export falls back to
+    the plain Q labels.
+    """
+    from .fitting.bayesian_assembly import resolve_g2_bins
+
+    try:
+        qmap = xf.qmap
+        mapping = np.asarray(qmap.dynamic_index_mapping)
+        names = list(qmap.map_names)
+        has_phi = int(qmap.dynamic_num_pts[1]) != 1 and names[1] == "phi"
+        dp = np.asarray(qmap.dplist, dtype=np.float64)
+        rows = []
+        for bin_id, q, _label in resolve_g2_bins(xf, None):
+            absolute = int(mapping[bin_id])
+            phi = float(dp[absolute % len(dp)]) if has_phi else None
+            rows.append((bin_id, absolute, float(q), phi))
+    except AttributeError:  # not a loaded file (no map): plain Q labels
+        logger.debug("G2 export: no q-map on %s, bin identity omitted", xf)
+        return None
+    except (IndexError, ValueError, TypeError) as exc:
+        logger.warning(f"G2 export: bin identity unavailable for {xf.label}: {exc}")
+        return None
+    if len(rows) != n_columns:
+        logger.warning(
+            f"G2 export: {len(rows)} map bins for {n_columns} G2 columns of "
+            f"{xf.label}; bin identity omitted"
+        )
+        return None
+    return rows
+
+
+def _fit_bin_identities(fit_summary: dict, fit_q, columns: list[tuple] | None):
+    """Identity of each fitted row, from the fit's own ``bin_ids`` (Bayesian) or
+    by matching the fitted Q values in order against the file's bins.
+
+    A fit selects whole Q groups (every sector at a fitted Q), so the fitted Qs
+    are an ordered subsequence of the file's Qs and the match is exact.
+    """
+    if columns is None:
+        return None
+    ids = fit_summary.get("bin_ids")
+    if ids is not None:
+        by_id = {c[0]: c for c in columns}
+        found = [by_id.get(int(i)) for i in np.ravel(ids)[: len(fit_q)]]
+        return found if all(f is not None for f in found) else None
+    out, pos = [], 0
+    for q in fit_q:
+        while pos < len(columns) and columns[pos][2] != float(q):
+            pos += 1
+        if pos == len(columns):
+            return None
+        out.append(columns[pos])
+        pos += 1
+    return out
+
+
+def _phi_text(phi) -> str:
+    return "NA" if phi is None else repr(float(phi))
+
+
+def _bin_tag(ident: tuple | None) -> str:
+    """Suffix of a column name: the bin's absolute identity (empty if unknown)."""
+    if ident is None:
+        return ""
+    bin_id, absolute, q, phi = ident
+    return f"[bin={bin_id},map={absolute},q={float(q)!r},phi={_phi_text(phi)}]"
+
+
+def _bin_row_comment(row: int, ident: tuple | None) -> str:
+    if ident is None:
+        return f"# row {row}: bin identity unavailable\n"
+    bin_id, absolute, q, phi = ident
+    return (
+        f"# row {row}: dynamic_bin_id={bin_id} map_index={absolute} "
+        f"q={float(q)!r} phi={_phi_text(phi)}\n"
+    )
 
 
 @contextlib.contextmanager
@@ -167,6 +256,8 @@ class ViewerKernel(FileLocator):
         super().__init__(path)
         self.statusbar = statusbar
         self.meta: dict[str, Any] = {}
+        # True when the last build() (Reload) re-read or dropped the SAXS background
+        self.background_replaced = False
         self.reset_meta()
         self.path = path
         # Plotting and analysis state
@@ -207,6 +298,10 @@ class ViewerKernel(FileLocator):
             # saxs 1d:
             "saxs1d_bkg_fname": None,
             "saxs1d_bkg_xf": None,
+            # full path and the on-disk revision (``_file_identity``) the loaded
+            # background was read from
+            "saxs1d_bkg_path": None,
+            "saxs1d_bkg_revision": None,
             # avg
             "avg_file_list": None,
             "avg_intt_minmax": None,
@@ -327,9 +422,69 @@ class ViewerKernel(FileLocator):
         The background file should have compatible Q-range and data
         structure with the analysis files for proper subtraction.
         """
-        base_fname = os.path.basename(fname)
-        self.meta["saxs1d_bkg_fname"] = base_fname
-        self.meta["saxs1d_bkg_xf"] = XpcsFile(fname)
+        path = os.path.abspath(fname)
+        revision = _file_identity(path)  # before the read, like the locator
+        xf = XpcsFile(path, qmap_manager=self.qmap_manager)
+        self.meta["saxs1d_bkg_fname"] = os.path.basename(fname)
+        self.meta["saxs1d_bkg_path"] = path
+        self.meta["saxs1d_bkg_xf"] = xf
+        self.meta["saxs1d_bkg_revision"] = revision
+
+    def background_revision(self) -> tuple[str, tuple[int, ...] | None] | None:
+        """``(path, on-disk revision)`` of the selected SAXS background.
+
+        ``None`` when none is selected. Part of the SAXS-1D plot request, so a
+        replaced background makes the request differ from the drawn one.
+        """
+        path = self.meta.get("saxs1d_bkg_path")
+        return None if path is None else (path, _file_identity(path))
+
+    def refresh_background(self) -> bool:
+        """Bring the background up to date with its file; True if it changed.
+
+        The background is held outside the locator's cache, so it gets the
+        locator's rule here: a file replaced on disk is read again, a file that
+        is gone is dropped with a warning (subtraction is then skipped).
+        """
+        path = self.meta.get("saxs1d_bkg_path")
+        if path is None:
+            return False
+        current = _file_identity(path)
+        if current == self.meta.get("saxs1d_bkg_revision"):
+            return False
+        xf = None
+        if current is None:
+            logger.warning(f"SAXS background file {path} is gone; it is cleared")
+        else:
+            try:
+                xf = XpcsFile(path, qmap_manager=self.qmap_manager)
+            except Exception as exc:
+                logger.warning(f"SAXS background file {path} cannot be read: {exc}")
+        if xf is None:
+            self.meta.update(
+                saxs1d_bkg_fname=None,
+                saxs1d_bkg_path=None,
+                saxs1d_bkg_xf=None,
+                saxs1d_bkg_revision=None,
+            )
+        else:
+            logger.info(f"SAXS background file {path} was replaced; reloaded")
+            self.meta["saxs1d_bkg_xf"] = xf
+            self.meta["saxs1d_bkg_revision"] = current
+        return True
+
+    def get_bkg_xf(self) -> XpcsFile | None:
+        """The SAXS background, current with its file (None if none/gone)."""
+        self.refresh_background()
+        return self.meta["saxs1d_bkg_xf"]
+
+    def build(self, path=None, filter_list=(".hdf", ".h5"), sort_method="Filename"):
+        """Rebuild the file list (Reload); also refreshes the SAXS background."""
+        built = super().build(
+            path=path, filter_list=filter_list, sort_method=sort_method
+        )
+        self.background_replaced = bool(built) and self.refresh_background()
+        return built
 
     def get_pg_tree(self, rows: Any) -> Any | None:
         xf_list = self.get_xf_list(rows)
@@ -696,10 +851,16 @@ class ViewerKernel(FileLocator):
         if xf_list:
             _get_module("saxs2d").plot(xf_list[0], *args, **kwargs)
 
-    def add_roi(self, hdl, **kwargs):
+    def add_roi(self, hdl, rows=None, **kwargs):
+        """Add a default ROI at the beam centre of the file shown in ``hdl``.
+
+        ``rows`` are the target rows the SAXS-2D view shows (its first file is
+        the one drawn); the beam centre is placed at the centre of its pixel in
+        the displayed frame (``hdl.pixel_centre``), not at a raw pixel index.
+        """
         logger.debug(f"ViewerKernel: add_roi called with kwargs: {kwargs}")
 
-        xf_list = self.get_xf_list()
+        xf_list = self.get_xf_list(rows)[0:1]
         logger.debug(
             f"ViewerKernel: get_xf_list returned {len(xf_list) if xf_list else 0} files"
         )
@@ -711,8 +872,9 @@ class ViewerKernel(FileLocator):
             return None
 
         try:
-            cen = (xf_list[0].bcx, xf_list[0].bcy)
-            logger.debug(f"ViewerKernel: beam center coordinates: {cen}")
+            bcx, bcy = xf_list[0].bcx, xf_list[0].bcy  # pixel-index frame
+            cen = hdl.pixel_centre(bcx, bcy)  # where that pixel is drawn
+            logger.debug(f"ViewerKernel: beam center {(bcx, bcy)} drawn at {cen}")
         except (AttributeError, IndexError) as e:
             logger.error(f"Cannot get beam center coordinates: {e}")
             return None
@@ -734,8 +896,8 @@ class ViewerKernel(FileLocator):
             return result
         if sl_type == "Circle":
             try:
-                radius_v = min(xf_list[0].mask.shape[0] - cen[1], cen[1])
-                radius_h = min(xf_list[0].mask.shape[1] - cen[0], cen[0])
+                radius_v = min(xf_list[0].mask.shape[0] - bcy, bcy)
+                radius_h = min(xf_list[0].mask.shape[1] - bcx, bcx)
                 radius = min(radius_h, radius_v) * 0.8
 
                 result1 = hdl.add_roi(cen=cen, radius=radius, label="RingA", **kwargs)
@@ -752,8 +914,8 @@ class ViewerKernel(FileLocator):
         elif sl_type == "Phi-Ring":
             # Phi-Ring ROI for angular analysis (ring-shaped)
             try:
-                radius_v = min(xf_list[0].mask.shape[0] - cen[1], cen[1])
-                radius_h = min(xf_list[0].mask.shape[1] - cen[0], cen[0])
+                radius_v = min(xf_list[0].mask.shape[0] - bcy, bcy)
+                radius_h = min(xf_list[0].mask.shape[1] - bcx, bcx)
                 radius = min(radius_h, radius_v) * 0.8
 
                 result1 = hdl.add_roi(cen=cen, radius=radius, label="RingA", **kwargs)
@@ -773,14 +935,45 @@ class ViewerKernel(FileLocator):
             logger.error(f"ViewerKernel: Unknown ROI type '{sl_type}'")
             return None
 
+    def get_xf_rows(self, rows=None, filter_atype=None) -> list[tuple[int, XpcsFile]]:
+        """``(target row, file)`` for each requested row whose file loads.
+
+        ``get_xf_list`` drops rows whose file is missing or unreadable, so its
+        positions no longer match target rows. Anything that needs to know WHICH
+        row a file came from (highlighting, colours, labels) must use this.
+        """
+        selected: Any
+        if rows is None:
+            selected = range(len(self.target))
+        elif isinstance(rows, int):
+            selected = [rows]
+        else:
+            selected = rows
+        return [
+            (r, xf)
+            for r in selected
+            for xf in self.get_xf_list(rows=[r], filter_atype=filter_atype)
+        ]
+
     def plot_saxs_1d(self, pg_hdl, mp_hdl, **kwargs):
-        xf_list = self.get_xf_list()
+        rows = kwargs.pop("rows", None)  # target rows to highlight
+        pairs = self.get_xf_rows()
+        if pairs or self.target:
+            xf_list = [xf for _, xf in pairs]
+            # the plot indexes the files it was given: translate target rows into
+            # positions among them (a row whose file is gone highlights nothing)
+            position = {r: k for k, (r, _) in enumerate(pairs)}
+        else:  # no target: the locator's cached files, which have no rows
+            xf_list, position = self.get_xf_list(), {}
         if xf_list:
             roi_list = pg_hdl.get_roi_list()
             self.get_module("saxs1d").pg_plot(
                 xf_list,
                 mp_hdl,
-                bkg_file=self.meta["saxs1d_bkg_xf"],
+                rows=None
+                if rows is None
+                else [position[r] for r in rows if r in position],
+                bkg_file=self.get_bkg_xf(),
                 roi_list=roi_list,
                 **kwargs,
             )
@@ -788,10 +981,29 @@ class ViewerKernel(FileLocator):
     def export_saxs_1d(self, pg_hdl, folder):
         xf_list = self.get_xf_list()
         roi_list = pg_hdl.get_roi_list()
+        guard = ExportGuard(xf.fname for xf in xf_list)
+        exported = 0
         # Stems are allocated for the whole export so two files sharing a display
         # label (scan.hdf / scan_results.hdf) cannot overwrite each other.
         for xf, stem in zip(xf_list, _export_stems(xf_list), strict=True):
-            xf.export_saxs1d(roi_list, folder, basename=stem)
+            try:
+                xf.export_saxs1d(roi_list, folder, basename=stem, guard=guard)
+            except ExportCollisionError as exc:
+                logger.error(f"SAXS 1D export of {xf.label} refused: {exc}")
+                continue
+            exported += 1
+        total = len(xf_list)
+        if total and exported == total:
+            logger.info(f"SAXS 1D export completed: {exported}/{total} files")
+        elif exported:
+            logger.warning(
+                f"SAXS 1D export partially completed: {exported}/{total} files "
+                "exported successfully"
+            )
+        elif total:
+            raise ValueError(
+                f"SAXS 1D export failed: 0/{total} files exported successfully"
+            )
 
     def switch_saxs1d_line(self, mp_hdl, lb_type):
         """Switch SAXS 1D line builder type (stub for future implementation)."""
@@ -891,11 +1103,12 @@ class ViewerKernel(FileLocator):
         of unused datasets, helping to manage memory usage for
         large XPCS data collections.
         """
+        # The caller's object comes from the locator, which checks the file
+        # revision; this cache is keyed by name only, so it must never win.
+        if fallback_xfile is not None:
+            return fallback_xfile
         with self._dset_cache_lock:
-            cached = self._current_dset_cache.get(fname)
-        if cached is not None:
-            return cached
-        return fallback_xfile
+            return self._current_dset_cache.get(fname)
 
     def plot_intt(self, pg_hdl, rows=None, **kwargs):
         """
@@ -1073,6 +1286,9 @@ class ViewerKernel(FileLocator):
 
         successful_exports = 0
         total_files = len(xf_list)
+        # One guard for the whole export: no destination may be (a link to) one of
+        # the selected input files or to a file this export already wrote.
+        guard = ExportGuard(xf.fname for xf in xf_list)
 
         for xf, stem in zip(xf_list, _export_stems(xf_list), strict=True):
             # Export raw G2 data
@@ -1082,13 +1298,26 @@ class ViewerKernel(FileLocator):
             try:
                 q_val, t_el, g2, g2_err, _labels = xf.get_g2_data()
 
-                # Save G2 correlation data
                 g2_filename = os.path.join(folder, f"{stem}_g2_data.txt")
+                fit_filename = os.path.join(folder, f"{stem}_g2_fitting.txt")
+                curve_filename = os.path.join(folder, f"{stem}_g2_fitted_curves.txt")
+                # Claim every destination of this file before writing any of them
+                # (a refused file is skipped whole and counted as failed).
+                guard.claim(g2_filename, str(xf.fname))
+                if xf.fit_summary is not None:
+                    guard.claim(fit_filename, str(xf.fname))
+                    if "fit_line" in xf.fit_summary and "fit_x" in xf.fit_summary:
+                        guard.claim(curve_filename, str(xf.fname))
 
-                # Create header
+                # Absolute identity of each G2 column (None for stand-in files)
+                columns = _g2_bin_identities(xf, len(q_val))
+
+                # Create header: the plain Q labels stay, the bin's full identity
+                # (dynamic bin, map position, numeric q and phi) is appended
                 header = "tau(s)"
                 for i, q in enumerate(q_val):
-                    header += f"\tG2_q{i:03d}(q={q:.6f})\tG2_err_q{i:03d}"
+                    tag = _bin_tag(columns[i] if columns else None)
+                    header += f"\tG2_q{i:03d}(q={q:.6f}){tag}\tG2_err_q{i:03d}{tag}"
 
                 # Prepare data array
                 data_array = [t_el]
@@ -1102,7 +1331,8 @@ class ViewerKernel(FileLocator):
 
                 # Export fitting results if available
                 if xf.fit_summary is not None:
-                    fit_filename = os.path.join(folder, f"{stem}_g2_fitting.txt")
+                    fit_q = np.asarray(xf.fit_summary["q_val"])
+                    fit_ids = _fit_bin_identities(xf.fit_summary, fit_q, columns)
 
                     with open(fit_filename, "w") as f:
                         f.write(f"# G2 Fitting Results for {xf.label}\n")
@@ -1110,7 +1340,13 @@ class ViewerKernel(FileLocator):
                         f.write(f"# Q-range: {xf.fit_summary['q_range']}\n")
                         f.write(f"# Time-range: {xf.fit_summary['t_range']}\n")
                         f.write(f"# Bounds: {xf.fit_summary['bounds']}\n")
-                        f.write(f"# Fit flags: {xf.fit_summary['fit_flag']}\n\n")
+                        f.write(f"# Fit flags: {xf.fit_summary['fit_flag']}\n")
+                        # The table's columns are unchanged; each row's absolute
+                        # bin identity (a radial Q alone is ambiguous) follows here.
+                        if fit_ids is not None:
+                            for i, ident in enumerate(fit_ids):
+                                f.write(_bin_row_comment(i, ident))
+                        f.write("\n")
 
                         # Parameter names
                         if xf.fit_summary["fit_func"] == "single":
@@ -1130,7 +1366,6 @@ class ViewerKernel(FileLocator):
                         # row i of the fit belongs to the fit's own q_val, which
                         # is a subset of the exported q_val when the fit was cropped
                         fit_val = xf.fit_summary["fit_val"]
-                        fit_q = np.asarray(xf.fit_summary["q_val"])
                         from .fitting.legacy import fit_success_mask
 
                         fit_ok = fit_success_mask(xf.fit_summary)
@@ -1159,10 +1394,6 @@ class ViewerKernel(FileLocator):
 
                     # Export fitted curves if available
                     if "fit_line" in xf.fit_summary and "fit_x" in xf.fit_summary:
-                        curve_filename = os.path.join(
-                            folder, f"{stem}_g2_fitted_curves.txt"
-                        )
-
                         fit_x = xf.fit_summary["fit_x"]
                         fit_line = xf.fit_summary["fit_line"]
 
@@ -1172,6 +1403,8 @@ class ViewerKernel(FileLocator):
                         header = "tau(s)"
                         for i in range(n_curves):
                             header += f"\tG2_fit_q{i:03d}(q={fit_q[i]:.6f})"
+                            if fit_ids is not None:
+                                header += _bin_tag(fit_ids[i])
                             if not fit_ok[i]:
                                 header += "[failed]"
 
@@ -1192,6 +1425,10 @@ class ViewerKernel(FileLocator):
                 successful_exports += 1
                 logger.info(f"Successfully exported G2 data for {xf.label}")
 
+            except ExportCollisionError as e:
+                # This file is refused whole; the others are still exported
+                logger.error(f"G2 export of {xf.label} refused: {e}")
+                continue
             except ValueError as e:
                 # Handle specific data validation errors (like invalid Q indices)
                 logger.error(f"Data validation error for {xf.label}: {e}")
@@ -1278,11 +1515,18 @@ class ViewerKernel(FileLocator):
 
         successful_exports = 0
         total_files = len(valid_xf_list) + n_failed
+        written = []  # files whose individual result was written (summary rows)
+        # One guard for the whole export (inputs: every selected file): no
+        # destination may be (a link to) an input or an earlier output of this run.
+        guard = ExportGuard(xf.fname for xf in xf_list)
 
         # Export individual file results
         for xf, stem in zip(valid_xf_list, _export_stems(valid_xf_list), strict=True):
             try:
-                filename = os.path.join(folder, f"{stem}_diffusion_fitting.txt")
+                filename = guard.claim(
+                    os.path.join(folder, f"{stem}_diffusion_fitting.txt"),
+                    str(xf.fname),
+                )
 
                 fs, method = fits[id(xf)]
                 tauq_data = fs[
@@ -1308,10 +1552,14 @@ class ViewerKernel(FileLocator):
                     f.write(f"b\t{tauq_data[0, 1]:.6f}\t{tauq_data[1, 1]:.6f}\n")
 
                 successful_exports += 1
+                written.append(xf)
                 logger.info(
                     f"Successfully exported diffusion fitting results for {xf.label}"
                 )
 
+            except ExportCollisionError as e:
+                logger.error(f"Diffusion export of {xf.label} refused: {e}")
+                continue
             except (OSError, PermissionError) as e:
                 logger.error(
                     f"File system error exporting diffusion data for {xf.label}: {e}"
@@ -1326,15 +1574,22 @@ class ViewerKernel(FileLocator):
                 logger.debug(f"Full traceback for {xf.label}: {traceback.format_exc()}")
                 continue
 
+        if not written:  # nothing to summarise
+            raise ValueError(
+                f"Diffusion export failed: 0/{total_files} files exported successfully"
+            )
+
         # Export summary table
         try:
-            summary_filename = os.path.join(folder, "diffusion_summary.txt")
+            summary_filename = guard.claim(
+                os.path.join(folder, "diffusion_summary.txt"), "diffusion summary"
+            )
 
             with open(summary_filename, "w") as f:
                 f.write("# Power Law Fitting Summary\n")
                 f.write("# Model: tau = a * q^b\n")
                 f.write(f"# Export date: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-                f.write(f"# Total files: {len(valid_xf_list)}\n")
+                f.write(f"# Total files: {len(written)}\n")
                 for method in sorted({m for _, m in fits.values()}):
                     f.write(f"# Fit method {method}:\n")
                     for line in _DIFFUSION_PROVENANCE[method]:
@@ -1346,8 +1601,8 @@ class ViewerKernel(FileLocator):
                     "file_name\n"
                 )
 
-                logger.info(f"Creating summary table for {len(valid_xf_list)} files")
-                for xf in valid_xf_list:
+                logger.info(f"Creating summary table for {len(written)} files")
+                for xf in written:
                     fs, method = fits[id(xf)]
                     if "tauq_fit_val" in fs:
                         tauq_data = fs["tauq_fit_val"]
@@ -1360,6 +1615,8 @@ class ViewerKernel(FileLocator):
 
             logger.info(f"Summary table exported to {summary_filename}")
 
+        except ExportCollisionError as e:
+            logger.error(f"Diffusion summary table refused: {e}")
         except Exception as e:
             logger.warning(f"Failed to create summary table: {e}")
             # Don't fail the entire export if summary fails

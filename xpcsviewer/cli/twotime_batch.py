@@ -12,6 +12,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from xpcsviewer.fileIO.hdf_reader import clear_connection_pool
+from xpcsviewer.utils.export_guard import ExportCollisionError, ExportGuard
 from xpcsviewer.utils.logging_config import get_logger
 from xpcsviewer.xpcs_file import XpcsFile
 
@@ -376,34 +377,34 @@ def generate_output_filename(
 def process_single_file(
     file_path: str,
     args,
-    written: dict[str, str] | None = None,
+    guard: ExportGuard | None = None,
     refused: list[str] | None = None,
 ) -> int:
     """
     Process a single HDF file and generate twotime images.
 
-    Within one run, two different (input file, Q-bin) pairs never write the same
-    output file, however the paths are spelled: the destination is keyed on the
-    case-normalised real path of the complete output file, so symlinked
-    directories and symlinked file names both resolve to one destination.
+    Every image goes through ``guard.claim`` before it is written, so within one
+    run no image is written onto an input HDF file or onto an image already
+    written by another (input file, Q-bin) pair, however the paths are spelled
+    (symlinked directories, symlinked file names, hard links, case).
     Re-running the CLI into the same output folder in a separate run overwrites
     the earlier images by design.
 
     Args:
         file_path: Path to HDF file
         args: Command line arguments
-        written: Destinations already written in this run, mapped to the source
-            that wrote them. Updated in place.
-        refused: Descriptions of images refused because their destination was
-            already written in this run. Appended to in place.
+        guard: The run's write gate; its inputs must be every input HDF file of
+            the run. Defaults to a gate whose only input is ``file_path``.
+        refused: Descriptions of images refused by the guard. Appended to in
+            place.
 
     Returns:
         Number of images generated
     """
     logger.info(f"Processing file: {file_path}")
 
-    if written is None:
-        written = {}
+    if guard is None:
+        guard = ExportGuard([file_path])
     if refused is None:
         refused = []
     xfile = None  # Initialize outside try block for finally cleanup
@@ -489,21 +490,16 @@ def process_single_file(
                     output_path = os.path.join(args.output, output_filename)
                     out_dir = os.path.dirname(output_path)
                     os.makedirs(out_dir, exist_ok=True)
-                    # the whole destination, so a symlink at the file name counts
-                    key = os.path.normcase(os.path.realpath(output_path))
-                    source = f"{file_path} (qbin {qbin_index})"
-                    if key in written:
-                        message = (
-                            f"Refusing to overwrite {output_path}: already written "
-                            f"in this run from {written[key]}, now requested by "
-                            f"{source}"
+                    try:
+                        output_path = guard.claim(
+                            output_path, f"{file_path} (qbin {qbin_index})"
                         )
-                        logger.error(message)
-                        refused.append(message)
+                    except ExportCollisionError as collision:
+                        logger.error(str(collision))
+                        refused.append(str(collision))
                         continue
 
                     fig.savefig(output_path, dpi=args.dpi, bbox_inches="tight")
-                    written[key] = source
                     logger.info(f"Saved image: {output_path}")
                     images_generated += 1
                 finally:
@@ -565,7 +561,7 @@ def process_directory(directory: str, args, refused: list[str] | None = None) ->
         directory: Directory containing HDF files
         args: Command line arguments
         refused: Appended with one description per image refused because its
-            destination was already written in this run
+            destination is an input file or was already written in this run
 
     Returns:
         Total number of images generated
@@ -581,13 +577,13 @@ def process_directory(directory: str, args, refused: list[str] | None = None) ->
 
     total_images = 0
     successful_files = 0
-    written: dict[str, str] = {}
+    guard = ExportGuard(hdf_files)
 
     for i, file_path in enumerate(hdf_files, 1):
         logger.info(f"Processing file {i}/{len(hdf_files)}: {file_path}")
 
         try:
-            images_count = process_single_file(file_path, args, written, refused)
+            images_count = process_single_file(file_path, args, guard, refused)
             total_images += images_count
             if images_count > 0:
                 successful_files += 1
@@ -668,7 +664,9 @@ def run_twotime_batch(args) -> int:
         # Process input (file or directory)
         refused: list[str] = []
         if os.path.isfile(args.input):
-            images_generated = process_single_file(args.input, args, refused=refused)
+            images_generated = process_single_file(
+                args.input, args, ExportGuard([args.input]), refused
+            )
         elif os.path.isdir(args.input):
             images_generated = process_directory(args.input, args, refused)
         else:
@@ -677,8 +675,8 @@ def run_twotime_batch(args) -> int:
 
         if refused:
             logger.error(
-                f"{len(refused)} image(s) were refused because another source "
-                f"already wrote the same output file in this run"
+                f"{len(refused)} image(s) were refused: the output file is an "
+                f"input file or another source's output in this run"
             )
             return 1
 

@@ -56,54 +56,41 @@ class SaxsPlotWorker(BasePlotWorker):
         self.check_cancelled()
         self.emit_step_progress(2, 4, "Processing SAXS data")
 
-        # Process the SAXS data using base class utilities
+        # The ONE function that decides image, orientation and beam centre
+        # (module/saxs2d.py); the viewer draws exactly this frame.
         xf = xf_list[0]
-        plot_type = self.get_plot_parameter("plot_type", "log")
-        rotate = self.get_plot_parameter("rotate", False)
-
-        # Get the image data
-        if hasattr(xf, "saxs_2d"):
-            image_data = xf.saxs_2d.copy()
-        else:
+        if getattr(xf, "saxs_2d", None) is None:
             return {
                 "message": "No SAXS 2D data available in this file. Please check the file format.",
                 "type": "info",
             }
 
-        # Apply rotation if requested
-        if rotate:
-            image_data = np.rot90(image_data)
+        from ..module.saxs2d import render_frame
+
+        frame = render_frame(
+            xf,
+            plot_type=self.get_plot_parameter("plot_type", "log"),
+            rotate=self.get_plot_parameter("rotate", False),
+        )
 
         self.check_cancelled()
-        self.emit_progress(3, 4, "Applying scaling and normalization")
+        self.emit_step_progress(4, 4, "Finalizing plot data")
 
-        # Apply log scaling if requested
-        if plot_type == "log":
-            image_data = np.log10(image_data + 1)
-
-        # Calculate levels for auto-scaling
-        autolevel = self.plot_kwargs.get("autolevel", True)
-        if autolevel:
-            vmin, vmax = np.percentile(image_data, (2, 98))
-        else:
-            vmin = self.plot_kwargs.get("vmin", image_data.min())
-            vmax = self.plot_kwargs.get("vmax", image_data.max())
-
-        self.check_cancelled()
-        self.emit_progress(4, 4, "Finalizing plot data")
-
-        # Prepare result
-        result = {
-            "image_data": image_data,
-            "levels": (vmin, vmax),
-            "cmap": self.plot_kwargs.get("cmap", "viridis"),
+        # One result object: the frame and the options it was made for.
+        return {
+            "frame": frame,
+            "display": {
+                "cmap": self.get_plot_parameter("cmap"),
+                "autolevel": self.get_plot_parameter("autolevel", False),
+                "autorange": self.get_plot_parameter("autorange", False),
+                "vmin": self.get_plot_parameter("vmin"),
+                "vmax": self.get_plot_parameter("vmax"),
+            },
             "file_info": {
                 "filename": xf.fname if hasattr(xf, "fname") else "unknown",
-                "shape": image_data.shape,
+                "shape": frame.display_shape,
             },
         }
-
-        return result
 
 
 class G2PlotWorker(BaseAsyncWorker):

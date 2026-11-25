@@ -113,8 +113,68 @@ tab_mapping = {
 
 def _revision_of(path: str | None) -> tuple[int, ...] | None:
     """On-disk revision of a data file: the identity the locator records for
-    the file it loaded (inode, device, mtime, size); None if unreadable."""
+    the file it loaded (inode, device, mtime, size, ctime); None if unreadable."""
     return None if path is None else _file_identity(os.path.normpath(path))
+
+
+def _detector_shape(xf) -> tuple[int, ...] | None:
+    """Shape of the file's detector image (None if it has none)."""
+    image = getattr(xf, "saxs_2d", None)
+    return None if image is None else tuple(np.shape(image))
+
+
+def _split_by_detector_shape(xf_list, arrays):
+    """Partition ``xf_list`` into files an import may be applied to and the rest.
+
+    One array (a SimpleMask mask or partition map) is pushed onto several
+    targets whose detectors can differ. A file takes it only if EVERY array in
+    ``arrays`` has that file's own detector shape; this is the only place that
+    decides, so no import can leave a file holding an array of the wrong shape.
+
+    Returns ``(accepted, skipped)``; ``skipped`` is ``[(file name, reason)]``.
+    """
+    accepted, skipped = [], []
+    for xf in xf_list:
+        shape = _detector_shape(xf)
+        name = os.path.basename(str(getattr(xf, "fname", "?")))
+        wrong = [tuple(np.shape(a)) for a in arrays if tuple(np.shape(a)) != shape]
+        if shape is None:
+            skipped.append((name, "its detector shape is unknown"))
+        elif wrong:
+            skipped.append(
+                (name, f"detector {shape} does not match the imported {wrong[0]}")
+            )
+        else:
+            accepted.append(xf)
+    return accepted, skipped
+
+
+def _skipped_text(skipped) -> str:
+    return "; ".join(f"{name} ({reason})" for name, reason in skipped)
+
+
+def _tauq_rows(fit_summary, q_range):
+    """``(q, tau, tau_err)`` rows of the tau-q power-law fit for *q_range*.
+
+    Source of truth: ``XpcsFile.fit_tauq`` (xpcs_file.py).  This is the same
+    selection, kept identical on purpose (a test compares both on a real file):
+    only Q bins inside *q_range* whose G2 fit succeeded
+    (``fit_success_mask``), with finite positive q and tau and a positive finite
+    uncertainty.  ``fit_tauq`` and the Bayesian launch must never disagree about
+    which rows are observations.
+    """
+    from .fitting.legacy import fit_success_mask
+
+    x = np.asarray(fit_summary["q_val"]).ravel()
+    fit_val = np.asarray(fit_summary["fit_val"])
+    n = min(len(x), fit_val.shape[0])
+    x, fit_val = x[:n], fit_val[:n]
+    in_range = (x >= q_range[0]) & (x <= q_range[1])
+    in_range &= fit_success_mask({**fit_summary, "fit_val": fit_val})[:n]
+    q, tau, err = x[in_range], fit_val[in_range, 0, 1], fit_val[in_range, 1, 1]
+    valid = (err > 0) & np.isfinite(tau) & np.isfinite(err)
+    valid &= np.isfinite(q) & (q > 0) & (tau > 0)
+    return q[valid], tau[valid], err[valid]
 
 
 @dataclass(frozen=True)
@@ -368,10 +428,10 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         # (file name, revision, absolute bin ID).
         self._g2_bayesian_store: dict[tuple, BayesianBundle] = {}
         self._g2_bayesian_launch: BayesianBundle | None = None  # fit in flight
-        # Revision of the launch's file when it was launched, and the bundle
-        # the diagnosis window shows (to close it when that bundle goes stale).
+        # Revision of the launch's file when it was launched.  A diagnosis
+        # window carries its own identity (file, revision, bin, bundle); the
+        # viewer never tracks "the bundle a window shows".
         self._g2_bayesian_launch_revision: tuple | None = None
-        self._g2_diagnosis_bundle: BayesianBundle | None = None
         self._bayesian_plot_dialog = None
         self._bayesian_plot_snapshot: _BayesianExportSnapshot | None = None
         self._g2_diagnosis_window = None
@@ -391,7 +451,6 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         self._diff_bayesian_store: dict[tuple, BayesianBundle] = {}
         self._diff_bayesian_launch: BayesianBundle | None = None
         self._diff_bayesian_launch_revision: tuple | None = None
-        self._diff_diagnosis_bundle: BayesianBundle | None = None
         self._diff_bayesian_worker: object | None = None
         self._diff_diagnosis_window = None
         self._diff_bayesian_worker_active: bool = False
@@ -1648,12 +1707,12 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             )
             return
 
-        image_data = result["image_data"]
-        levels = result["levels"]
+        # The worker's frame (image, orientation, beam centre of ONE file) and
+        # the options it was made for are drawn by the same function as the
+        # synchronous plot; nothing is recombined here.
+        from .module import saxs2d
 
-        # Convert JAX arrays to NumPy before passing to PyQtGraph (BUG-027)
-        self.pg_saxs.setImage(ensure_numpy(image_data), levels=levels)
-        # Apply colormap if needed
+        saxs2d.draw(self.pg_saxs, result["frame"], **result["display"])
 
     def apply_g2_result(self, result):
         """Apply G2 plot result to the GUI.
@@ -1928,6 +1987,18 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
     ) -> None:
         if self._g2_regroup_export is not None:
             return
+        from .utils.export_guard import ExportCollisionError, ExportGuard
+
+        try:  # the source file is an input of this export
+            ExportGuard([result.source_path]).claim(destination, "regrouped G2")
+        except ExportCollisionError as exc:
+            logger.error("Regroup export refused: %s", exc)
+            message = f"Export refused: {exc}"
+            self.statusbar.showMessage(message, 10000)
+            self.toast_manager.show_error(message)
+            if self._g2_regroup_dialog is not None:
+                self._g2_regroup_dialog.set_export_active(False, message)
+            return
         worker = G2RegroupExportWorker(result, destination)
         self._g2_regroup_export = worker
         if self._g2_regroup_dialog is not None:
@@ -2055,6 +2126,8 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             **kwargs,
             "source_revisions": revisions,
             "display_partition": self._display_partition_version,
+            # a replaced or re-selected SAXS background changes what SAXS-1D draws
+            "saxs1d_background": self.vk.background_revision() if self.vk else None,
         }
 
     def _invalidate_plots(self) -> None:
@@ -2285,7 +2358,8 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             return
         if self.pg_saxs.view.sceneBoundingRect().contains(pos):
             mouse_point = self.pg_saxs.getView().mapSceneToView(pos)
-            x, y = int(mouse_point.x()), int(mouse_point.y())
+            # the pixel drawn there, through the item's own (possibly rotated) mapping
+            x, y = self.pg_saxs.pixel_index_at(mouse_point.x(), mouse_point.y())
             rows = self.get_selected_rows()
             payload = self.vk.get_info_at_mouse(rows, x, y)
             if payload:
@@ -2378,7 +2452,7 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         }
 
         logger.debug(f"GUI: Attempting to add ROI with kwargs: {kwargs}")
-        result = self.vk.add_roi(self.pg_saxs, **kwargs)
+        result = self.vk.add_roi(self.pg_saxs, rows=self.get_selected_rows(), **kwargs)
         if result is None:
             logger.warning(f"GUI: ROI addition failed for type '{kwargs['sl_type']}'")
         else:
@@ -2925,34 +2999,40 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             if not xf_list:
                 return
 
-            # Validate dimensions
-            xf = xf_list[0]
-            if xf.saxs_2d is not None:
-                detector_shape = xf.saxs_2d.shape
-                if mask.shape != detector_shape:
-                    QtWidgets.QMessageBox.warning(
-                        self,
-                        "Dimension Mismatch",
-                        f"Mask dimensions {mask.shape} do not match\n"
-                        f"detector dimensions {detector_shape}.\n\n"
-                        "Cannot import mask.",
-                    )
-                    return
+            # Each target is checked against its OWN detector: files of another
+            # shape are left untouched, never given a mask of the wrong shape.
+            accepted, skipped = _split_by_detector_shape(xf_list, [mask])
+            if skipped:
+                logger.warning(
+                    f"Mask {np.shape(mask)} not applied to {len(skipped)} "
+                    f"file(s): {_skipped_text(skipped)}"
+                )
+            if not accepted:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Dimension Mismatch",
+                    f"Mask dimensions {np.shape(mask)} match no loaded file:\n"
+                    f"{_skipped_text(skipped)}\n\nCannot import mask.",
+                )
+                return
 
-            # Apply mask to all loaded XpcsFile objects (BUG-001 fix)
-            for xf in xf_list:
+            # Apply mask to the matching loaded XpcsFile objects (BUG-001 fix)
+            for xf in accepted:
                 xf.mask = mask
 
             logger.info(
                 f"Mask exported from SimpleMask: shape {mask.shape}, "
-                f"{np.sum(mask)} pixels unmasked — applied to {len(xf_list)} file(s)"
+                f"{np.sum(mask)} pixels unmasked - applied to {len(accepted)} file(s)"
             )
 
-            self.statusbar.showMessage(
+            message = (
                 f"Mask imported: {np.sum(mask):,} of {mask.size:,} pixels unmasked"
             )
-
+            if skipped:
+                message += f". Skipped (other detector shape): {_skipped_text(skipped)}"
             self.update_plot()
+            # after the redraw: starting a plot writes its own status message
+            self.statusbar.showMessage(message)
 
         except Exception as e:
             logger.error(f"Failed to import mask: {e}")
@@ -2993,36 +3073,53 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
                 else 0
             )
 
-            xf_list = self.vk.get_xf_list()
-            if xf_list:
-                # Apply partition maps to all loaded XpcsFile objects (BUG-001 fix).
-                # DISPLAY ONLY: stored under separate names that only the Q-map
-                # displays read (XpcsFile.get_display_qmap). xf.dqmap / xf.sqmap
-                # stay the file's own maps, which the G2/two-time bins, the ROI
-                # calculations and the G2 map's detector image are bound to.
-                dqmap = partition.get("dynamic_roi_map")
-                sqmap = partition.get("static_roi_map")
-                for xf in xf_list:
-                    if dqmap is not None:
-                        xf.display_dqmap = dqmap
-                    if sqmap is not None:
-                        xf.display_sqmap = sqmap
+            xf_list = self.vk.get_xf_list() or []
+            dqmap = partition.get("dynamic_roi_map")
+            sqmap = partition.get("static_roi_map")
+            # Each target takes the maps only if they have ITS detector shape.
+            accepted, skipped = _split_by_detector_shape(
+                xf_list, [m for m in (dqmap, sqmap) if m is not None]
+            )
+            if skipped:
+                logger.warning(
+                    f"Partition not applied to {len(skipped)} file(s): "
+                    f"{_skipped_text(skipped)}"
+                )
+            if xf_list and not accepted:
+                self.statusbar.showMessage(
+                    f"Partition not imported: {_skipped_text(skipped)}"
+                )
+                return
+
+            # Apply partition maps to the matching loaded XpcsFile objects
+            # (BUG-001 fix). DISPLAY ONLY: stored under separate names that only
+            # the Q-map displays read (XpcsFile.get_display_qmap). xf.dqmap /
+            # xf.sqmap stay the file's own maps, which the G2/two-time bins, the
+            # ROI calculations and the G2 map's detector image are bound to.
+            for xf in accepted:
+                if dqmap is not None:
+                    xf.display_dqmap = dqmap
+                if sqmap is not None:
+                    xf.display_sqmap = sqmap
 
             self._display_partition_version += 1
             self._invalidate_plots()
 
             logger.info(
                 f"Partition exported from SimpleMask: {dq_num} dynamic bins, "
-                f"{sq_num} static bins — applied to {len(xf_list) if xf_list else 0} file(s)"
+                f"{sq_num} static bins - applied to {len(accepted)} file(s)"
             )
 
-            self.statusbar.showMessage(
+            message = (
                 f"Partition imported for display: {dq_num} dynamic Q-bins, "
                 f"{sq_num} static Q-bins (existing G2/two-time results keep "
                 "the file's own Q bins)"
             )
-
+            if skipped:
+                message += f". Skipped (other detector shape): {_skipped_text(skipped)}"
             self.update_plot()
+            # after the redraw: starting a plot writes its own status message
+            self.statusbar.showMessage(message)
 
         except Exception as e:
             logger.error(f"Failed to import partition: {e}")
@@ -4014,12 +4111,19 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             for n in self.vk.target
             if os.path.normpath(os.path.join(self.vk.path, n)) in replaced
         ]
+        bkg_replaced = bool(getattr(self.vk, "background_replaced", False))
+        if bkg_replaced and self.vk.meta.get("saxs1d_bkg_path") is None:
+            # the kernel dropped a vanished background: do not show its path
+            self.le_bkg_fname.clear()
         if not self.vk.target:
             return
         # Bundles of any other stale revision (file rewritten, then read again
         # before this reload) go too.
         evicted = self._evict_stale_bayesian()
         if not changed and not evicted:
+            if bkg_replaced:
+                # SAXS-1D's request carries the background revision, so it is redrawn
+                self.update_plot()
             return
         # The loaded files' own display partition died with their old objects.
         self._display_partition_version += 1
@@ -4182,39 +4286,52 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             if attr == "_bayesian_plot_dialog":
                 self._bayesian_plot_snapshot = None
 
-    def _close_bayesian_windows(self, *, everything=False, shown=()) -> None:
-        """Close the diagnosis / All-Q windows that show a bundle in *shown*
-        (or every one when *everything*)."""
-        for win_attr, bundle_attr in (
-            ("_g2_diagnosis_window", "_g2_diagnosis_bundle"),
-            ("_diff_diagnosis_window", "_diff_diagnosis_bundle"),
-        ):
+    def _close_bayesian_windows(self, *, everything=False, is_gone=None) -> int:
+        """Close the diagnosis / All-Q windows whose OWN identity satisfies
+        ``is_gone(file name, revision)`` (every one when *everything*).
+        Returns how many were closed.
+
+        The windows are asked, not the stores: a window keeps showing the
+        bundle it was built from even after a refit replaced it in the store.
+        """
+        closed = 0
+        for win_attr in ("_g2_diagnosis_window", "_diff_diagnosis_window"):
             win = getattr(self, win_attr, None)
-            bundle = getattr(self, bundle_attr, None)
-            if win is not None and (everything or any(bundle is b for b in shown)):
+            if win is not None and (
+                everything or (is_gone is not None and win.matches(is_gone))
+            ):
                 # closed AND released: a hidden window would keep the evicted
                 # posterior and its observations alive
                 win.close()
                 win.deleteLater()
                 setattr(self, win_attr, None)
-                setattr(self, bundle_attr, None)
+                closed += 1
         dialog = getattr(self, "_bayesian_plot_dialog", None)
         snapshot = getattr(self, "_bayesian_plot_snapshot", None)
-        if dialog is not None and (everything or any(snapshot is b for b in shown)):
+        if dialog is not None and (
+            everything
+            or (
+                is_gone is not None
+                and snapshot is not None
+                and is_gone(snapshot.fname, snapshot.revision)
+            )
+        ):
             dialog.close()
             self._forget_window("_bayesian_plot_dialog", dialog)
+            closed += 1
+        return closed
 
     def _drop_bayesian(self, is_gone) -> int:
         """Evict every Bayesian result of a ``(file name, revision)`` for which
-        ``is_gone(fname, revision)`` holds: stored bundles (their open windows
-        are closed), fits in flight (cancelled; their late completion no longer
+        ``is_gone(fname, revision)`` holds: stored bundles, open windows that
+        show such a file (asked directly), fits in flight (cancelled; their late completion no longer
         matches a launch and is ignored) and an All-Q dialog.  Returns how many
         things were dropped."""
-        dropped = []
+        n = 0
         for store in (self._g2_bayesian_store, self._diff_bayesian_store):
             for key in [k for k in store if is_gone(k[0], k[1])]:
-                dropped.append(store.pop(key))
-        n = len(dropped)
+                del store[key]
+                n += 1
 
         launch = self._g2_bayesian_launch
         if launch is not None and is_gone(
@@ -4248,12 +4365,7 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             self._g2_batch_launch = None  # late per-bin results are ignored
             n += 1
 
-        snapshot = self._bayesian_plot_snapshot
-        shown: list[object] = list(dropped)
-        if snapshot is not None and is_gone(snapshot.fname, snapshot.revision):
-            shown.append(snapshot)
-            n += 1
-        self._close_bayesian_windows(shown=shown)
+        n += self._close_bayesian_windows(is_gone=is_gone)
 
         if n:
             self._refresh_bayesian_buttons()
@@ -4906,18 +5018,16 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             )
 
         # 4. Auto-update diagnosis window if open
-        if (
-            self._g2_diagnosis_window is not None
-            and self._g2_diagnosis_window.isVisible()
-        ):
+        window = self._g2_diagnosis_window
+        if window is not None and window.isVisible():
             if has_result:
                 # The stored observations are shown with the stored posterior;
                 # nothing is re-extracted from the current selection.
                 self._update_g2_diagnosis(bundle)
             else:
-                # Show placeholder in diagnosis window title
-                title = f"G2 Bayesian Diagnosis \u2014 Q-bin {q_idx} (no fit yet)"
-                self._g2_diagnosis_window.setWindowTitle(title)
+                # Explicit empty state: never another bin's posterior under
+                # this bin's title.
+                window.clear(f"G2 Bayesian Diagnosis \u2014 Q-bin {q_idx} (no fit yet)")
 
     def _highlight_g2_subplot(self, q_idx):
         """Highlight the selected Q-bin subplot in the g2 fitting plot grid.
@@ -5198,7 +5308,7 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             return None
 
         from .fitting import fit_double_exp, fit_single_exp
-        from .fitting.bayesian_assembly import BayesianBundle
+        from .fitting.bayesian_assembly import BayesianBundle, resolve_bin_phi
 
         fit_func = fit_single_exp if fit_func_name == "single" else fit_double_exp
 
@@ -5253,6 +5363,7 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             "t_el": x,
             "g2": fitted_g2,
             "bin_ids": [b[0] for b in bins],
+            "bin_phi": resolve_bin_phi(xf_list[0], [b[0] for b in bins]),
             "fit_func_name": fit_func_name,
             "fname": fname,
             "revision": _revision_of(fname),
@@ -5398,6 +5509,7 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
                 model_func=launch["model_func"],
                 fname=launch["fname"],
                 bin_ids=launch["bin_ids"],
+                bin_phi=launch.get("bin_phi"),
                 fit_q_range=launch["q_range"],
                 fit_t_range=launch["t_range"],
                 obs_g2=launch["g2"],
@@ -5582,8 +5694,13 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         br = snapshot.results
 
         from .fitting.viz import export_bayesian_csv, export_bayesian_diagnostics
+        from .utils.export_guard import ExportCollisionError, ExportGuard
 
+        # One guard for the whole action: the source data file is an input and
+        # every destination is claimed before it is written.
+        guard = ExportGuard([snapshot.fname] if snapshot.fname else [])
         failures: list[str] = []
+        refused: list[str] = []
 
         # 1. CSV parameters
         try:
@@ -5594,7 +5711,13 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
                 bfs["fit_func"],
                 failed_mask=bfs.get("failed_mask"),
                 nonconverged_mask=bfs.get("nonconverged_mask"),
+                bin_ids=bfs.get("bin_ids"),
+                bin_phi=bfs.get("bin_phi"),
+                guard=guard,
             )
+        except ExportCollisionError as exc:
+            logger.error("CSV export refused: %s", exc)
+            refused.append(str(exc))
         except Exception:
             logger.exception("CSV export failed")
             failures.append("CSV")
@@ -5607,32 +5730,51 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             logger.warning("Figure was already closed; skipping figure export")
             failures.append("PDF/PNG")
         else:
-            try:
-                fig.savefig(
-                    out_dir / "bayesian_all_q.pdf", dpi=300, bbox_inches="tight"
-                )
-                fig.savefig(
-                    out_dir / "bayesian_all_q.png", dpi=150, bbox_inches="tight"
-                )
-            except Exception:
-                logger.exception("Figure export failed")
-                failures.append("PDF/PNG")
+            for name, dpi in (("bayesian_all_q.pdf", 300), ("bayesian_all_q.png", 150)):
+                try:
+                    guard.claim(out_dir / name, "All-Q figure")
+                    fig.savefig(out_dir / name, dpi=dpi, bbox_inches="tight")
+                except ExportCollisionError as exc:
+                    logger.error("Figure export refused: %s", exc)
+                    refused.append(str(exc))
+                except Exception:
+                    logger.exception("Figure export failed")
+                    failures.append("PDF/PNG")
 
-        # 3. netCDF diagnostics (skipped, not failed, when no backend is installed)
+        # 3. netCDF diagnostics (skipped, not failed, when no backend is
+        # installed).  The writer drops the bins the summary marks failed.
         netcdf_skipped = False
         if br is not None:
             try:
                 netcdf_skipped = not export_bayesian_diagnostics(
-                    out_dir / "bayesian_diagnostics.nc", br
+                    out_dir / "bayesian_diagnostics.nc",
+                    br,
+                    failed_mask=bfs.get("failed_mask"),
+                    bin_ids=bfs.get("bin_ids"),
+                    q_val=bfs.get("q_val"),
+                    bin_phi=bfs.get("bin_phi"),
+                    source=snapshot.fname,
+                    guard=guard,
                 )
+            except ExportCollisionError as exc:
+                logger.error("netCDF export refused: %s", exc)
+                refused.append(str(exc))
             except Exception:
                 logger.exception("netCDF export failed")
                 failures.append("netCDF")
 
-        if failures:
-            self.statusbar.showMessage(
-                f"Export partially failed ({', '.join(failures)}); see log", 5000
-            )
+        if refused or failures:
+            parts = []
+            if refused:
+                parts.append(f"Export refused ({'; '.join(refused)})")
+            if failures:
+                parts.append(
+                    f"Export partially failed ({', '.join(failures)}); see log"
+                )
+            message = ". ".join(parts)
+            self.statusbar.showMessage(message, 10000)
+            if refused:
+                self.toast_manager.show_warning(message)
         elif netcdf_skipped:
             self.statusbar.showMessage(
                 f"Exported to {out_dir}; netCDF skipped "
@@ -5665,7 +5807,7 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
     def _update_g2_diagnosis(self, bundle):
         """Create/update the G2 diagnosis window from a stored bundle."""
         from .fitting.models import double_exp_func, single_exp_func
-        from .gui.bayesian_diagnosis import BayesianDiagnosisWindow
+        from .gui.bayesian_diagnosis import BayesianDiagnosisWindow, DiagnosisIdentity
 
         fit_result, x, y, yerr = bundle.result, bundle.x, bundle.y, bundle.yerr
         q_value = bundle.q_value
@@ -5691,7 +5833,6 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             return
 
         win = self._g2_diagnosis_window
-        self._g2_diagnosis_bundle = bundle
         win.set_axis_labels("Delay time (s)", "g2")
         win.update_results(
             result=fit_result,
@@ -5704,6 +5845,9 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
                 f"G2 Bayesian Diagnosis - Q={q_value:.4g} "
                 f"({bundle.label}, bin {bundle.bin_id})"
             ),
+            identity=DiagnosisIdentity(
+                bundle.fname, _revision_of(bundle.fname), bundle.bin_id, bundle
+            ),
         )
         win.show()
         win.raise_()
@@ -5715,14 +5859,15 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
     def _extract_diffusion_for_bayesian(self):
         """Extract (q, tau, tau_err) from fit_summary for Bayesian power-law fit.
 
-        Mirrors the data extraction logic in ``module/tauq.py``.
+        Uses the deterministic tau-q fit's row selection with the current GUI
+        Q range (``_tauq_rows``).
 
         Returns
         -------
         BayesianBundle or None
             The captured observations ``(q, tau, tau_err)`` of the first
-            selected file as a result-less bundle, ``None`` if no valid data
-            is available.
+            selected file and the Q range that selected them, as a result-less
+            bundle; ``None`` if fewer than two distinct valid Q remain.
         """
         if not self._guard_no_data("diffusion"):
             return None
@@ -5739,44 +5884,27 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             self.statusbar.showMessage("Run G2 fitting first (no fit_summary)", 3000)
             return None
 
-        fit_summary = xf.fit_summary
+        # The rows are selected NOW with the GUI's Q range, by the deterministic
+        # fit's own rule (_tauq_rows); rows of an earlier tau-q fit are never
+        # reused.
+        try:
+            q_range = (float(self.tauq_qmin.text()), float(self.tauq_qmax.text()))
+        except (ValueError, AttributeError):
+            self.statusbar.showMessage("Invalid Q range for the diffusion fit", 3000)
+            return None
+        q, tau, tau_err = _tauq_rows(xf.fit_summary, q_range)
 
-        # Prefer filtered tauq data (already Q-range-clipped and validity-
-        # checked by fit_tauq).  Fall back to raw G2 fit_val when tauq keys
-        # are absent (e.g. user clicks "Fit Bayesian" before "fit plot").
-        if "tauq_q" in fit_summary:
-            q = np.asarray(fit_summary["tauq_q"])
-            tau = np.asarray(fit_summary["tauq_tau"])
-            tau_err = np.asarray(fit_summary["tauq_tau_err"])
-        else:
-            q = np.asarray(fit_summary["q_val"])
-            from .fitting.legacy import fit_success_mask
-
-            fit_val = np.asarray(fit_summary["fit_val"])
-            # a Q bin without a usable G2 fit never contributes a tau value
-            ok = fit_success_mask(fit_summary)
-            tau = np.where(ok, fit_val[:, 0, 1], np.nan)
-            tau_err = np.where(ok, fit_val[:, 1, 1], np.nan)
-
-            # Trim to consistent length
-            min_len = min(len(q), len(tau), len(tau_err))
-            q, tau, tau_err = q[:min_len], tau[:min_len], tau_err[:min_len]
-
-            # Apply Q-range filter from UI (tauq path already applies this)
-            try:
-                q_min = float(self.tauq_qmin.text())
-                q_max = float(self.tauq_qmax.text())
-            except (ValueError, AttributeError):
-                q_min, q_max = q.min(), q.max()
-
-            q_mask = (q >= q_min) & (q <= q_max)
-            q, tau, tau_err = q[q_mask], tau[q_mask], tau_err[q_mask]
-
-        # Validity filter (redundant for tauq path but needed for fallback)
-        valid = (tau_err > 0) & np.isfinite(tau) & np.isfinite(tau_err)
-
-        if not np.any(valid):
+        if q.size == 0:
             self.statusbar.showMessage("No valid diffusion data in Q-range", 2000)
+            return None
+        if np.unique(q).size < 2:
+            # same rule as XpcsFile.fit_tauq: with one Q the exponent is not
+            # identifiable and the "posterior" would be the prior
+            self.statusbar.showMessage(
+                "Bayesian diffusion needs at least 2 distinct positive Q values "
+                "in the Q range (fewer than 2: the exponent is not identifiable)",
+                6000,
+            )
             return None
 
         from .fitting.bayesian_assembly import BayesianBundle
@@ -5787,9 +5915,10 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             "tau(q) power law",
             0.0,
             "power_law",
-            q[valid],
-            tau[valid],
-            tau_err[valid],
+            q,
+            tau,
+            tau_err,
+            q_range=q_range,
         )
 
     def _fit_diff_bayesian(self):
@@ -5905,7 +6034,7 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             alpha = summary.loc["alpha", "mean"]
             tau0 = summary.loc["tau0", "mean"]
             param_str = f"  tau0={tau0:.3g}, alpha={alpha:.3f} (b={-alpha:.3f})"
-        except (KeyError, TypeError):
+        except (KeyError, TypeError, AttributeError):
             param_str = ""
         self.statusbar.showMessage(
             f"Bayesian power-law fit done (converged){param_str}", 6000
@@ -5963,7 +6092,7 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
     def _update_diff_diagnosis(self, bundle):
         """Create/update the diffusion diagnosis window from a stored bundle."""
         from .fitting.models import power_law_func
-        from .gui.bayesian_diagnosis import BayesianDiagnosisWindow
+        from .gui.bayesian_diagnosis import BayesianDiagnosisWindow, DiagnosisIdentity
 
         fit_result, q, tau, tau_err = bundle.result, bundle.x, bundle.y, bundle.yerr
 
@@ -5977,7 +6106,6 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             )
 
         win = self._diff_diagnosis_window
-        self._diff_diagnosis_bundle = bundle
         win.set_axis_labels("Q (1/A)", "tau (s)")
         win.update_results(
             result=fit_result,
@@ -5986,6 +6114,9 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             y_data=tau,
             yerr=tau_err,
             title=f"Diffusion Bayesian Diagnosis - Power Law ({bundle.fname})",
+            identity=DiagnosisIdentity(
+                bundle.fname, _revision_of(bundle.fname), None, bundle
+            ),
         )
         win.show()
         win.raise_()

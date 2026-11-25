@@ -14,6 +14,7 @@ from xpcsviewer.fileIO.g2_regroup import (
 )
 from xpcsviewer.gui.qt_compat import QtCore, QtWidgets, Signal, Slot
 from xpcsviewer.threading.async_workers import BaseAsyncWorker
+from xpcsviewer.utils.export_guard import ExportGuard
 
 _HDF5_FILTER = "HDF5 files (*.h5 *.hdf *.hdf5);;All files (*)"
 
@@ -68,6 +69,10 @@ class G2RegroupExportWorker(BaseAsyncWorker):
         self.destination = destination
 
     def do_work(self) -> Path:
+        # The worker itself refuses to write through an alias of what it read,
+        # whoever calls it (the Viewer also claims the destination at dispatch).
+        guard = ExportGuard([self.result.source_path, self.result.qmap_path])
+        guard.claim(self.destination, "G2 regroup export")
         try:
             export_g2_regroup(self.result, self.destination)
         except InterruptedError as exc:

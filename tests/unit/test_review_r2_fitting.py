@@ -131,6 +131,40 @@ def test_unavailable_covariance_is_reported_as_nan():
     assert np.isfinite(fit_val[0, 0]).all()
 
 
+def test_identifiable_fit_with_unavailable_covariance_has_nan_errors(monkeypatch):
+    # Since R4-01 the test above is failed by the rank check before the
+    # covariance is read. This one keeps _param_errors honest end to end: an
+    # identifiable, converged fit whose covariance could not be estimated is a
+    # success with NaN errors, never invented ones.
+    popt = np.array([2.0, -1.0])
+
+    class _Result:
+        success = True
+        message = ""
+        jac = np.array([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]])  # full column rank
+
+        def __iter__(self):
+            return iter((popt, np.inf * np.eye(2)))
+
+    monkeypatch.setattr(legacy, "curve_fit", lambda *a, **k: _Result())
+    x = np.array([0.1, 0.2, 0.4])
+    y = np.array([[4.0], [2.0], [1.0]])
+    _, fit_val, ok = fit_with_fixed(
+        lambda q, a, b: a * q**b,
+        x,
+        y,
+        np.full_like(y, 0.1),
+        np.array([[0.0, -3.0], [5.0, 0.0]]),
+        np.ones(2, dtype=bool),
+        x,
+        p0=np.array([1.0, -1.0]),
+        return_status=True,
+    )
+    assert ok.all()
+    np.testing.assert_allclose(fit_val[0, 0], popt)
+    assert np.isnan(fit_val[0, 1]).all()
+
+
 def test_param_errors_nan_for_nonfinite_or_negative_diagonal():
     pcov = np.array([[4.0, 0.0, 0.0], [0.0, np.inf, 0.0], [0.0, 0.0, -1.0]])
     errors = legacy._param_errors(pcov, 3)

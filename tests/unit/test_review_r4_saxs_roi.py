@@ -106,18 +106,36 @@ def test_r4_06_direct_export_defaults_to_the_source_file_name(tmp_path):
 
 
 # ------------------------------------------------------------------ R4-08
-def _inside_drawn(shape_owner, shape, path_of=lambda roi: roi.shape()):
-    """Pixels whose (col, row) point lies inside the Qt shape of an ROI."""
-    path = path_of(shape_owner)
+# Round 5 (R5-12) corrected the oracle of this section: the ImageItem draws pixel
+# (row, col) over the square [col, col+1] x [row, row+1], so a pixel belongs to the
+# drawn ROI iff its CENTRE (col + 0.5, row + 0.5 in image-item coordinates), mapped
+# through the real ImageItem into the ROI's own frame, lies inside the ROI's shape.
+# Round 4 tested the integer point (col, row) and so agreed with the exporter.
+def _view_with(xf):
+    view = ImageViewDev()
+    view.setImage(xf.saxs_2d)
+    return view
+
+
+def _centres_in_roi_frame(view, roi, shape):
+    """Every pixel centre, mapped through the real ImageItem into ``roi``'s frame."""
+    item = view.getImageItem()
+    return [
+        [
+            roi.mapFromItem(item, QtCore.QPointF(c + 0.5, r + 0.5))
+            for c in range(shape[1])
+        ]
+        for r in range(shape[0])
+    ]
+
+
+def _inside_drawn(view, roi, shape):
+    """Pixels whose painted centre lies inside the Qt shape of a (Pie) ROI."""
+    path = roi.shape()
     return np.array(
         [
-            [
-                path.contains(
-                    shape_owner.mapFromParent(QtCore.QPointF(float(x), float(y)))
-                )
-                for x in range(shape[1])
-            ]
-            for y in range(shape[0])
+            [path.contains(p) for p in row]
+            for row in _centres_in_roi_frame(view, roi, shape)
         ]
     )
 
@@ -125,7 +143,11 @@ def _inside_drawn(shape_owner, shape, path_of=lambda roi: roi.shape()):
 def _mask(param, shape):
     """The pixel mask the export builds from a ROI descriptor."""
     return XpcsFile._pixels_in_polygon(
-        param["polygon"], shape, param["origin"], param["rotation"]
+        param["polygon"],
+        shape,
+        param["origin"],
+        param["rotation"],
+        param.get("pixel_frame"),
     )
 
 
@@ -142,15 +164,19 @@ def test_r4_08_reviewer_scenario_exports_the_pixels_of_the_drawn_wedge(tmp_path,
     path = tmp_path / "wedge_0001.h5"
     r3._write_nexus(path)
     xf = XpcsFile(str(path))
-    roi = PieROI((r3.BC, r3.BC), 3.0)  # 3 pixel Pie centred on the beam centre
+    view = _view_with(xf)
+    # the GUI's 3 pixel Q-Wedge centred on the beam centre
+    label = view.add_roi(cen=(r3.BC, r3.BC), radius=3.0, sl_type="Q-Wedge")
+    roi = view.roi_record[label]
     apex = roi.mapToParent(QtCore.QPointF(0.0, roi.size().y() / 2))
     assert (apex.x(), apex.y()) == (2.0, 3.5)  # the drawn apex is NOT the centre
-    inside = _inside_drawn(roi, (8, 8))
-    assert inside.sum() == 6
+    inside = _inside_drawn(view, roi, (8, 8))
+    assert inside.sum() == 5  # painted pixel centres; the corner point test saw 6
 
-    qlist, got = xf.get_roi_data(roi.get_parameter())
+    (param,) = view.get_roi_list()
+    qlist, got = xf.get_roi_data(param)
     np.testing.assert_allclose(got, _expected_pie(xf, inside), equal_nan=True)
-    assert got[0] == pytest.approx(44.5)  # not the wedge about the beam centre
+    assert got[0] == pytest.approx(38.0)  # not 44.5 (corner frame) nor the beam wedge
 
 
 @pytest.fixture
@@ -172,15 +198,15 @@ PIE_CASES = [
     (11.5, 11.5, 8.0, 0.0, None),
     (9.3, 12.7, 10.0, 35.0, None),
     (14.2, 8.6, 7.0, -70.0, (7.0, 11.0)),
-    (6.1, 15.9, 12.0, 200.0, (12.0, 6.0)),
+    (16.1, 12.0, 12.0, 200.0, (12.0, 6.0)),  # points up-left, over the image
     (11.5, 11.5, 5.0, 90.0, None),
     (17.7, 5.3, 14.0, 310.0, (14.0, 9.0)),
 ]
 
 
-def _make_pie(case):
+def _make_pie(view, case):
     cx, cy, size, angle, wh = case
-    roi = PieROI((cx, cy), size)
+    roi = view.roi_record[view.add_roi(cen=(cx, cy), radius=size, sl_type="Pie")]
     if wh is not None:
         roi.setSize(wh)
     roi.setAngle(angle)
@@ -189,52 +215,56 @@ def _make_pie(case):
 
 @pytest.mark.parametrize("case", PIE_CASES)
 def test_r4_08_export_mask_equals_the_drawn_shape_pixel_for_pixel(big_xf, qapp, case):
-    roi = _make_pie(case)
-    inside_qt = _inside_drawn(roi, big_xf.saxs_2d.shape)
+    view = _view_with(big_xf)
+    roi = _make_pie(view, case)
+    inside_qt = _inside_drawn(view, roi, big_xf.saxs_2d.shape)
     assert 0 < inside_qt.sum() < inside_qt.size  # a real, partial selection
 
-    polygon = roi.get_parameter()["polygon"]
-    mask = _mask(roi.get_parameter(), big_xf.saxs_2d.shape)
+    (param,) = view.get_roi_list()
+    mask = _mask(param, big_xf.saxs_2d.shape)
     assert np.array_equal(mask, inside_qt)  # equal, not merely overlapping
 
-    qlist, got = big_xf.get_roi_data(roi.get_parameter())
+    qlist, got = big_xf.get_roi_data(param)
     expected = _expected_pie(big_xf, inside_qt)
     expected[~(expected > 0)] = np.nan
     np.testing.assert_allclose(got, expected, equal_nan=True)
 
 
 def test_r4_08_handler_roi_in_a_view_uses_the_parent_frame(big_xf, qapp):
-    view = ImageViewDev()
-    view.setImage(big_xf.saxs_2d)
+    view = _view_with(big_xf)
     label = view.add_roi(cen=(10.3, 13.1), radius=9.0, sl_type="Pie")
     roi = view.roi_record[label]
     roi.setAngle(25.0)
     (param,) = view.get_roi_list()
-    inside_qt = _inside_drawn(roi, big_xf.saxs_2d.shape)
+    inside_qt = _inside_drawn(view, roi, big_xf.saxs_2d.shape)
     assert 0 < inside_qt.sum() < inside_qt.size
     mask = _mask(param, big_xf.saxs_2d.shape)
     assert np.array_equal(mask, inside_qt)
 
 
 def test_r4_08_resize_without_repaint_does_not_use_a_stale_angle(big_xf, qapp):
-    roi = PieROI((11.5, 11.5), 8.0)
+    view = _view_with(big_xf)
+    roi = view.roi_record[view.add_roi(cen=(11.5, 11.5), radius=8.0, sl_type="Pie")]
     roi.shape()  # last hit test used the square
     roi.setSize((8.0, 16.0))  # wider-than-high ratio changes; no shape() call
-    param = roi.get_parameter()
+    (param,) = view.get_roi_list()
     half = np.degrees(np.arctan2(16.0 / 2.0, 8.0))  # drawn half-angle, w=8 h=16
     lo, hi = param["angle_range"]
     assert (hi - lo) % 360.0 == pytest.approx(2 * half)
-    inside_qt = _inside_drawn(roi, big_xf.saxs_2d.shape)
+    inside_qt = _inside_drawn(view, roi, big_xf.saxs_2d.shape)
     assert np.array_equal(_mask(param, big_xf.saxs_2d.shape), inside_qt)
 
 
 @pytest.mark.parametrize("angle", [0.0, 90.0, 180.0, 270.0])
 def test_r4_08_lattice_aligned_rois_match_qt_on_their_edges(big_xf, qapp, angle):
-    # integer-aligned ROIs put detector pixels exactly on the polygon edges
-    roi = PieROI((12.0, 12.0), 6.0)
+    # pixel centres sit at half-integers, so a half-integer apex puts centres
+    # exactly on the polygon edges: Qt's edge convention must be reproduced
+    view = _view_with(big_xf)
+    roi = view.roi_record[view.add_roi(cen=(12.5, 12.5), radius=6.0, sl_type="Pie")]
     roi.setAngle(angle)
-    inside_qt = _inside_drawn(roi, big_xf.saxs_2d.shape)
-    assert np.array_equal(_mask(roi.get_parameter(), big_xf.saxs_2d.shape), inside_qt)
+    inside_qt = _inside_drawn(view, roi, big_xf.saxs_2d.shape)
+    (param,) = view.get_roi_list()
+    assert np.array_equal(_mask(param, big_xf.saxs_2d.shape), inside_qt)
 
 
 def test_r4_08_descriptor_without_polygon_keeps_the_wedge_about_the_beam_centre(
@@ -247,8 +277,7 @@ def test_r4_08_descriptor_without_polygon_keeps_the_wedge_about_the_beam_centre(
 
 def test_r4_08_ring_uses_the_drawn_centre_and_radii(big_xf, qapp):
     cx, cy, r_in, r_out = 10.3, 13.1, 4.0, 9.0
-    view = ImageViewDev()
-    view.setImage(big_xf.saxs_2d)
+    view = _view_with(big_xf)
     view.add_roi(cen=(cx, cy), radius=r_out, sl_type="Circle", label="RingA")
     view.add_roi(cen=(cx, cy), radius=r_in, sl_type="Circle", label="RingB")
     (param,) = view.get_roi_list()
@@ -257,19 +286,42 @@ def test_r4_08_ring_uses_the_drawn_centre_and_radii(big_xf, qapp):
     assert sorted(param["radius"]) == pytest.approx([r_in, r_out])
 
     # The circles are PAINTED as true ellipses (EllipseROI.paint -> drawEllipse of
-    # the bounding rect), so the oracle is the geometry of the drawn items.
+    # the bounding rect), so the oracle is the geometry of the drawn items, tested
+    # at the painted pixel centres mapped through the real ImageItem.
     shape = big_xf.saxs_2d.shape
-    rows, cols = np.indices(shape)
 
     def disc(roi):
         rect = roi.boundingRect()
-        c = roi.mapToParent(rect.center())
-        return np.hypot(cols - c.x(), rows - c.y()) < rect.width() / 2.0
+        c = rect.center()
+        return np.array(
+            [
+                [
+                    np.hypot(p.x() - c.x(), p.y() - c.y()) < rect.width() / 2.0
+                    for p in row
+                ]
+                for row in _centres_in_roi_frame(view, roi, shape)
+            ]
+        )
 
     annulus = disc(view.roi_record["RingA"]) & ~disc(view.roi_record["RingB"])
     assert annulus.any() and not annulus.all()
 
-    phi = np.mod(-np.degrees(np.arctan2(rows - cy, cols - cx)), 360.0)
+    # azimuth about the drawn centre, from the centres in the ROI parent frame
+    item = view.getImageItem()
+    parent = view.roi_record["RingA"].parentItem()
+    xy = np.array(
+        [
+            [
+                (q.x(), q.y())
+                for q in (
+                    parent.mapFromItem(item, QtCore.QPointF(c + 0.5, r + 0.5))
+                    for c in range(shape[1])
+                )
+            ]
+            for r in range(shape[0])
+        ]
+    )
+    phi = np.mod(-np.degrees(np.arctan2(xy[..., 1] - cy, xy[..., 0] - cx)), 360.0)
     lo, hi = phi[annulus].min(), phi[annulus].max()
     x, y = big_xf.get_roi_data(param, phi_num=6)
     idx = np.clip(((phi - lo) / ((hi - lo) / 6)).astype(int), 0, 5)

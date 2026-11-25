@@ -289,7 +289,8 @@ def pg_plot(
         plot_offset: Vertical offset exponent applied per file for
             visual separation. 0 means no offset.
         title: Plot title string, or None for no title.
-        rows: List of file indices to highlight at full opacity.
+        rows: Positions in ``xf_list`` (not target rows) to highlight at
+            full opacity; positions outside the list are ignored.
             Remaining files are drawn at alpha 0.35.
         qmax: Upper bound of the q-range to display (1/A).
         qmin: Lower bound of the q-range to display (1/A).
@@ -337,11 +338,15 @@ def pg_plot(
 
     # Vectorized alpha computation with early termination
     num_files = len(xf_list)
-    if rows:
-        alpha = np.full(num_files, 0.35, dtype=np.float32)
-        alpha[rows] = 1.0
-    else:
-        alpha = np.ones(num_files, dtype=np.float32)
+    # ``rows`` are positions in ``xf_list``; one outside it highlights nothing
+    # (and with nothing left to highlight, no file is dimmed)
+    highlight = [r for r in (rows or ()) if 0 <= r < num_files]
+    if len(highlight) != len(rows or ()):
+        logger.warning(f"pg_plot: ignoring highlight rows outside {num_files} files")
+    alpha = np.ones(num_files, dtype=np.float32)
+    if highlight:
+        alpha[:] = 0.35
+        alpha[highlight] = 1.0
 
     # Optimize background handling
     if not subtract_background:

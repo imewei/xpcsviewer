@@ -347,9 +347,9 @@ def test_r4_12_real_open_diagnosis_window_closed_for_replaced_file(g2_env):
     _finish_fit(view, launch)
     window = MagicMock()
     view._g2_diagnosis_window = window
-    view._g2_diagnosis_bundle = next(iter(view._g2_bayesian_store.values()))
     _replace(env.root, env.data, "a.h5", 999, (0.17, 0.27, 0.37))
     view.reload_source()
+    window.matches.assert_called()  # the window itself is asked (round 5)
     window.close.assert_called()
 
 
@@ -467,7 +467,7 @@ def test_r4_13_real_dialog_exports_its_own_snapshot(viewer_env, monkeypatch, tmp
     monkeypatch.setattr(
         viz,
         "export_bayesian_diagnostics",
-        lambda path, results: seen.update(nc=results),
+        lambda path, results, **k: seen.update(nc=results),
     )
     monkeypatch.setattr(
         QtWidgets.QFileDialog, "getExistingDirectory", lambda *a, **k: str(tmp_path)
@@ -557,7 +557,6 @@ def test_r4_14_evicted_diagnosis_window_is_closed_and_released(g2_env):
     _finish_fit(view, launch)
     window = MagicMock()
     view._g2_diagnosis_window = window
-    view._g2_diagnosis_bundle = next(iter(view._g2_bayesian_store.values()))
     view.list_view_target.selectionModel().select(
         view.vk.target.index(0, 0),
         QtCore.QItemSelectionModel.SelectionFlag.ClearAndSelect,
@@ -565,7 +564,7 @@ def test_r4_14_evicted_diagnosis_window_is_closed_and_released(g2_env):
     view.remove_target()
     window.close.assert_called()
     window.deleteLater.assert_called()
-    assert view._g2_diagnosis_window is None and view._g2_diagnosis_bundle is None
+    assert view._g2_diagnosis_window is None
 
 
 def test_r4_02_diagnosis_csv_export_marks_a_nonconverged_fit(

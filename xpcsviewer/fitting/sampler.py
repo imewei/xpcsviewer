@@ -196,36 +196,57 @@ def _run_mcmc(
     return mcmc, samples
 
 
+def _per_chain_bfmi(result) -> np.ndarray:
+    """Per-chain BFMI values from what ``az.bfmi`` returned.
+
+    ArviZ 1.x returns a DataTree (group ``sample_stats``, variable ``energy``,
+    dimension ``chain``); older releases and tests return a plain array.
+    """
+    if hasattr(result, "to_dataset"):  # DataTree
+        result = result.to_dataset()
+    if hasattr(result, "data_vars"):  # Dataset
+        parts = [
+            np.asarray(result[v].values, dtype=float).ravel() for v in result.data_vars
+        ]
+        if not parts:
+            raise ValueError("az.bfmi returned no variables")
+        return np.concatenate(parts)
+    return np.asarray(result, dtype=float).ravel()
+
+
 def compute_bfmi(arviz_data) -> float | None:
     """Compute BFMI from ArviZ DataTree.
 
     Parameters
     ----------
     arviz_data : DataTree
-        ArviZ DataTree object from MCMC sampling
+        ArviZ DataTree object from MCMC sampling (needs ``sample_stats/energy``)
 
     Returns
     -------
     float | None
-        Mean BFMI across chains, or None if computation fails
+        The minimum BFMI across chains (the worst chain decides, so that
+        ``FitDiagnostics.converged``'s ``bfmi < 0.2`` rule fails when any one
+        chain explores poorly), or None, with a WARNING, if it cannot be
+        computed. None is not evidence of convergence.
 
     Notes
     -----
-    Uses az.bfmi() which returns per-chain values.
-    Returns mean across all chains.
     Logs warning if BFMI < 0.2 per Technical Guidelines.
     """
     try:
-        bfmi_values = az.bfmi(arviz_data)
-        bfmi_mean = float(np.mean(bfmi_values))
-        if bfmi_mean < 0.2:
+        values = _per_chain_bfmi(az.bfmi(arviz_data))
+        if values.size == 0 or not np.all(np.isfinite(values)):
+            raise ValueError(f"non-finite or empty per-chain BFMI {values.tolist()}")
+        bfmi_min = float(np.min(values))
+        if bfmi_min < 0.2:
             logger.warning(
-                f"Low BFMI ({bfmi_mean:.3f}) indicates poor posterior exploration. "
+                f"Low BFMI ({bfmi_min:.3f}) indicates poor posterior exploration. "
                 f"Consider reparameterization or increasing warmup."
             )
-        return bfmi_mean
+        return bfmi_min
     except Exception as e:
-        logger.warning(f"Failed to compute BFMI: {e}")
+        logger.warning(f"Failed to compute BFMI (fit cannot count as converged): {e}")
         return None
 
 

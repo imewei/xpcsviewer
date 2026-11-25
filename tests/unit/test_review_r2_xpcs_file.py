@@ -417,7 +417,29 @@ def test_large_saxs_roi_uses_initialised_memory_manager(monkeypatch):
 def test_large_saxs_roi_without_pressure_takes_normal_path():
     xf = _roi_stub(MemoryPressure.LOW)
     x, y = xf.get_roi_data({"sl_type": "Ring", "radius": (0.5, 2.5)})
-    assert x.size == 180 and np.isfinite(y).any()
+
+    # Independent expectation: image value 4*row + col, beam centre at pixel
+    # (0, 0), phi = -atan2(row, col) in [0, 360); the 180 angle bins span
+    # [phi_min, phi_max] of the annulus pixels.
+    pixels = [
+        (col, row)
+        for row in range(4)
+        for col in range(4)
+        if 0.5 <= np.hypot(col, row) < 2.5
+    ]
+    phi = np.array([(-np.degrees(np.arctan2(r, c))) % 360.0 for c, r in pixels])
+    value = np.array([4.0 * r + c for c, r in pixels])
+    lo, hi = phi.min(), phi.max()
+    owner = np.minimum(((phi - lo) / ((hi - lo) / 180)).astype(int), 179)
+    expected = np.full(180, np.nan)
+    for b in np.unique(owner):
+        expected[b] = value[owner == b].mean()
+
+    np.testing.assert_allclose(x, np.linspace(lo, hi, 180))
+    # finite exactly where an angle bin holds annulus pixels, with their mean
+    assert np.array_equal(np.isfinite(y), np.isfinite(expected))
+    assert 0 < np.isfinite(y).sum() < 180
+    np.testing.assert_allclose(y, expected, equal_nan=True)
 
 
 def test_large_saxs_ring_roi_under_memory_pressure_still_returns_a_profile():

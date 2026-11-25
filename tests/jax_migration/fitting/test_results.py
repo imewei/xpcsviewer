@@ -61,6 +61,7 @@ class TestFitDiagnostics:
             ess_tail={"tau": 800, "baseline": 900},
             divergences=0,
             max_treedepth_reached=0,
+            bfmi=0.9,
         )
 
         assert diag.converged is True

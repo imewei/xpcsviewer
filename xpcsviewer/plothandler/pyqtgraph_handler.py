@@ -277,15 +277,74 @@ class ImageViewDev(ImageView):
         for key in keys:
             self.remove_roi(key)
 
+    # The two circles of a Ring (``Circle`` / ``Phi-Ring``) are one ROI: they
+    # are added, replaced and removed together, and exported as one Ring.
+    RING_PARTS = ("RingA", "RingB")
+
     def remove_roi(self, roi_key):
-        t = self.roi_record.pop(roi_key, None)
-        if t is not None:
-            self.removeItem(t)
+        keys = self.RING_PARTS if roi_key in self.RING_PARTS else (roi_key,)
+        for key in keys:
+            t = self.roi_record.pop(key, None)
+            if t is not None:
+                self.removeItem(t)
+
+    def pixel_centre(self, col, row, parent=None):
+        """Display position (x, y) of the point ``(col, row)`` of the pixel-INDEX frame.
+
+        Calibrated coordinates (beam centre, ``QMap.compute_qmap``) put the centre
+        of pixel i at coordinate i, while the image item draws pixel i over the
+        unit square [i, i+1]; so index (col, row) is item point (col + 0.5,
+        row + 0.5). The item's real transform (rotation, shift) then carries it
+        to the frame ``parent`` (default: the item's parent, where the view
+        draws markers and ROIs).
+        """
+        item = self.getImageItem()
+        point = QtCore.QPointF(col + 0.5, row + 0.5)
+        mapped = (
+            parent.mapFromItem(item, point)
+            if parent is not None
+            else item.mapToParent(point)
+        )
+        return mapped.x(), mapped.y()
+
+    def pixel_index_at(self, x, y):
+        """``(col, row)`` of the pixel drawn under the display position (x, y)."""
+        mapped = self.getImageItem().mapFromParent(QtCore.QPointF(x, y))
+        return int(np.floor(mapped.x())), int(np.floor(mapped.y()))
+
+    def _pixel_frame(self, roi):
+        """Where the image item draws its pixel centres, in ``roi``'s parent frame.
+
+        An ``ImageItem`` draws pixel (row, col) over the unit square starting at
+        (col, row) in its own coordinates, so the pixel's centre is the centre of
+        that square; the real item transform then places it in the frame the ROI
+        is positioned in. The export tests pixel centres in exactly this frame.
+        """
+        parent = roi.parentItem()
+
+        def centre(col, row):
+            return self.pixel_centre(col, row, parent)
+
+        ox, oy = centre(0, 0)
+        cx, cy = centre(1, 0)
+        rx, ry = centre(0, 1)
+        return {
+            "origin": (ox, oy),
+            "col_step": (cx - ox, cy - oy),
+            "row_step": (rx - ox, ry - oy),
+        }
 
     def get_roi_list(self):
         parameter = []
         for key, roi in self.roi_record.items():
             if key == "Center":
+                continue
+            if key in self.RING_PARTS and not all(
+                part in self.roi_record for part in self.RING_PARTS
+            ):
+                logger.warning(
+                    f"ROI list: skipping incomplete ring ({key} without its pair)"
+                )
                 continue
             if key.startswith("RingB"):
                 state = roi.getState()
@@ -303,10 +362,13 @@ class ImageViewDev(ImageView):
                         float(state["pos"][0]) + state["size"][0] / 2.0,
                         float(state["pos"][1]) + state["size"][1] / 2.0,
                     ),
+                    # where pixel centres are drawn in that same frame
+                    "pixel_frame": self._pixel_frame(roi),
                 }
                 parameter.append(temp)
             elif key.startswith("roi"):
                 temp = roi.get_parameter()
+                temp["pixel_frame"] = self._pixel_frame(roi)
                 parameter.append(temp)
         return parameter
 

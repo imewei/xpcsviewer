@@ -117,8 +117,8 @@ class FitDiagnostics:
     max_treedepth_reached : int
         Count of max treedepth events
     bfmi : float | None
-        Bayesian Fraction of Missing Information (mean across chains).
-        Added per Technical Guidelines for Bayesian inference compliance.
+        Bayesian Fraction of Missing Information (minimum across chains).
+        None means it could not be computed, which fails ``converged``.
 
     Properties (computed)
     ---------------------
@@ -132,7 +132,7 @@ class FitDiagnostics:
     ess_bulk > 400 : Sufficient effective samples
     ess_tail > 400 : Sufficient tail samples
     divergences == 0 : No divergent transitions
-    bfmi >= 0.2 : Adequate exploration (if computed)
+    bfmi >= 0.2 : Adequate exploration (must be computed)
     """
 
     r_hat: dict[str, float] = field(default_factory=dict)
@@ -183,8 +183,9 @@ class FitDiagnostics:
         if self.divergences > 0:
             return False
 
-        # BFMI check (per Technical Guidelines)
-        if self.bfmi is not None and self.bfmi < 0.2:
+        # BFMI is a mandatory diagnostic: not computed (None) or NaN is not
+        # evidence of convergence, and the weakest chain must reach 0.2.
+        if self.bfmi is None or not math.isfinite(self.bfmi) or self.bfmi < 0.2:
             return False
 
         return True

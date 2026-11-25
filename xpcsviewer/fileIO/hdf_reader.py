@@ -48,14 +48,24 @@ MEMORY_PRESSURE_MODERATE = 0.70  # 70% - Moderate memory pressure
 def _file_identity(path: str) -> tuple[int, ...] | None:
     """Identify the file revision currently at ``path`` (None if unreadable).
 
-    An atomic replace changes the inode (and usually mtime/size), so a handle
-    or cached array tied to the old identity no longer describes ``path``.
+    This is the single revision identity of the package: the connection pool,
+    read caches, QMap keys, C2 cache and FileLocator all compare it, so they
+    invalidate together. It is ``(inode, device, mtime_ns, size, ctime_ns)``.
+
+    An atomic replace changes the inode. An in-place rewrite that restores the
+    old mtime and size (``shutil.copy2`` of a corrected file) is still seen
+    because the kernel sets ctime on every content or metadata change and it
+    cannot be set from user space. The same property means that a ``chmod``,
+    ``chown`` or rename of the file also changes ctime and therefore triggers a
+    reload of an unchanged file: a spurious reload is accepted, a stale read is
+    not. On Windows ctime is the creation time, so there the in-place
+    rewrite with restored mtime and size is not detected.
     """
     try:
         st = os.stat(path)
     except OSError:
         return None
-    return (st.st_ino, st.st_dev, st.st_mtime_ns, st.st_size)
+    return (st.st_ino, st.st_dev, st.st_mtime_ns, st.st_size, st.st_ctime_ns)
 
 
 class PooledConnection:

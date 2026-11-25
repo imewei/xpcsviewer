@@ -49,6 +49,8 @@ class BayesianBundle:
     y: NDArray
     yerr: NDArray | None
     result: Any = None
+    # Q range the observations were selected with (diffusion fits); None for G2.
+    q_range: tuple[float, float] | None = None
 
     @classmethod
     def create(
@@ -61,6 +63,7 @@ class BayesianBundle:
         x: Any,
         y: Any,
         yerr: Any = None,
+        q_range: tuple[float, float] | None = None,
     ) -> BayesianBundle:
         return cls(
             fname,
@@ -71,6 +74,7 @@ class BayesianBundle:
             _frozen(x),
             _frozen(y),
             None if yerr is None else _frozen(yerr),
+            q_range=None if q_range is None else (float(q_range[0]), float(q_range[1])),
         )
 
     @property
@@ -108,6 +112,29 @@ def resolve_g2_bins(xf: Any, q_range: Any) -> list[tuple[int, float, str]]:
         for k, (i, ok) in enumerate(zip(sel, keep, strict=True))
         if ok
     ]
+
+
+def resolve_bin_phi(xf: Any, bin_ids: Any) -> NDArray:
+    """Numeric azimuth of each absolute dynamic bin (NaN where the map has none).
+
+    Absolute bin ``a`` of a ``(q, phi)`` map with ``dynamic_num_pts = (nq, nphi)``
+    sits at ``(a // nphi, a % nphi)``; the value is ``dplist[a % nphi]`` in the
+    map's own angle unit (degrees for APS files).
+    """
+    out = np.full(len(bin_ids), np.nan)
+    try:
+        qmap = xf.qmap
+        if list(qmap.map_names)[:2] != ["q", "phi"]:
+            return out
+        nphi = int(qmap.dynamic_num_pts[1])
+        phi = np.asarray(qmap.dplist, dtype=float).ravel()
+    except (AttributeError, IndexError, TypeError, ValueError):
+        return out
+    for k, b in enumerate(bin_ids):
+        j = int(b) % nphi if nphi > 0 else -1
+        if 0 <= j < phi.size:
+            out[k] = phi[j]
+    return out
 
 
 # Legacy parameter order for single_exp_all(x, a, b, c, d):
@@ -216,6 +243,7 @@ def assemble_fit_summary(
     fit_t_range: tuple[float, float] | None = None,
     obs_g2: Any = None,
     obs_t_el: Any = None,
+    bin_phi: Any = None,
 ) -> dict[str, Any]:
     """Convert per-Q Bayesian results into NLSQ-compatible fit_summary.
 
@@ -233,9 +261,10 @@ def assemble_fit_summary(
         Bayesian model function (``single_exp_func`` or ``double_exp_func``).
     q_range, t_range, bounds, fit_flag, label : optional
         Metadata fields matching the NLSQ fit_summary format.
-    fname, bin_ids, fit_q_range, fit_t_range, obs_g2, obs_t_el : optional
+    fname, bin_ids, bin_phi, fit_q_range, fit_t_range, obs_g2, obs_t_el : optional
         Provenance that makes the summary self-contained: the file, the
-        absolute bin ID of every column, the Q/delay ranges of the fit and
+        absolute bin ID and numeric azimuth of every column, the Q/delay
+        ranges of the fit and
         the observations (G2 matrix and delays) that were fitted.  Plotting
         uses these instead of re-extracting current data.
 
@@ -257,6 +286,8 @@ def assemble_fit_summary(
     num_q = len(q_arr)
     if bin_ids is not None and len(bin_ids) != num_q:
         raise ValueError(f"bin_ids has {len(bin_ids)} entries for {num_q} Q-bins")
+    if bin_phi is not None and len(bin_phi) != num_q:
+        raise ValueError(f"bin_phi has {len(bin_phi)} entries for {num_q} Q-bins")
     if obs_g2 is not None and np.shape(obs_g2)[1:2] != (num_q,):
         raise ValueError("obs_g2 columns do not match the Q-bins of the summary")
     nparams = _SINGLE_EXP_NPARAMS if fit_func_name == "single" else _DOUBLE_EXP_NPARAMS
@@ -356,6 +387,7 @@ def assemble_fit_summary(
         "n_rhat_unavailable": rhat_unavailable,
         "fname": fname,
         "bin_ids": None if bin_ids is None else np.asarray(bin_ids),
+        "bin_phi": None if bin_phi is None else np.asarray(bin_phi, dtype=float),
         "fit_q_range": fit_q_range,
         "fit_t_range": fit_t_range,
         "obs_g2": None if obs_g2 is None else _frozen(obs_g2),

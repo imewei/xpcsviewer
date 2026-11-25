@@ -139,11 +139,23 @@ def test_parallel_worker_evaluation_limit_is_flagged(monkeypatch):
     monkeypatch.setattr(
         legacy, "curve_fit", lambda *a, **k: real(*a, **{**k, "max_nfev": 1})
     )
-    args = _single_exp_all_args(12)
-    serial = fit_with_fixed(*args, p0=P0, return_status=True)[2]
-    parallel = fit_with_fixed_parallel(*args, p0=P0, return_status=True)[2]
+    # Identifiable model (the GUI's): legacy.single_exp_all has redundant c and d
+    # and would be failed by the rank check whatever the evaluation limit does.
+    from xpcsviewer.xpcs_file.fitting import single_exp_all
+
+    args = (single_exp_all, *_single_exp_all_args(12)[1:])
+    # Start away from the truth (the data are generated at P0, where the solver
+    # converges on its first evaluation and the limit never bites).
+    start = np.array([0.1, 5.0, 0.8, 1.05])
+    serial = fit_with_fixed(*args, p0=start, return_status=True)[2]
+    parallel = fit_with_fixed_parallel(*args, p0=start, return_status=True)[2]
     assert not serial.any()
     assert not parallel.any()
+    # Control: the same fit without the limit converges, so only the evaluation
+    # limit can explain the failures above.
+    monkeypatch.undo()
+    assert fit_with_fixed(*args, p0=start, return_status=True)[2].all()
+    assert fit_with_fixed_parallel(*args, p0=start, return_status=True)[2].all()
 
 
 def test_parallel_converged_fit_reports_success():

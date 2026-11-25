@@ -882,10 +882,15 @@ class TestChain6JAXBoundaryLeak:
         import inspect
 
         from xpcsviewer import xpcs_viewer
+        from xpcsviewer.module import saxs2d
 
-        source = inspect.getsource(xpcs_viewer.XpcsViewer.apply_saxs_2d_result)
+        # the setImage call moved into the one SAXS-2D draw function
+        assert "saxs2d.draw" in inspect.getsource(
+            xpcs_viewer.XpcsViewer.apply_saxs_2d_result
+        )
+        source = inspect.getsource(saxs2d.draw)
         assert "ensure_numpy" in source, (
-            "BUG-027 regression: apply_saxs_2d_result missing ensure_numpy at setImage call"
+            "BUG-027 regression: saxs2d.draw missing ensure_numpy at setImage call"
         )
 
     def test_boundary_point_xpcs_viewer_apply_g2_result(self):
@@ -964,10 +969,15 @@ class TestChain6JAXBoundaryLeak:
         import inspect
 
         from xpcsviewer import xpcs_viewer
-        from xpcsviewer.simplemask import simplemask_kernel, simplemask_window
 
         # Point 1: apply_saxs_2d_result
-        saxs_source = inspect.getsource(xpcs_viewer.XpcsViewer.apply_saxs_2d_result)
+        from xpcsviewer.module import saxs2d
+        from xpcsviewer.simplemask import simplemask_kernel, simplemask_window
+
+        assert "saxs2d.draw" in inspect.getsource(
+            xpcs_viewer.XpcsViewer.apply_saxs_2d_result
+        )
+        saxs_source = inspect.getsource(saxs2d.draw)
         assert "ensure_numpy" in saxs_source, "Boundary 1 missing ensure_numpy"
 
         # Point 2: apply_g2_result (covered by using worker result dict directly)

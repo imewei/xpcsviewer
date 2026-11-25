@@ -31,6 +31,9 @@ class StubKernel(file_locator.FileLocator):
     def plot_saxs_2d(self, **kwargs):
         pass
 
+    def background_revision(self):  # part of every plot request (no SAXS background)
+        return None
+
 
 @pytest.fixture
 def viewer(qtbot, monkeypatch, tmp_path):

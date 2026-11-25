@@ -254,7 +254,7 @@ def test_converged_bayesian_fit_remains_a_measurement():
         "tau": 0.1 + 0.001 * rng.standard_normal(100),
         "baseline": 1.0 + 0.01 * rng.standard_normal(100),
     }
-    good = FitResult(samples=samples, diagnostics=FitDiagnostics())
+    good = FitResult(samples=samples, diagnostics=FitDiagnostics(bfmi=0.9))
     assert good.diagnostics.converged
     s = assemble_fit_summary(
         {0: good, 1: None}, np.array([0.1, 0.2]), T, "single", single_exp_func

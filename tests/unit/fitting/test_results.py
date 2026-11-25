@@ -56,8 +56,8 @@ class TestFitDiagnosticsBFMI:
         )
         assert diagnostics.converged is False
 
-    def test_converged_passes_with_none_bfmi(self):
-        """T030: Verify converged ignores bfmi when None (not computed)."""
+    def test_converged_fails_with_none_bfmi(self):
+        """R5-15: a BFMI that was not computed is not evidence of convergence."""
         from xpcsviewer.fitting.results import FitDiagnostics
 
         diagnostics = FitDiagnostics(
@@ -67,7 +67,7 @@ class TestFitDiagnosticsBFMI:
             divergences=0,
             bfmi=None,  # Not computed
         )
-        assert diagnostics.converged is True
+        assert diagnostics.converged is False
 
     def test_converged_boundary_bfmi(self):
         """T030: Verify bfmi boundary at exactly 0.2."""
