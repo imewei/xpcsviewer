@@ -269,6 +269,7 @@ three-brain-out/
 # Claude session scratch files in docs
 docs/.claude-progress.md
 docs/superpowers/
+.superpowers/
 
 # ----------------------------------------------------------------------------
 # Graphify (Knowledge Graph & Semantic Cache)
