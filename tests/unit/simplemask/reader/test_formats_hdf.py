@@ -226,3 +226,21 @@ class TestGetFormatLoader:
         fname = str(tmp_path / "data.xyz")
         with pytest.raises(ValueError, match="unsupported dataset file"):
             get_format_loader(fname)
+
+
+@pytest.mark.parametrize("num_frames", [-1, 0, 1])
+def test_hdf_single_image_accepts_preset_frame_ranges(tmp_path, num_frames):
+    fname = str(tmp_path / "img.h5")
+    with h5py.File(fname, "w") as f:
+        f.create_dataset("/entry/data/data", data=np.arange(4).reshape(2, 2))
+    out = HdfDataset(fname).get_scattering(num_frames=num_frames, begin_idx=0)
+    np.testing.assert_array_equal(out, [[0, 1], [2, 3]])
+
+
+@pytest.mark.parametrize("begin_idx, num_frames", [(99, -1), (1, 1), (0, 5), (0, -2)])
+def test_hdf_single_image_rejects_out_of_range_frames(tmp_path, begin_idx, num_frames):
+    fname = str(tmp_path / "img.h5")
+    with h5py.File(fname, "w") as f:
+        f.create_dataset("/entry/data/data", shape=(2, 2))
+    with pytest.raises(ValueError, match="single 2-D image"):
+        HdfDataset(fname).get_scattering(num_frames=num_frames, begin_idx=begin_idx)
