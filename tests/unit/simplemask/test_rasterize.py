@@ -46,7 +46,7 @@ GOLDENS = {
     ),
     "line": (
         47,
-        "93f1645decb20dbe7f4506cc33d04b5e98f29b5e7fc613e99d3c14709dbb2cc2",
+        "b2d72fe13938daa46ac70313190c0b1351c24e2d9b159fc6c2cf2327c7c05ead",
     ),
     "inclusive_rect_exclusive_circle": (
         621,
@@ -87,7 +87,9 @@ def test_matches_upstream_rectangle():
 
 
 def test_matches_upstream_line():
-    roi = RoiPolygon(line_vertices((4, 5), (14, 17), 3.0))
+    # Endpoints off the pixel lattice: with integer endpoints two pixel centres
+    # sit exactly on the end caps and flip with last-bit libm differences.
+    roi = RoiPolygon(line_vertices((4.4, 5.3), (14.1, 17.4), 3.0))
     _assert_golden("line", rasterize(SHAPE, [roi]))
 
 

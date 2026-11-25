@@ -314,8 +314,13 @@ def test_regroup_export_round_trips_native_filename_bytes(
         pytest.skip(
             "filesystem encoding decodes the filenames without surrogate escape"
         )
-    source_path = source_path.rename(tmp_path / source_name)
-    qmap_path = qmap_path.rename(tmp_path / qmap_name)
+    try:
+        source_path = source_path.rename(tmp_path / source_name)
+        qmap_path = qmap_path.rename(tmp_path / qmap_name)
+    except OSError as exc:
+        if exc.errno != errno.EILSEQ:
+            raise
+        pytest.skip("filesystem rejects non-UTF-8 filenames (e.g. macOS APFS)")
     output = tmp_path / "derived.h5"
 
     g2_regroup.export_g2_regroup(read_g2_regroup(source_path, qmap_path), output)
