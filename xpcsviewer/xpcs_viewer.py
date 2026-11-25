@@ -3343,10 +3343,28 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
 
     def _initialize_g2_fit_bounds(self, extent: tuple[float, float] | None) -> None:
         if not self._g2_fit_bounds_initialized and extent is not None:
-            self._g2_fit_bounds_initialized = True
             t_min, t_max = extent
-            self.g2_bmin.setValue(t_min / 20)
-            self.g2_bmax.setValue(t_max * 10)
+            # Mirror the spin boxes' rounding and clamping to spot inverted bounds.
+            lo, hi = (
+                min(max(round(value, box.decimals()), box.minimum()), box.maximum())
+                for box, value in (
+                    (self.g2_bmin, t_min / 20),
+                    (self.g2_bmax, t_max * 10),
+                )
+            )
+            if hi <= lo:
+                logger.info(
+                    "G2 fit bounds not initialised: delays %s..%s give tau bounds "
+                    "%s..%s after spin-box rounding",
+                    t_min,
+                    t_max,
+                    lo,
+                    hi,
+                )
+                return
+            self._g2_fit_bounds_initialized = True
+            self.g2_bmin.setValue(lo)
+            self.g2_bmax.setValue(hi)
 
     def init_g2(self, qd_per_file, tel):
         from .module import g2mod
