@@ -89,6 +89,8 @@ def _read_delays(
         seconds = delays * (timing_dtype.type(frame_time) * stride * average)
     if not np.isfinite(seconds).all():
         raise ValueError("Elapsed delay seconds must be finite")
+    if np.any((delays > 0) & (seconds == 0)):
+        raise ValueError("Elapsed delay seconds underflow to zero")
 
     unit = dataset.attrs.get("units")
     return delays, seconds, unit if isinstance(unit, (str, bytes)) else None

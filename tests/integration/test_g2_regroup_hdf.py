@@ -448,3 +448,16 @@ def test_regroup_export_cleans_up_failed_write_or_publication(
         g2_regroup.export_g2_regroup(result, output)
 
     assert set(tmp_path.iterdir()) == {source_path, qmap_path}
+
+
+def test_regroup_rejects_positive_delay_that_underflows_to_zero_seconds(
+    source_path, qmap_path
+):
+    with h5py.File(source_path, "r+") as source:
+        del source[DELAY_PATH], source[FRAME_TIME_PATH]
+        del source[STRIDE_PATH], source[AVERAGE_PATH]
+        source[DELAY_PATH] = [0, 1e-200, 2e-200]
+        source[FRAME_TIME_PATH] = 1e-200
+
+    with pytest.raises(ValueError, match="underflow"):
+        read_g2_regroup(source_path, qmap_path)
