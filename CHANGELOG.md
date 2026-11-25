@@ -27,6 +27,10 @@ All notable changes to this project will be documented in this file.
 - Averaging: a second Start click on a queued, running, finished or killed job is ignored (it could crash the application)
 - Averaging: an integer-typed first file no longer makes the sum fail or truncate on the sequential or parallel path (sums are float64), and a file is counted as accepted only after all of its fields were added
 - Averaging: a queued job can now be killed with the Kill button; it ends `killed` without opening any file
+- G2 fit panel: delay ranges so short that the tau bounds would round to an empty or inverted range no longer initialise the bounds, so a later, slower scan can still set usable defaults
+- Fitting: tau-q with fewer than two distinct positive q values and both parameters free now reports a failed fit instead of raising a linear-algebra error or reporting the bounds midpoint as a success
+- G2 regroup: a positive delay whose elapsed time underflows to zero seconds is now rejected with an error
+- Q-map: the q-bin label lookup returns "invalid qbin" for booleans, non-integral numbers and non-numeric values, and accepts integral floats and NumPy integers
 - Mask Editor: raw-frame averaging accumulates in float64 on every path, so one and several processes give the same image, and the averaged frame range (with a note when only a representative subset is used) is logged
 - Mask Editor: a rejected mask import is reported as a failure in the status bar and log, without a modal dialog; datasets of unsupported type (strings, bytes, complex) are rejected the same way, and upper-case `.H5`/`.HDF5` extensions are accepted
 - Mask Editor: draw and parameter edits replace their own mask layer instead of accumulating; Apply with nothing drawable is a no-op
