@@ -4,7 +4,9 @@ import h5py
 import numpy as np
 import pytest
 
+from xpcsviewer.simplemask.qmap import compute_qmap
 from xpcsviewer.simplemask.reader import get_reader
+from xpcsviewer.simplemask.reader.adapter import to_kernel_metadata
 from xpcsviewer.simplemask.reader.beamlines.aps_8idi import (
     APS8IDIReader,
     get_nexus_metadata,
@@ -138,3 +140,60 @@ class TestGetReader:
         _write_8idi_file(fname)
         with pytest.raises(ValueError, match="unsupported beamline"):
             get_reader("APS_9IDD", fname)
+
+
+SWING_PATHS = {
+    "swing_angle_horizontal": "/entry/instrument/detector_1/flightpath_swing",
+    "swing_angle_vertical": "/entry/instrument/detector_1/flightpath_swing_vertical",
+}
+
+
+def _add_swing(fname, horizontal, vertical):
+    with h5py.File(fname, "a") as f:
+        f.create_dataset(SWING_PATHS["swing_angle_horizontal"], data=horizontal)
+        f.create_dataset(SWING_PATHS["swing_angle_vertical"], data=vertical)
+
+
+class TestSwingAngles:
+    def _kernel_metadata(self, fname):
+        reader = APS8IDIReader(fname)
+        reader.prepare_data()
+        assert reader.metadata_is_placeholder is False
+        return to_kernel_metadata(reader.metadata, reader.stype)
+
+    def test_swing_reaches_kernel_metadata_and_changes_qmap(self, tmp_path):
+        plain = str(tmp_path / "plain.h5")
+        swung = str(tmp_path / "swung.h5")
+        _write_8idi_file(plain, shape=(8, 9), bcx0=4.0, bcy0=3.0)
+        _write_8idi_file(swung, shape=(8, 9), bcx0=4.0, bcy0=3.0)
+        _add_swing(swung, 20.0, 5.0)
+
+        plain_meta = self._kernel_metadata(plain)
+        swung_meta = self._kernel_metadata(swung)
+
+        assert swung_meta["swing_angle_horizontal"] == 20.0
+        assert swung_meta["swing_angle_vertical"] == 5.0
+        assert plain_meta["swing_angle_horizontal"] == 0.0
+        assert plain_meta["swing_angle_vertical"] == 0.0
+        # Non-swung file: the kernel metadata is otherwise unchanged.
+        assert {k: v for k, v in plain_meta.items() if not k.startswith("swing_")} == {
+            "bcx": 4.0,
+            "bcy": 3.0,
+            "pix_dim": pytest.approx(0.075),
+            "det_dist": 6000.0,
+            "energy": 11.0,
+            "shape": (8, 9),
+            "stype": "Transmission",
+        }
+
+        q_plain = compute_qmap("Transmission", plain_meta)[0]["q"]
+        q_swung = compute_qmap("Transmission", swung_meta)[0]["q"]
+        assert q_plain[3, 4] == pytest.approx(0.0, abs=1e-12)
+        assert q_swung[3, 4] > 0.1
+
+    def test_nan_swing_is_rejected_naming_the_field(self, tmp_path):
+        fname = str(tmp_path / "nan.h5")
+        _write_8idi_file(fname)
+        _add_swing(fname, float("nan"), 0.0)
+        with pytest.raises(ValueError, match="swing_angle_horizontal"):
+            self._kernel_metadata(fname)

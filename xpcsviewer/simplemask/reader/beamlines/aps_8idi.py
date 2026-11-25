@@ -20,9 +20,12 @@ METADATA_KEYMAPS: dict[str, str] = {
     "ccdy0": "/entry/instrument/detector_1/beam_center_position_y",
     "bcx0": "/entry/instrument/detector_1/beam_center_x",
     "bcy0": "/entry/instrument/detector_1/beam_center_y",
+    "swing_angle_horizontal": "/entry/instrument/detector_1/flightpath_swing",
+    "swing_angle_vertical": "/entry/instrument/detector_1/flightpath_swing_vertical",
 }
 
-OPTIONAL_FIELDS: list[str] = []
+# Detector swing (degrees); absent in unswung scans, which then read as 0.0.
+OPTIONAL_FIELDS: list[str] = ["swing_angle_horizontal", "swing_angle_vertical"]
 
 
 def get_nexus_metadata(fname: str, metadata_fname: str | None = None) -> dict[str, Any]:
@@ -43,6 +46,10 @@ def get_nexus_metadata(fname: str, metadata_fname: str | None = None) -> dict[st
     meta, _meta_fname = read_nexus_metadata(
         fname, METADATA_KEYMAPS, OPTIONAL_FIELDS, metadata_fname=metadata_fname
     )
+
+    for key in OPTIONAL_FIELDS:
+        if meta.get(key) is None:
+            meta[key] = 0.0
 
     # Beam center = recorded center + detector translation in pixels.
     # Type: ignore needed because dict values are Any, but arithmetic is safe.
