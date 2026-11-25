@@ -33,7 +33,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 # Import validation components
 try:
-    from scientific_accuracy_validator import ScientificAccuracyValidationFramework
+    from scientific_accuracy_validator import (
+        ScientificAccuracyValidationFramework,
+        report_passed,
+    )
 
     VALIDATION_COMPONENTS_AVAILABLE = True
 except ImportError as e:
@@ -162,6 +165,16 @@ class ValidationOrchestrator:
                 else:
                     self.phase_validation_status["Phase3_Vectorization"] = "failed"
 
+            report = self.results["accuracy"]
+            if not report_passed(report):
+                # Same predicate as the standalone validator's exit status
+                self.phase_validation_status["Phase3_Vectorization"] = "failed"
+                self.logger.error(
+                    f"Scientific accuracy validation failed: {report.tests_failed} "
+                    f"failed case(s), score {report.overall_accuracy_score:.1f}%"
+                )
+                return False
+
             self.logger.info("Scientific accuracy validation completed successfully")
             return True
 
@@ -236,13 +249,19 @@ class ValidationOrchestrator:
                 timeout=300,
             )
 
+            # A pass/fail pytest run: the score is the actual outcome, not an estimate
+            stability_score = 100.0 if result.returncode == 0 else 0.0
             self.results["stability"] = type(
                 "StabilityResult",
                 (),
                 {
-                    "overall_stability_score": 95.0 if result.returncode == 0 else 60.0,
+                    "overall_stability_score": stability_score,
                     "stress_test_results": [
-                        {"test_name": "memory_limits", "system_stability_score": 95.0}
+                        {
+                            "test_name": "memory_limits",
+                            "system_stability_score": stability_score,
+                            "return_code": result.returncode,
+                        }
                     ],
                 },
             )()
@@ -445,13 +464,34 @@ class ValidationOrchestrator:
             "monitoring_requirements": [],
         }
 
+        # Blockers (critical issues, failed required steps/phases) come before any
+        # score threshold: nothing is recommended for deployment while one exists.
+        blockers = list(critical_issues)
+        # generate_recommendations() already lists failed steps/phases as critical
+        # issues; this covers callers that pass only a score.
+        if not blockers and self.failed_steps:
+            blockers.append(
+                f"Required validation steps failed: {', '.join(self.failed_steps)}"
+            )
+        failed_phases = [
+            phase
+            for phase, status in self.phase_validation_status.items()
+            if status == "failed"
+        ]
+        if not blockers and failed_phases:
+            blockers.append(f"Failed phases: {', '.join(failed_phases)}")
+
         # Determine deployment readiness
-        if overall_score >= 85 and len(critical_issues) == 0:
+        if blockers:
+            readiness_assessment["recommended_action"] = (
+                "Do not deploy - resolve the deployment blockers first"
+            )
+        elif overall_score >= 85:
             readiness_assessment["ready_for_production"] = True
             readiness_assessment["recommended_action"] = (
                 "Deploy to production with monitoring"
             )
-        elif overall_score >= 75 and len(critical_issues) <= 1:
+        elif overall_score >= 75:
             readiness_assessment["ready_for_beta"] = True
             readiness_assessment["recommended_action"] = (
                 "Deploy to beta testing environment"
@@ -467,8 +507,7 @@ class ValidationOrchestrator:
             )
 
         # Identify deployment blockers
-        if len(critical_issues) > 0:
-            readiness_assessment["deployment_blockers"] = critical_issues
+        readiness_assessment["deployment_blockers"] = blockers
 
         # Identify risks
         if self.phase_validation_status.get("Phase1_Memory") != "passed":

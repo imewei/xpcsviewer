@@ -250,6 +250,85 @@ def _param_errors(pcov: Any, n_free: int) -> NDArray[np.floating[Any]]:
     return np.sqrt(np.where(np.isfinite(diag) & (diag >= 0), diag, np.nan))
 
 
+def fit_success_mask(fit_summary: dict[str, Any]) -> NDArray[np.bool_]:
+    """Per-Q boolean mask: True where a G2 fit result is a usable measurement.
+
+    The solver's stored ``fit_success`` (or a Bayesian summary's ``failed_mask``)
+    is authoritative; a row also needs finite fitted parameters. Summaries that
+    store neither fall back to the finiteness test alone. Every consumer of
+    ``fit_val`` / ``fit_line`` (plots, exports, tau-Q) uses this one rule.
+    """
+    val = np.asarray(fit_summary["fit_val"], dtype=float)
+    if val.ndim != 3:
+        return np.zeros(len(val), dtype=bool)
+    ok = np.isfinite(val[:, 0, :]).all(axis=1)
+    stored = fit_summary.get("fit_success")
+    if stored is None and fit_summary.get("failed_mask") is not None:
+        stored = ~np.asarray(fit_summary["failed_mask"], dtype=bool)
+    if stored is None:
+        return ok
+    stored = np.asarray(stored, dtype=bool).ravel()
+    aligned = np.zeros(len(ok), dtype=bool)  # rows without a status are not trusted
+    n = min(len(stored), len(ok))
+    aligned[:n] = stored[:n]
+    return ok & aligned
+
+
+def _solve_column(
+    wrapper_func: Callable[..., Any],
+    x: NDArray[np.floating[Any]],
+    y_col: NDArray[np.floating[Any]],
+    sigma_col: NDArray[np.floating[Any]],
+    p0: NDArray[np.floating[Any]],
+    bounds_fit: NDArray[np.floating[Any]],
+    **curve_fit_kwargs: Any,
+) -> tuple[
+    NDArray[np.floating[Any]] | None, NDArray[np.floating[Any]] | None, bool, str
+]:
+    """Fit one column under the single set of rules every solver path shares.
+
+    Returns ``(popt, errors, ok, reason)``. ``ok`` is False when the column has
+    fewer finite observations than free parameters, when the solver raised, or
+    when it stopped without converging (``result.success`` False, e.g. at the
+    evaluation limit). ``popt`` is None when no iterate exists; a non-converged
+    column keeps the solver's last iterate (still ``ok`` False). ``errors`` come
+    from ``_param_errors`` (NaN where the covariance is unavailable).
+    """
+    n_obs = int(np.count_nonzero(np.isfinite(y_col) & np.isfinite(x)))
+    if n_obs < len(p0):
+        return (
+            None,
+            None,
+            False,
+            f"{n_obs} observations cannot determine {len(p0)} free parameters",
+        )
+    try:
+        result = curve_fit(
+            wrapper_func,
+            x,
+            y_col,
+            sigma=sigma_col,
+            p0=p0,
+            bounds=(bounds_fit[0], bounds_fit[1]),
+            **curve_fit_kwargs,
+        )
+        popt, pcov = result
+    except Exception as e:
+        return None, None, False, str(e)
+    popt = np.asarray(popt, dtype=float)
+    errors = _param_errors(pcov, len(p0))
+    if not getattr(result, "success", True):
+        return (
+            popt,
+            errors,
+            False,
+            f"did not converge: {getattr(result, 'message', '')}",
+        )
+    if not np.all(np.isfinite(popt)):
+        return popt, errors, False, "non-finite parameters"
+    return popt, errors, True, ""
+
+
 @log_timing(threshold_ms=100)
 def fit_with_fixed(
     base_func: Callable[..., NDArray[np.floating[Any]]],
@@ -350,40 +429,21 @@ def fit_with_fixed(
 
     # Fit each column
     for n in range(y.shape[1]):
-        try:
-            sigma_col = sigma[:, n] if sigma.ndim > 1 else sigma
-            n_obs = int(np.count_nonzero(np.isfinite(y[:, n])))
-            if n_obs < len(p0):
-                raise ValueError(
-                    f"{n_obs} observations cannot determine {len(p0)} free parameters"
-                )
-            result = curve_fit(
-                wrapper_func,
-                x,
-                y[:, n],
-                sigma=sigma_col,
-                p0=p0,
-                bounds=(bounds_fit[0], bounds_fit[1]),
-                max_nfev=5000,
-            )
-            popt, pcov = result
+        sigma_col = sigma[:, n] if sigma.ndim > 1 else sigma
+        popt, errors, ok, reason = _solve_column(
+            wrapper_func, x, y[:, n], sigma_col, p0, bounds_fit, max_nfev=5000
+        )
+        if not ok:
+            logger.warning(f"Fitting failed for column {n}: {reason}")
+            success[n] = False
+        if popt is not None:
             # nlsq reports non-convergence (e.g. evaluation limit) in `success`
             # instead of raising; the last iterate is kept but flagged.
-            if not getattr(result, "success", True):
-                logger.warning(
-                    f"Column {n}: solver did not converge: "
-                    f"{getattr(result, 'message', '')}"
-                )
-                success[n] = False
-
             fit_val[n, 0, fit_flag] = popt
-            fit_val[n, 1, fit_flag] = _param_errors(pcov, len(p0))
+            fit_val[n, 1, fit_flag] = errors
             fit_val[n, 0, fix_flag] = full_p0[fix_flag]
             fit_val[n, 1, fix_flag] = 0
-
-        except Exception as e:
-            logger.warning(f"Fitting failed for column {n}: {e}")
-            success[n] = False
+        else:
             fit_val[n, 0, :] = np.mean(bounds, axis=0)
             fit_val[n, 0, fix_flag] = full_p0[fix_flag]
             fit_val[n, 1, :] = 0
@@ -428,26 +488,26 @@ def _fit_single_qvalue(
 ) -> tuple[
     int, NDArray[np.floating[Any]] | None, NDArray[np.floating[Any]] | None, bool
 ]:
-    """Worker function for parallel fitting of a single q-value."""
+    """Worker function for parallel fitting of a single q-value.
+
+    Applies the same rules as ``fit_with_fixed`` (``_solve_column``): the bool is
+    False for an underdetermined column, a solver error or a non-converged
+    solve; a non-converged column still returns its last iterate.
+    """
     col_idx, x, y_col, sigma_col, wrapper_func, p0, bounds_fit = args
-
-    try:
-        popt, pcov = curve_fit(
-            wrapper_func,
-            x,
-            y_col,
-            sigma=sigma_col,
-            p0=p0,
-            bounds=(bounds_fit[0], bounds_fit[1]),
-            method="trf",
-            max_nfev=5000,
-        )
-
-        return col_idx, popt, _param_errors(pcov, len(p0)), True
-
-    except Exception as e:
-        logger.warning(f"Fitting failed for q-value {col_idx}: {e}")
-        return col_idx, None, None, False
+    popt, errors, ok, reason = _solve_column(
+        wrapper_func,
+        x,
+        y_col,
+        sigma_col,
+        p0,
+        bounds_fit,
+        method="trf",
+        max_nfev=5000,
+    )
+    if not ok:
+        logger.warning(f"Fitting failed for q-value {col_idx}: {reason}")
+    return col_idx, popt, errors, ok
 
 
 @log_timing(threshold_ms=500)
@@ -462,9 +522,14 @@ def fit_with_fixed_parallel(
     p0: NDArray[np.floating[Any]] | None = None,
     max_workers: int | None = None,
     use_threads: bool = True,
+    return_status: bool = False,
     **kwargs: Any,
-) -> tuple[NDArray[np.floating[Any]], NDArray[np.floating[Any]]]:
-    """Parallel version of fit_with_fixed for processing multiple q-values simultaneously."""
+) -> tuple[NDArray[Any], ...]:
+    """Parallel version of fit_with_fixed for processing multiple q-values simultaneously.
+
+    Same contract as ``fit_with_fixed``, including ``return_status`` (a per-column
+    boolean success mask as a third return value).
+    """
     # Ensure numpy arrays at nlsq boundary
     x = ensure_numpy(x)
     y = ensure_numpy(y)
@@ -485,6 +550,7 @@ def fit_with_fixed_parallel(
     p0 = full_p0[fit_flag]
 
     fit_val = np.zeros((num_qvals, 2, num_args))
+    status = np.ones(num_qvals, dtype=bool)
 
     # Fixed parameter values: use initial guess (not upper bound)
     fixed_values_par = full_p0.tolist()
@@ -523,8 +589,9 @@ def fit_with_fixed_parallel(
 
         for completed_fits, future in enumerate(as_completed(future_to_col), start=1):
             col_idx, popt, errors, success = future.result()
+            status[col_idx] = success
 
-            if success:
+            if popt is not None:
                 fit_val[col_idx, 0, fit_flag] = popt
                 fit_val[col_idx, 1, fit_flag] = errors
                 fit_val[col_idx, 0, fix_flag] = full_p0[fix_flag]
@@ -547,6 +614,8 @@ def fit_with_fixed_parallel(
         fit_line[n] = ensure_numpy(base_func(fit_x, *fit_val[n, 0, :]))
 
     logger.info(f"Parallel G2 fitting completed for {num_qvals} q-values")
+    if return_status:
+        return fit_line, fit_val, status
     return fit_line, fit_val
 
 
@@ -611,14 +680,21 @@ def sequential_fitting(
 
         # Validate that popt has the expected shape
         if popt.shape == (n_params,) and np.all(np.isfinite(popt)):
+            # An unavailable covariance is reported as NaN, never a made-up one.
+            unavailable_pcov = np.full((n_params, n_params), np.nan)
+            if not getattr(result, "success", True):
+                logger.debug("NLSQ fitting stopped without converging")
+                return popt, unavailable_pcov, "nlsq_not_converged"
             if pcov.shape == (n_params, n_params) and np.all(np.isfinite(pcov)):
                 logger.debug("NLSQ multistart fitting succeeded")
                 return popt, pcov, "nlsq_multistart"
-            # popt is valid but pcov is not - use popt with fallback covariance
-            logger.debug(
-                "NLSQ fitting: popt valid but pcov invalid, using fallback pcov"
+            logger.debug("NLSQ fitting: popt valid but pcov unavailable")
+            # non-finite entries stay as they are; _param_errors turns them to NaN
+            return (
+                popt,
+                pcov if pcov.shape == (n_params, n_params) else unavailable_pcov,
+                "nlsq_partial",
             )
-            return popt, np.eye(n_params) * 1e6, "nlsq_partial"
 
     except Exception as e:
         logger.debug(f"NLSQ fitting failed: {e}")
@@ -647,7 +723,12 @@ def sequential_fitting(
         )
         fallback_popt = np.ones(n_params)
 
-    return fallback_popt, np.eye(n_params) * 1e6, "fallback"
+    # "fallback" is not a fit: callers must treat it as failed (no covariance).
+    return fallback_popt, np.full((n_params, n_params), np.nan), "fallback"
+
+
+# sequential_fitting methods whose popt came from a converged solve.
+_CONVERGED_METHODS = frozenset({"nlsq_multistart", "nlsq_partial"})
 
 
 @log_timing(threshold_ms=500)
@@ -660,9 +741,17 @@ def fit_with_fixed_sequential(
     fit_flag: NDArray[np.bool_],
     fit_x: NDArray[np.floating[Any]],
     p0: NDArray[np.floating[Any]] | None = None,
+    return_status: bool = False,
     **kwargs: Any,
-) -> tuple[NDArray[np.floating[Any]], NDArray[np.floating[Any]], list[str]]:
-    """Enhanced fitting with sequential method approach."""
+) -> tuple[Any, ...]:
+    """Enhanced fitting with sequential method approach.
+
+    Returns ``(fit_line, fit_val, fit_methods)``, or ``(fit_line, fit_val,
+    fit_methods, success)`` with ``return_status``. ``success`` follows the same
+    rules as ``fit_with_fixed``: False for too few observations, a solver failure
+    or a non-converged solve. Unavailable covariance gives NaN errors; failed
+    columns hold bounds-midpoint placeholders with zero errors (not a result).
+    """
     # Ensure numpy arrays
     x = ensure_numpy(x)
     y = ensure_numpy(y)
@@ -696,48 +785,57 @@ def fit_with_fixed_sequential(
     # Compute expected number of fit parameters (True values in fit_flag)
     n_fit_params = int(np.sum(fit_flag))
 
+    success = np.zeros(y.shape[1], dtype=bool)
+
     for n in range(y.shape[1]):
+        sigma_col = sigma[:, n] if sigma.ndim > 1 else sigma
+        # (popt, errors) hold a solver iterate; None -> bounds-midpoint placeholder
+        popt: NDArray[np.floating[Any]] | None = None
+        errors: NDArray[np.floating[Any]] | None = None
         try:
-            sigma_col = sigma[:, n] if sigma.ndim > 1 else sigma
-
-            popt, pcov, method_used = sequential_fitting(
-                wrapper_func,
-                x,
-                y[:, n],
-                sigma=sigma_col,
-                p0=p0,
-                bounds=(bounds_fit[0], bounds_fit[1]),
-                max_nfev=5000,
-            )
-
-            # Validate popt shape before assignment
-            popt = np.atleast_1d(popt)
-            if popt.shape[0] != n_fit_params:
+            n_obs = int(np.count_nonzero(np.isfinite(y[:, n]) & np.isfinite(x)))
+            if n_obs < n_fit_params:
+                method_used = "fallback_underdetermined"
                 logger.warning(
-                    f"Column {n}: popt shape mismatch - got {popt.shape}, "
-                    f"expected ({n_fit_params},). Using fallback."
+                    f"Column {n}: {n_obs} observations cannot determine "
+                    f"{n_fit_params} free parameters"
                 )
-                popt = p0.copy() if p0 is not None else np.mean(bounds_fit, axis=0)
-                pcov = np.eye(n_fit_params) * 1e6
-                method_used = "fallback_shape_mismatch"
+            else:
+                popt, pcov, method_used = sequential_fitting(
+                    wrapper_func,
+                    x,
+                    y[:, n],
+                    sigma=sigma_col,
+                    p0=p0,
+                    bounds=(bounds_fit[0], bounds_fit[1]),
+                    max_nfev=5000,
+                )
+                popt = np.atleast_1d(popt)
+                if popt.shape[0] != n_fit_params:
+                    logger.warning(
+                        f"Column {n}: popt shape mismatch - got {popt.shape}, "
+                        f"expected ({n_fit_params},)."
+                    )
+                    method_used = "fallback_shape_mismatch"
+                elif method_used in _CONVERGED_METHODS | {"nlsq_not_converged"}:
+                    errors = _param_errors(pcov, n_fit_params)
+                    success[n] = method_used in _CONVERGED_METHODS
+                if errors is None:
+                    popt = None
+        except Exception as e:
+            logger.warning(f"Sequential fitting failed for column {n}: {e}")
+            method_used = "fallback_error"
+            popt = errors = None
 
-            fit_methods.append(method_used)
-            logger.debug(f"Column {n}: fitted using {method_used}")
+        fit_methods.append(method_used)
+        logger.debug(f"Column {n}: fitted using {method_used}")
 
+        if popt is not None and errors is not None:
             fit_val[n, 0, fit_flag] = popt
-            # Safely extract diagonal from pcov
-            pcov_diag = np.diag(pcov) if pcov.ndim == 2 else np.abs(pcov)
-            errors = np.sqrt(np.abs(pcov_diag))
-            # Handle non-finite errors
-            if not np.all(np.isfinite(errors)):
-                errors = np.where(np.isfinite(errors), errors, np.abs(popt) * 0.1)
             fit_val[n, 1, fit_flag] = errors
             fit_val[n, 0, fix_flag] = full_p0[fix_flag]
             fit_val[n, 1, fix_flag] = 0
-
-        except Exception as e:
-            logger.warning(f"Sequential fitting failed for column {n}: {e}")
-            fit_methods.append("fallback_error")
+        else:
             fit_val[n, 0, :] = np.mean(bounds, axis=0)
             fit_val[n, 0, fix_flag] = full_p0[fix_flag]
             fit_val[n, 1, :] = 0
@@ -751,6 +849,8 @@ def fit_with_fixed_sequential(
         method_counts[method] = method_counts.get(method, 0) + 1
     logger.info(f"Fitting methods used: {method_counts}")
 
+    if return_status:
+        return fit_line, fit_val, fit_methods, success
     return fit_line, fit_val, fit_methods
 
 
@@ -760,18 +860,28 @@ def robust_curve_fit(
     y: NDArray[np.floating[Any]],
     **kwargs: Any,
 ) -> tuple[NDArray[np.floating[Any]], NDArray[np.floating[Any]]]:
-    """Simple wrapper around nlsq.curve_fit with error handling."""
+    """Simple wrapper around nlsq.curve_fit with error handling.
+
+    On failure (solver error or non-convergence) returns all-NaN ``popt`` and
+    ``pcov`` of the right size, never made-up parameters or covariance.
+    """
     x = ensure_numpy(x)
     y = ensure_numpy(y)
     try:
         result: Any = curve_fit(func, x, y, **kwargs)
+        if not getattr(result, "success", True):
+            raise RuntimeError(f"did not converge: {getattr(result, 'message', '')}")
         if hasattr(result, "popt"):
             return np.asarray(result.popt), np.asarray(result.pcov)
         return np.asarray(result[0]), np.asarray(result[1])
     except Exception as e:
         logger.warning(f"Curve fitting failed: {e}")
-        n_params = func.__code__.co_argcount - 1
-        return np.ones(n_params), np.eye(n_params)
+        p0 = kwargs.get("p0")
+        try:
+            n_params = len(p0) if p0 is not None else func.__code__.co_argcount - 1
+        except (AttributeError, TypeError):
+            n_params = 1
+        return np.full(n_params, np.nan), np.full((n_params, n_params), np.nan)
 
 
 def vectorized_parameter_estimation(
@@ -809,6 +919,8 @@ def vectorized_parameter_estimation(
             method="trf",
             maxfev=5000,
         )
+        if not getattr(result, "success", True):
+            return None
         if hasattr(result, "popt"):
             popt = cast(Any, result).popt
         else:

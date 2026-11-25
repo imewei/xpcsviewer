@@ -650,6 +650,25 @@ class HDF5ConnectionPool:
             self._last_health_check = 0  # Force immediate check
             self._perform_health_check()
 
+    def _purge_read_cache_locked(
+        self, fname: str, identity: tuple[int, ...] | None
+    ) -> None:
+        """Drop expired entries everywhere and stale revisions of ``fname``.
+
+        Must be called with ``_read_cache_lock`` held.
+        """
+        now = time.time()
+        for name in list(self._read_cache):
+            bucket = self._read_cache[name]
+            for key in list(bucket):
+                entry = bucket[key]
+                if now - entry["timestamp"] >= CACHE_ENTRY_TIMEOUT or (
+                    name == fname and entry["identity"] != identity
+                ):
+                    del bucket[key]
+            if not bucket:
+                del self._read_cache[name]
+
     def batch_read_datasets(
         self, fname: str, dataset_paths: list[str], use_cache: bool = True
     ) -> dict[str, Any]:
@@ -684,7 +703,7 @@ class HDF5ConnectionPool:
             with self._read_cache_lock:
                 bucket = self._read_cache.get(fname)
                 cached_result = bucket.get(cache_key) if bucket else None
-                if cached_result is not None:
+                if bucket is not None and cached_result is not None:
                     # Hit only if recent (within 5 minutes) and for the same
                     # file revision; otherwise drop the dead entry now.
                     if (
@@ -722,6 +741,9 @@ class HDF5ConnectionPool:
         # Cache the results
         if use_cache:
             with self._read_cache_lock:
+                # Expired entries of *any* file and entries of a replaced
+                # revision of this file are dead weight: drop them now.
+                self._purge_read_cache_locked(fname, identity)
                 if fname not in self._read_cache:
                     self._read_cache[fname] = {}
 

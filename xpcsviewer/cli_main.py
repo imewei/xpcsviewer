@@ -158,6 +158,13 @@ def _get_version():
     return __version__
 
 
+def _resolve_startup_path(args):
+    """Return ``(path, explicit)``; a directory the user named wins over the
+    saved session's workspace, a plain launch opens ``./`` implicitly."""
+    named = args.positional_path if args.positional_path is not None else args.path
+    return ("./" if named is None else named), named is not None
+
+
 def _start_gui(path, label_style, path_explicit=False):
     """Start the GUI application (deferred import for faster startup)."""
     from xpcsviewer.xpcs_viewer import main_gui
@@ -181,8 +188,13 @@ def main_gui():
     argparser.add_argument(
         "--version", action="version", version=f"xpcsviewer: {_get_version()}"
     )
+    # default=None is an omitted-value sentinel: "--path ./" typed by the user
+    # is explicit, a plain launch opens the current directory.
     argparser.add_argument(
-        "--path", type=str, help="path to the result folder", default="./"
+        "--path",
+        type=str,
+        help="path to the result folder (default: current directory)",
+        default=None,
     )
     argparser.add_argument(
         "positional_path",
@@ -229,13 +241,10 @@ def main_gui():
         logger.warning(f"Cleanup initialization error: {xpcs_error}")
 
     # Resolve path
-    path = args.positional_path if args.positional_path is not None else args.path
+    path, path_explicit = _resolve_startup_path(args)
     logger.info(f"Starting XPCS Viewer GUI with path: {path}")
 
     try:
-        # A directory the user named wins over the saved session's workspace.
-        # shortcut: "--path ./" equals the default and counts as implicit.
-        path_explicit = args.positional_path is not None or args.path != "./"
         exit_code = _start_gui(path, args.label_style, path_explicit)
         logger.info(f"XPCS Viewer GUI exited with code: {exit_code}")
         safe_shutdown()

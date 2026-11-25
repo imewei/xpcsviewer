@@ -412,11 +412,8 @@ class TestErrorHandling:
             pass
 
     def test_compute_geometry_empty_g2_list(self):
-        """Test compute_geometry with empty g2 list."""
-        g2_list = []
-
-        with pytest.raises(IndexError):
-            g2mod.compute_geometry(g2_list, "multiple")
+        """No files: no panels (R3-19), instead of an IndexError crash."""
+        assert g2mod.compute_geometry([], "multiple") == (0, 0)
 
     def test_compute_geometry_invalid_g2_shape(self):
         """Test compute_geometry with invalid g2 shape."""

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 # Standard library imports
+import functools
 import multiprocessing as mp
 import re
+import threading
+from collections import OrderedDict
 from collections.abc import Callable
 from concurrent.futures import ProcessPoolExecutor
-from functools import lru_cache
 from multiprocessing import Pool
 
 # Third-party imports
@@ -16,7 +18,7 @@ from xpcsviewer.utils.logging_config import get_logger
 
 # Local imports
 from ..fileIO.aps_8idi import key as key_map
-from ..fileIO.hdf_reader import _connection_pool
+from ..fileIO.hdf_reader import _connection_pool, _file_identity
 
 key_map_nexus = key_map["nexus"]
 logger = get_logger(__name__)
@@ -27,6 +29,99 @@ _pool_size: int | None = None
 import typing
 
 _shared_arrays: dict[str, tuple[typing.Any, np.ndarray]] = {}
+
+
+_C2_CACHE_MAX_ENTRIES = 32
+_C2_CACHE_MAX_BYTES = 512 * 1024 * 1024
+
+
+def _nbytes(obj) -> int:
+    if isinstance(obj, np.ndarray):
+        return obj.nbytes
+    if isinstance(obj, dict):
+        return sum(_nbytes(v) for v in obj.values())
+    return 0
+
+
+class _RevisionCache:
+    """LRU of read results keyed by (path, call args), valid for one file revision.
+
+    An entry is served only while ``_file_identity(path)`` equals the identity
+    the read started from, and is only stored if the file did not change during
+    the read. Bounded by entry count and by array bytes.
+    """
+
+    def __init__(self, max_entries: int, max_bytes: int) -> None:
+        self.max_entries = max_entries
+        self.max_bytes = max_bytes
+        self.nbytes = 0
+        self._data: OrderedDict[tuple, tuple[tuple, object, int]] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._data.clear()
+            self.nbytes = 0
+
+    def _drop(self, key: tuple) -> None:
+        self.nbytes -= self._data.pop(key)[2]
+
+    def get(self, key: tuple, identity: tuple):
+        with self._lock:
+            entry = self._data.get(key)
+            if entry is None:
+                return False, None
+            if entry[0] != identity:
+                self._drop(key)
+                return False, None
+            self._data.move_to_end(key)
+            return True, entry[1]
+
+    def put(self, key: tuple, identity: tuple, value: object) -> None:
+        size = _nbytes(value)
+        if size > self.max_bytes:
+            return
+        with self._lock:
+            if key in self._data:
+                self._drop(key)
+            for old in [
+                k for k, e in self._data.items() if k[0] == key[0] and e[0] != identity
+            ]:
+                self._drop(old)  # earlier revisions of this path never hit again
+            self._data[key] = (identity, value, size)
+            self.nbytes += size
+            while self._data and (
+                len(self._data) > self.max_entries or self.nbytes > self.max_bytes
+            ):
+                self._drop(next(iter(self._data)))
+
+
+_c2_cache = _RevisionCache(_C2_CACHE_MAX_ENTRIES, _C2_CACHE_MAX_BYTES)
+
+
+def _revision_cached(func):
+    """Memoise ``func(full_path, ...)`` per file revision (see ``_RevisionCache``)."""
+
+    @functools.wraps(func)
+    def wrapper(full_path, *args, **kwargs):
+        identity = _file_identity(full_path)
+        if identity is None:  # unreadable: let ``func`` raise its own error
+            return func(full_path, *args, **kwargs)
+        key = (full_path, func.__name__, args, tuple(sorted(kwargs.items())))
+        hit, value = _c2_cache.get(key, identity)
+        if hit:
+            return value
+        value = func(full_path, *args, **kwargs)
+        # Skip the insert if the path changed while it was being read.
+        if _file_identity(full_path) == identity:
+            _c2_cache.put(key, identity, value)
+        return value
+
+    wrapper.cache_clear = _c2_cache.clear
+    return wrapper
 
 
 def get_optimal_worker_count() -> int:
@@ -156,16 +251,9 @@ def read_single_c2_enhanced(args: tuple) -> tuple[np.ndarray | None, int, str]:
             if f"{c2_prefix}/{index_str}" not in f:
                 return None, 0, f"Dataset {index_str} not found"
 
-            c2_half = f[f"{c2_prefix}/{index_str}"][()]
-
-            # Vectorized C2 matrix reconstruction
-            c2 = _reconstruct_c2_matrix_vectorized(c2_half)
-
-            # Vectorized sampling if needed
-            sampling_rate = 1
-            if max_size > 0 and max_size < c2.shape[0]:
-                sampling_rate = (c2.shape[0] + max_size - 1) // max_size
-                c2 = c2[::sampling_rate, ::sampling_rate]
+            c2, sampling_rate = _read_c2_downsampled(
+                f[f"{c2_prefix}/{index_str}"], max_size
+            )
 
         # Apply diagonal correction if requested
         if correct_diag:
@@ -263,6 +351,23 @@ def correct_diagonal_c2_vectorized(c2_mat):
     return c2_mat
 
 
+def _read_c2_downsampled(dataset, max_size):
+    """Read a stored half C2 and return ``(c2, sampling_rate)``, owned and sized.
+
+    Subsampling commutes with the symmetric reconstruction (both axes use the
+    same indices), so only the needed stride is read from HDF5 and the result
+    owns its memory instead of being a view pinning the full matrix.
+    """
+    n = dataset.shape[0]
+    sampling_rate = 1
+    if max_size > 0 and max_size < n:
+        sampling_rate = (n + max_size - 1) // max_size
+    c2_half = (
+        dataset[::sampling_rate, ::sampling_rate] if sampling_rate > 1 else dataset[()]
+    )
+    return _reconstruct_c2_matrix_vectorized(c2_half), sampling_rate
+
+
 def _reconstruct_c2_matrix_vectorized(c2_half):
     """
     Vectorized C2 matrix reconstruction from half matrix.
@@ -287,23 +392,17 @@ def read_single_c2(args):
         full_path, index_str, max_size, correct_diag = args
         c2_prefix = key_map_nexus["c2_prefix"]
         with _connection_pool.get_connection(full_path, "r") as f:
-            c2_half = f[f"{c2_prefix}/{index_str}"][()]
-            c2 = _reconstruct_c2_matrix_vectorized(c2_half)
-            sampling_rate = 1
-            if max_size > 0 and max_size < c2.shape[0]:
-                sampling_rate = (c2.shape[0] + max_size - 1) // max_size
-                c2 = c2[::sampling_rate, ::sampling_rate]
+            c2, sampling_rate = _read_c2_downsampled(
+                f[f"{c2_prefix}/{index_str}"], max_size
+            )
     else:
         # Optimized mode: reuse file handle
         # Handle both 5+ args (new) and other arg counts
         f, index_str, max_size, correct_diag = args[:4]
         c2_prefix = key_map_nexus["c2_prefix"]
-        c2_half = f[f"{c2_prefix}/{index_str}"][()]
-        c2 = _reconstruct_c2_matrix_vectorized(c2_half)
-        sampling_rate = 1
-        if max_size > 0 and max_size < c2.shape[0]:
-            sampling_rate = (c2.shape[0] + max_size - 1) // max_size
-            c2 = c2[::sampling_rate, ::sampling_rate]
+        c2, sampling_rate = _read_c2_downsampled(
+            f[f"{c2_prefix}/{index_str}"], max_size
+        )
 
     if correct_diag:
         c2 = correct_diagonal_c2_vectorized(c2)
@@ -512,7 +611,7 @@ def get_all_c2_from_hdf_enhanced(
         return None
 
 
-@lru_cache(maxsize=16)
+@_revision_cached
 def get_single_c2_from_hdf(
     full_path, selection=0, max_size=512, t0=1, correct_diag=True
 ):
@@ -568,7 +667,7 @@ def get_single_c2_from_hdf(
     return c2_result
 
 
-@lru_cache(maxsize=16)
+@_revision_cached
 def get_c2_g2partials_from_hdf(full_path):
     # t0 = time.perf_counter()
     c2_prefix = key_map_nexus["c2_prefix"]

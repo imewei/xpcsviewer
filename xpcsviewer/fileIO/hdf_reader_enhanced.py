@@ -26,6 +26,9 @@ from .hdf_reader import _file_identity
 
 logger = get_logger(__name__)
 
+# Upper bound on dataset keys whose access history is tracked.
+_MAX_TRACKED_DATASETS = 256
+
 
 class AccessPattern(Enum):
     """HDF5 data access patterns for optimization."""
@@ -254,6 +257,9 @@ class ReadAheadCache:
         """Record an access for pattern analysis."""
         key = f"{file_path}:{dataset_path}"
         with self._lock:
+            if key not in self.access_patterns:
+                while len(self.access_patterns) >= _MAX_TRACKED_DATASETS:
+                    del self.access_patterns[next(iter(self.access_patterns))]
             self.access_patterns[key].append((time.time(), slice_info))
             # Keep only recent accesses
             if len(self.access_patterns[key]) > MAX_HISTORY_ENTRIES:
@@ -414,13 +420,22 @@ class ReadAheadCache:
         dataset_path: str,
         slice_info: tuple[slice, ...] | None,
         data: np.ndarray | None,
+        identity: tuple[int, ...] | None = None,
     ):
+        """Cache ``data`` under the revision of the file that supplied it.
+
+        ``identity`` is the identity the reading handle was opened with. If the
+        path no longer names that revision the bytes are stale and not cached.
+        """
         if data is None:
             return
 
-        cache_key = (
-            f"{file_path}:{_file_identity(file_path)}:{dataset_path}:{slice_info}"
-        )
+        current = _file_identity(file_path)
+        if identity is None:
+            identity = current
+        elif identity != current:
+            return
+        cache_key = f"{file_path}:{identity}:{dataset_path}:{slice_info}"
         data_size_mb = data.nbytes / (1024 * 1024)
 
         # Skip caching very large chunks
@@ -429,6 +444,15 @@ class ReadAheadCache:
             return
 
         with self._lock:
+            # Entries of earlier revisions of this path can never hit again.
+            live = f"{file_path}:{identity}:"
+            for key in [
+                k
+                for k in self.cache
+                if k.startswith(f"{file_path}:") and not k.startswith(live)
+            ]:
+                del self.cache[key]
+
             # Make space if needed
             self._make_space(data_size_mb)
 
@@ -495,7 +519,8 @@ class EnhancedHDF5Reader:
         self.cache = ReadAheadCache(max_cache_mb)
         self.memory_manager = get_memory_manager()
 
-        # Connection management
+        # Connection management; each handle carries ``_xpcs_identity``, the
+        # file revision it was opened from.
         self._connections: weakref.WeakValueDictionary[str, h5py.File] = (
             weakref.WeakValueDictionary()
         )
@@ -519,13 +544,22 @@ class EnhancedHDF5Reader:
         # release it before yielding so concurrent threads are not blocked
         # during the caller's (potentially long) HDF5 I/O.
         with self._connection_lock:
+            identity = _file_identity(file_path)
             file_obj = self._connections.get(file_path)
-            if file_obj is not None and not file_obj.id.valid:
+            if file_obj is not None and (
+                not file_obj.id.valid
+                or getattr(file_obj, "_xpcs_identity", None) != identity
+            ):
+                # Closed, or the path now names another file (atomic replace):
+                # a still-borrowed old handle keeps serving its own borrower.
                 del self._connections[file_path]
                 file_obj = None
             if file_obj is None:
                 try:
+                    # Stat before open: a replace in between only makes the
+                    # recorded identity older, never newer than the bytes.
                     file_obj = h5py.File(file_path, "r")
+                    file_obj._xpcs_identity = identity
                     self._connections[file_path] = file_obj
                 except Exception as e:
                     logger.error(f"Failed to open HDF5 file {file_path}: {e}")
@@ -588,7 +622,13 @@ class EnhancedHDF5Reader:
             self.stats["bytes_read"] += data.nbytes
 
             # Cache the data
-            self.cache.cache_data(file_path, dataset_path, slice_info, data)
+            self.cache.cache_data(
+                file_path,
+                dataset_path,
+                slice_info,
+                data,
+                getattr(f, "_xpcs_identity", None),
+            )
 
             # Record access for pattern analysis
             self.cache.record_access(file_path, dataset_path, slice_info)
@@ -649,7 +689,11 @@ class EnhancedHDF5Reader:
                                 pred_data = dataset[pred_slice]
                                 pred_data = np.array(pred_data)
                                 self.cache.cache_data(
-                                    file_path, dataset_path, pred_slice, pred_data
+                                    file_path,
+                                    dataset_path,
+                                    pred_slice,
+                                    pred_data,
+                                    getattr(f, "_xpcs_identity", None),
                                 )
                                 logger.debug(f"Read-ahead cached: {pred_slice}")
                 except Exception as e:
@@ -719,7 +763,13 @@ class EnhancedHDF5Reader:
                     self.stats["bytes_read"] += data.nbytes
 
                     # Cache the data
-                    self.cache.cache_data(file_path, dataset_path, slice_info, data)
+                    self.cache.cache_data(
+                        file_path,
+                        dataset_path,
+                        slice_info,
+                        data,
+                        getattr(f, "_xpcs_identity", None),
+                    )
 
                 except Exception as e:
                     logger.warning(f"Failed to read dataset {dataset_path}: {e}")

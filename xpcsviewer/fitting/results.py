@@ -136,8 +136,9 @@ class FitDiagnostics:
     """
 
     r_hat: dict[str, float] = field(default_factory=dict)
-    ess_bulk: dict[str, int] = field(default_factory=dict)
-    ess_tail: dict[str, int] = field(default_factory=dict)
+    # float so an unavailable diagnostic can be carried as NaN
+    ess_bulk: dict[str, float] = field(default_factory=dict)
+    ess_tail: dict[str, float] = field(default_factory=dict)
     divergences: int = 0
     max_treedepth_reached: int = 0
     bfmi: float | None = None  # NEW: Per Technical Guidelines

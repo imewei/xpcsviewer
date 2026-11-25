@@ -4,6 +4,7 @@ import os
 import shutil
 from collections import OrderedDict
 from pathlib import Path
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
 # Third-party imports
@@ -59,6 +60,9 @@ from .utils import get_logger, log_system_info, sanitize_path, setup_exception_l
 from .utils.log_utils import RateLimitedLogger
 from .viewer_kernel import ViewerKernel
 from .viewer_ui import Ui_mainWindow as Ui
+
+if TYPE_CHECKING:  # the fitting package is imported lazily (JAX start-up cost)
+    from .fitting.bayesian_assembly import BayesianBundle
 
 # Initialize centralized logging and get logger
 logger = get_logger(__name__)
@@ -174,14 +178,18 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
     >>> viewer.show()
     """
 
-    def __init__(self, path=None, label_style=None, path_explicit=False):
+    def __init__(self, path=None, label_style=None, path_explicit=None):
         super().__init__()
         self.setupUi(self)
         self.home_dir = home_dir
         self.label_style = label_style
-        # True when the user named the startup directory: it then wins over the
-        # workspace stored in the saved session (see _restore_session).
-        self._path_explicit = path_explicit
+        # True when the caller named the startup directory: it then wins over
+        # the workspace stored in the saved session (see _restore_session).
+        # A supplied path is explicit unless the caller marks it as an
+        # automatic default with path_explicit=False.
+        self._path_explicit = (
+            (path is not None) if path_explicit is None else bool(path_explicit)
+        )
 
         self.tabWidget.setCurrentIndex(0)  # show scattering 2d
         self.plot_kwargs_record = {}
@@ -225,6 +233,9 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         # Track active async operations
         self.active_plot_operations = {}  # operation_id -> plot_type
         self._plot_op_requests = {}  # operation_id -> kwargs it was started with
+        # Tabs whose newer request was suppressed while an older operation ran.
+        self._plot_pending: set[str] = set()
+        self._retiring_plots = False  # True while callers retire ops on purpose
         self._g2_fit_bounds_initialized = False
 
         # list widget models
@@ -298,38 +309,31 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         self._simplemask_window: SimpleMaskWindow | None = None
 
         # Bayesian fitting state — G2 (single-Q)
-        self._g2_bayesian_results: dict[int, object] = {}
-        # q_idx -> (file name, actual Q value, fitted delay array) of each cached fit
-        self._g2_bayesian_context: dict[
-            int, tuple[str | None, float, np.ndarray | None]
-        ] = {}
-        self._g2_bayesian_fit_fname: str | None = None
-        self._g2_bayesian_fit_x: np.ndarray | None = None
+        # Invariant: a posterior is only ever shown, diagnosed or plotted with
+        # the exact observations and physical bin it was fitted to.  Results
+        # are therefore committed as BayesianBundle objects (result + captured
+        # observations + file + absolute bin ID), keyed by (file name,
+        # absolute bin ID) -- never by the relative index in the current Q range.
+        self._g2_bayesian_store: dict[tuple, BayesianBundle] = {}
+        self._g2_bayesian_launch: BayesianBundle | None = None  # fit in flight
         self._g2_diagnosis_window = None
         self._g2_bayesian_worker_active: bool = False
         self._g2_bayesian_worker: object | None = None  # current single-Q worker
-        self._g2_bayesian_model_func = None  # single-Q only
-        self._g2_bayesian_data: tuple | None = None
 
-        # Bayesian fitting state — G2 (batch all-Q)
-        self._g2_batch_model_func = None
-        self._g2_batch_q_range: tuple[float, float] | None = None
-        self._g2_batch_t_range: tuple[float, float] | None = None
-        self._g2_batch_t_el: np.ndarray | None = None
-        self._g2_batch_q_arr: np.ndarray | None = None
-        self._g2_batch_q_x: dict[int, np.ndarray] = {}  # q_idx -> fitted delays
-        self._g2_batch_fit_func_name: str | None = None
-        self._g2_batch_target_xf: object | None = None
+        # Bayesian fitting state — G2 (batch all-Q): everything captured when
+        # the batch was launched (None when idle or after a workspace reset).
+        self._g2_batch_launch: dict | None = None
 
         # Grid metadata for Q-bin subplot highlighting
         self._g2_fitting_num_col: int = 4
         self._g2_fitting_plot_type: str = "multiple"
 
-        # Bayesian fitting state — Diffusion
-        self._diff_bayesian_result = None
+        # Bayesian fitting state — Diffusion (same bundle rule, keyed by file)
+        self._diff_bayesian_store: dict[str | None, BayesianBundle] = {}
+        self._diff_bayesian_launch: BayesianBundle | None = None
+        self._diff_bayesian_worker: object | None = None
         self._diff_diagnosis_window = None
         self._diff_bayesian_worker_active: bool = False
-        self._diff_bayesian_data: tuple | None = None
 
         self.avg_job_pop.clicked.connect(self.remove_avg_job)
         self.btn_submit_job.clicked.connect(self.submit_job)
@@ -1431,6 +1435,7 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             # Connect async signals
             self.async_vk.plot_ready.connect(self.on_async_plot_ready)
             self.async_vk.operation_error.connect(self.on_async_operation_error)
+            self.async_vk.operation_cancelled.connect(self.on_async_operation_cancelled)
             self.async_vk.operation_progress.connect(
                 self.progress_manager.update_progress
             )
@@ -1442,10 +1447,46 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         if self.async_vk:
             self.async_vk.cancel_operation(operation_id)
 
-        # Remove from active operations — pop() avoids KeyError if on_async_plot_ready
-        # already removed the entry (P1-02).
-        self.active_plot_operations.pop(operation_id, None)
-        self._plot_op_requests.pop(operation_id, None)
+        # An explicit retirement (selection changed, workspace reset) is
+        # followed by the caller's own redraw; a user cancel is not.
+        self._settle_plot_operation(
+            operation_id, failed=True, reschedule=not self._retiring_plots
+        )
+
+    def _settle_plot_operation(
+        self, operation_id: str, *, failed: bool, reschedule: bool = True
+    ) -> str | None:
+        """End bookkeeping for a plot operation; whether it finished, failed
+        or was cancelled, the newest request for its tab must still be drawn.
+
+        pop() avoids KeyError if another path already removed the entry
+        (P1-02).  Returns the operation's tab name, or None if unknown.
+        """
+        plot_type = self.active_plot_operations.pop(operation_id, None)
+        request = self._plot_op_requests.pop(operation_id, None)
+        if plot_type is None:
+            return None
+        pending = plot_type in self._plot_pending
+        self._plot_pending.discard(plot_type)
+        if failed and request is not None and not self._retiring_plots:
+            # A failed/cancelled request drew nothing: let the same request
+            # be issued again instead of being skipped as "unchanged".  (A
+            # deliberate retirement is followed by the caller's own redraw.)
+            if self.plot_kwargs_record.get(plot_type) == request:
+                self.plot_kwargs_record[plot_type] = {}
+        # After a success the staleness was already checked before drawing, and
+        # drawing itself may change the kwargs (e.g. auto bounds): only a
+        # request suppressed meanwhile (`pending`) is replayed then.
+        if reschedule and (
+            pending
+            or (
+                failed
+                and request is not None
+                and self._plot_request_is_stale(plot_type, request)
+            )
+        ):
+            self.update_plot_async(plot_type)
+        return plot_type
 
     def _plot_request_is_stale(self, plot_type, request) -> bool:
         """True if the current selection no longer yields *request*'s kwargs."""
@@ -1468,12 +1509,11 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
 
         # Selection/targets changed while the worker ran: drop the result and
         # queue a refresh for the newest selection instead of painting old data.
-        request = self._plot_op_requests.pop(operation_id, None)
+        request = self._plot_op_requests.get(operation_id)
         if request is not None and self._plot_request_is_stale(plot_type, request):
             logger.info("Discarding stale %s plot result", plot_type)
-            self.active_plot_operations.pop(operation_id, None)
             self.progress_manager.complete_operation(operation_id, True)
-            self.update_plot_async(plot_type)
+            self._settle_plot_operation(operation_id, failed=True)
             return
 
         try:
@@ -1503,9 +1543,8 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             )
             self.toast_manager.show_error(f"Plot error: {e!s}")
 
-        # Clean up — use pop() to avoid KeyError if operation was already
-        # removed by a concurrent cancel_async_operation call (P1-02).
-        self.active_plot_operations.pop(operation_id, None)
+        # Clean up; a request suppressed while this operation ran is drawn now.
+        self._settle_plot_operation(operation_id, failed=False)
 
     def on_async_operation_error(
         self, operation_id: str, error_msg: str, traceback_str: str
@@ -1523,10 +1562,17 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         self.progress_manager.complete_operation(operation_id, False, error_msg)
         self.toast_manager.show_error(f"Operation failed: {error_msg}")
 
-        # Clean up
-        self._plot_op_requests.pop(operation_id, None)
-        if operation_id in self.active_plot_operations:
-            del self.active_plot_operations[operation_id]
+        # The newest request for the tab must still be drawn.
+        self._settle_plot_operation(operation_id, failed=True)
+
+    def on_async_operation_cancelled(self, operation_id: str):
+        """A worker was cancelled without the viewer asking for it."""
+        if operation_id not in self.active_plot_operations:
+            return
+        self.progress_manager.complete_operation(operation_id, False, "Cancelled")
+        self._settle_plot_operation(
+            operation_id, failed=True, reschedule=not self._retiring_plots
+        )
 
     def apply_saxs_2d_result(self, result):
         """Apply SAXS 2D plot result to the GUI."""
@@ -2024,6 +2070,9 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         for _op_id, plot_type in list(self.active_plot_operations.items()):
             if plot_type == tab_name:
                 logger.info(f"Async {tab_name} plot already in progress, skipping")
+                # Remember the newer request: whichever way the running
+                # operation ends (done, failed, cancelled), it is drawn then.
+                self._plot_pending.add(tab_name)
                 return
 
         operation_id = None
@@ -2854,16 +2903,17 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             xf_list = self.vk.get_xf_list()
             if xf_list:
                 # Apply partition maps to all loaded XpcsFile objects (BUG-001 fix).
-                # Display only: the instance attributes shadow xf.qmap's maps for
-                # the Q-map and static views, while G2/two-time bin selection keeps
-                # using xf.qmap (the partition the correlations were computed on).
+                # DISPLAY ONLY: stored under separate names that only the Q-map
+                # displays read (XpcsFile.get_display_qmap). xf.dqmap / xf.sqmap
+                # stay the file's own maps, which the G2/two-time bins, the ROI
+                # calculations and the G2 map's detector image are bound to.
                 dqmap = partition.get("dynamic_roi_map")
                 sqmap = partition.get("static_roi_map")
                 for xf in xf_list:
                     if dqmap is not None:
-                        xf.dqmap = dqmap
+                        xf.display_dqmap = dqmap
                     if sqmap is not None:
-                        xf.sqmap = sqmap
+                        xf.display_sqmap = sqmap
 
             logger.info(
                 f"Partition exported from SimpleMask: {dq_num} dynamic bins, "
@@ -3946,35 +3996,49 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         # do not leak into the new session.
         self.plot_kwargs_record = {v: {} for _, v in tab_mapping.items()}
 
+        self._reset_bayesian_state()
+
+        # Trigger plot update to show proper empty states since no files are auto-added
+        self.update_plot()
+
+    def _reset_bayesian_state(self):
+        """Forget every Bayesian result and in-flight fit of the old dataset.
+
+        Running fits are asked to stop and their launch records are dropped,
+        so a late completion callback no longer matches and is ignored.
+        """
         # Stop the running batch BEFORE clearing the state its callbacks use.
         if self._g2_batch_coordinator is not None:
             self._cancel_g2_bayesian_batch()
+        self._g2_batch_launch = None
 
-        # Clear Bayesian fitting state from previous dataset
-        self._g2_bayesian_results = {}
-        self._g2_bayesian_context = {}
-        self._g2_bayesian_data = None
-        self._g2_bayesian_model_func = None
-        self._g2_bayesian_worker = None
-        self._g2_batch_model_func = None
-        self._g2_batch_q_range = None
-        self._g2_batch_t_range = None
-        self._g2_batch_t_el = None
-        self._g2_batch_q_arr = None
-        self._g2_batch_q_x = {}
-        self._g2_batch_fit_func_name = None
-        self._g2_batch_target_xf = None
-        self._diff_bayesian_result = None
-        self._diff_bayesian_data = None
+        # Buttons are restored only for a fit that was actually running, so a
+        # button disabled at start-up (NumPyro missing) stays disabled.
+        g2_was_running = getattr(self, "_g2_bayesian_worker_active", False)
+        diff_was_running = getattr(self, "_diff_bayesian_worker_active", False)
+        for name in ("_g2_bayesian_worker", "_diff_bayesian_worker"):
+            worker = getattr(self, name, None)
+            if worker is not None and hasattr(worker, "cancel"):
+                worker.cancel()
+            setattr(self, name, None)
+        self._g2_bayesian_worker_active = False
+        self._diff_bayesian_worker_active = False
+        self._g2_bayesian_launch = None
+        self._diff_bayesian_launch = None
+        self._g2_bayesian_store = {}
+        self._diff_bayesian_store = {}
+        if g2_was_running:
+            self.btn_g2_bayesian.setEnabled(True)
+            self.btn_g2_bayesian.setText(f"Fit Q-{self.sb_g2_bayesian_qidx.value()}")
+        if diff_was_running:
+            self.btn_diff_bayesian.setEnabled(True)
+            self.btn_diff_bayesian.setText("Fit Bayesian")
         if hasattr(self, "btn_g2_diagnosis"):
             self.btn_g2_diagnosis.setEnabled(False)
         if hasattr(self, "btn_diff_diagnosis"):
             self.btn_diff_diagnosis.setEnabled(False)
         if hasattr(self, "btn_g2_plot_all_q"):
             self.btn_g2_plot_all_q.setEnabled(False)
-
-        # Trigger plot update to show proper empty states since no files are auto-added
-        self.update_plot()
 
     def update_box(self, file_list, mode="source"):
         if file_list is None:
@@ -4243,14 +4307,23 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         self.update_box(self.vk.target, mode="target")
 
     def _retire_plot_operations(self, plot_type: str | None = None) -> None:
-        """Cancel in-flight plot operations (all, or only those of *plot_type*)."""
-        for operation_id, op_type in list(self.active_plot_operations.items()):
-            if plot_type is not None and op_type != plot_type:
-                continue
-            if self.progress_manager.is_operation_active(operation_id):
-                self.progress_manager.cancel_operation_ui(operation_id)
-            else:
-                self.cancel_async_operation(operation_id)
+        """Cancel in-flight plot operations (all, or only those of *plot_type*).
+
+        The caller redraws (or has reset) the affected tabs itself, so no
+        deferred request is replayed from here.
+        """
+        self._retiring_plots = True
+        try:
+            for operation_id, op_type in list(self.active_plot_operations.items()):
+                if plot_type is not None and op_type != plot_type:
+                    continue
+                if self.progress_manager.is_operation_active(operation_id):
+                    self.progress_manager.cancel_operation_ui(operation_id)
+                else:
+                    self.cancel_async_operation(operation_id)
+                self._plot_pending.discard(op_type)
+        finally:
+            self._retiring_plots = False
 
     def _reset_g2_fit_bounds(self) -> None:
         self._retire_plot_operations("g2")
@@ -4433,14 +4506,47 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
     # Bayesian fitting — G2 tab
     # ------------------------------------------------------------------
 
+    def _g2_bin_table(self):
+        """``(fname, bins)`` of the first selected file for the current Q range.
+
+        ``bins[j]`` is ``(absolute bin ID, q, label)`` of G2 column ``j``; the
+        Q-bin spinbox is only a position in this table.  ``None`` if no file
+        or bin table is available.
+        """
+        if not self.vk:
+            return None
+        rows = self.get_selected_rows()
+        xf_list = self.vk.get_xf_list(rows) if rows else []
+        if not xf_list:
+            return None
+        from .fitting.bayesian_assembly import resolve_g2_bins
+
+        try:
+            p = self.check_g2_number()
+            return xf_list[0].fname, resolve_g2_bins(xf_list[0], (p[0], p[1]))
+        except Exception:
+            logger.debug("Could not resolve the G2 Q-bin table", exc_info=True)
+            return None
+
+    def _g2_current_bundle(self):
+        """Stored Bayesian bundle of the currently selected physical bin, or
+        ``None`` (no fit yet for *this* bin of *this* file)."""
+        table = self._g2_bin_table()
+        q_idx = self.sb_g2_bayesian_qidx.value()
+        if table is None or not 0 <= q_idx < len(table[1]):
+            return None
+        return self._g2_bayesian_store.get((table[0], table[1][q_idx][0]))
+
     def _extract_g2_for_bayesian(self):
-        """Extract (x, y, yerr, q_idx, q_value, fit_func_name) for one Q-bin.
+        """Capture the observations and physical identity of the selected Q-bin.
 
         Returns
         -------
         tuple or None
-            ``(x, y, yerr, q_idx, q_value, fit_func_name)`` on success,
-            ``None`` if data cannot be extracted.
+            ``(bundle, q_idx)``: a :class:`BayesianBundle` without result
+            (observations, file name, absolute bin ID, label, model name) and
+            the relative spinbox position; ``None`` if data cannot be
+            extracted or the bin cannot be identified.
         """
         if not self._guard_no_data("g2"):
             return None
@@ -4470,6 +4576,11 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             )
             return None
 
+        bins = self._g2_resolved_bins(xf_list[0], p, q_arr)
+        if bins is None:
+            return None
+        bin_id, _, label = bins[q_idx]
+
         q_value = float(q_arr[q_idx])
         x = np.asarray(tel[0])
         y = np.asarray(g2[0][:, q_idx])
@@ -4481,25 +4592,37 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             self.statusbar.showMessage("No valid G2 data for this Q-index", 2000)
             return None
 
+        from .fitting.bayesian_assembly import BayesianBundle
+
         _, _, fit_func_name = self.check_g2_fitting_number()
-        return x[valid], y[valid], yerr[valid], q_idx, q_value, fit_func_name
-
-    def _g2_first_fname(self):
-        """File name of the first selected file (the one Bayesian fits use)."""
-        xf_list = self.vk.get_xf_list(self.get_selected_rows())
-        return xf_list[0].fname if xf_list else None
-
-    def _g2_fit_matches_current(self, q_idx, q_value, x):
-        """True if the cached fit for *q_idx* was made for the current file, Q
-        and delay observations *x*."""
-        ctx = self._g2_bayesian_context.get(q_idx)
-        return (
-            ctx is not None
-            and ctx[0] == self._g2_first_fname()
-            and bool(np.isclose(ctx[1], q_value))
-            and ctx[2] is not None
-            and np.array_equal(ctx[2], x)
+        bundle = BayesianBundle.create(
+            xf_list[0].fname,
+            bin_id,
+            label,
+            q_value,
+            fit_func_name,
+            x[valid],
+            y[valid],
+            yerr[valid],
         )
+        return bundle, q_idx
+
+    def _g2_resolved_bins(self, xf, p, q_arr):
+        """Absolute bin table of *xf* checked against the extracted columns."""
+        from .fitting.bayesian_assembly import resolve_g2_bins
+
+        try:
+            bins = resolve_g2_bins(xf, (p[0], p[1]))
+            ok = len(bins) == len(q_arr) and np.allclose([b[1] for b in bins], q_arr)
+        except Exception:
+            logger.debug("Could not resolve the G2 Q-bin table", exc_info=True)
+            ok = False
+        if not ok:
+            self.statusbar.showMessage(
+                "Cannot identify the physical Q-bins of this selection", 3000
+            )
+            return None
+        return bins
 
     def _on_g2_qbin_changed(self, q_idx):
         """Handle Q-bin spinbox value change in g2 fitting tab.
@@ -4511,7 +4634,8 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         #    This provides immediate, visible confirmation that the
         #    spinbox value is connected to the Bayesian actions.
         self.btn_g2_bayesian.setText(f"Fit Q-{q_idx}")
-        has_result = q_idx in self._g2_bayesian_results
+        bundle = self._g2_current_bundle()
+        has_result = bundle is not None
         self.btn_g2_diagnosis.setEnabled(has_result)
         if has_result:
             self.btn_g2_diagnosis.setText(f"Diagnosis Q-{q_idx}")
@@ -4522,17 +4646,13 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         highlighted = self._highlight_g2_subplot(q_idx)
 
         # 3. Show Q-value in status bar
+        # The spinbox addresses a position in the current Q range: name the
+        # physical bin from the same table Fit and Diagnosis use.
         q_label = ""
-        rows = self.get_selected_rows()
-        if rows and self.vk:
-            try:
-                xf_list = self.vk.get_xf_list(rows=rows, filter_atype="Multitau")
-                if xf_list:
-                    q_arr = xf_list[0].qd
-                    if q_idx < len(q_arr):
-                        q_label = f"q = {q_arr[q_idx]:.4g} {Q_UNIT_DISPLAY}"
-            except Exception:
-                pass
+        table = self._g2_bin_table()
+        if table is not None and 0 <= q_idx < len(table[1]):
+            _, q_bin, label = table[1][q_idx]
+            q_label = f"q = {q_bin:.4g} {Q_UNIT_DISPLAY} ({label})"
 
         if q_label:
             self.statusbar.showMessage(f"Q-bin {q_idx}: {q_label}", 3000)
@@ -4548,16 +4668,9 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             and self._g2_diagnosis_window.isVisible()
         ):
             if has_result:
-                extracted = self._extract_g2_for_bayesian()
-                if extracted is not None:
-                    x, y, yerr, _, q_value, _ = extracted
-                    if self._g2_fit_matches_current(q_idx, q_value, x):
-                        fit_result = self._g2_bayesian_results[q_idx]
-                        self._g2_bayesian_data = (x, y, yerr, q_idx, q_value)
-                        self._update_g2_diagnosis(fit_result, x, y, yerr, q_value)
-                    else:
-                        title = f"G2 Bayesian Diagnosis — Q-bin {q_idx} (stale fit)"
-                        self._g2_diagnosis_window.setWindowTitle(title)
+                # The stored observations are shown with the stored posterior;
+                # nothing is re-extracted from the current selection.
+                self._update_g2_diagnosis(bundle)
             else:
                 # Show placeholder in diagnosis window title
                 title = f"G2 Bayesian Diagnosis \u2014 Q-bin {q_idx} (no fit yet)"
@@ -4649,22 +4762,13 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         if extracted is None:
             return
 
-        x, y, yerr, q_idx, q_value, fit_func_name = extracted
+        bundle, q_idx = extracted
+        x, y, yerr, q_value = bundle.x, bundle.y, bundle.yerr, bundle.q_value
 
         from .fitting import fit_double_exp, fit_single_exp
-        from .fitting.models import double_exp_func, single_exp_func
         from .threading.bayesian_worker import BayesianFitWorker
 
-        if fit_func_name == "single":
-            fit_func = fit_single_exp
-            self._g2_bayesian_model_func = single_exp_func
-        else:
-            fit_func = fit_double_exp
-            self._g2_bayesian_model_func = double_exp_func
-
-        self._g2_bayesian_data = (x, y, yerr, q_idx, q_value)
-        self._g2_bayesian_fit_fname = self._g2_first_fname()
-        self._g2_bayesian_fit_x = np.array(x)
+        fit_func = fit_single_exp if bundle.model_name == "single" else fit_double_exp
 
         warmup = self.sb_g2_bayesian_warmup.value()
         samples = self.sb_g2_bayesian_samples.value()
@@ -4676,11 +4780,12 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             samples,
             chains,
         )
+        # Private writable copies: the bundle's own arrays stay untouched.
         worker = BayesianFitWorker(
             fit_func=fit_func,
-            x=x,
-            y=y,
-            yerr=yerr,
+            x=np.array(x),
+            y=np.array(y),
+            yerr=np.array(yerr),
             q_index=q_idx,
             q_value=q_value,
             context="g2",
@@ -4689,11 +4794,13 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
                 "num_samples": samples,
                 "num_chains": chains,
             },
+            launch=bundle,
         )
         worker.signals.finished.connect(self._on_g2_bayesian_finished)
         worker.signals.error.connect(self._on_g2_bayesian_error)
         worker.signals.cancelled.connect(self._on_g2_bayesian_cancelled)
 
+        self._g2_bayesian_launch = bundle
         self._g2_bayesian_worker = worker
         self._g2_bayesian_worker_active = True
         self.btn_g2_bayesian.setText(f"Cancel Q-{q_idx}")
@@ -4702,8 +4809,16 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
 
     def _on_g2_bayesian_finished(self, result):
         """Handle successful G2 Bayesian fit."""
+        launch = result.get("launch") if isinstance(result, dict) else None
+        if result is not None and (
+            launch is None or launch is not self._g2_bayesian_launch
+        ):
+            # A superseded fit (workspace reset, newer launch): drop it.
+            logger.info("Ignoring Bayesian G2 result of a superseded fit")
+            return
         self._g2_bayesian_worker_active = False
         self._g2_bayesian_worker = None
+        self._g2_bayesian_launch = None
         self.btn_g2_bayesian.setEnabled(True)
         q_idx_current = self.sb_g2_bayesian_qidx.value()
         self.btn_g2_bayesian.setText(f"Fit Q-{q_idx_current}")
@@ -4713,19 +4828,15 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             return
 
         fit_result = result["fit_result"]
-        q_idx = result["q_index"]
-        q_value = result["q_value"]
+        q_value = launch.q_value
 
-        self._g2_bayesian_results[q_idx] = fit_result
-        self._g2_bayesian_context[q_idx] = (
-            self._g2_bayesian_fit_fname,
-            float(q_value),
-            self._g2_bayesian_fit_x,
-        )
+        # Commit posterior + the observations/bin it was fitted to as one unit.
+        done = launch.with_result(fit_result)
+        self._g2_bayesian_store[done.key] = done
 
         # Enable diagnosis only if the CURRENT spinbox Q-bin has a result
         # (user may have changed spinbox while the fit was running)
-        has_current = q_idx_current in self._g2_bayesian_results
+        has_current = self._g2_current_bundle() is not None
         self.btn_g2_diagnosis.setEnabled(has_current)
         self.btn_g2_diagnosis.setText(
             f"Diagnosis Q-{q_idx_current}"
@@ -4739,10 +4850,18 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             f"Bayesian fit done for Q={q_value:.4g} ({status})", 4000
         )
 
+    def _is_current_g2_worker(self, worker_id):
+        """True if *worker_id* is the single-Q fit in flight (not a superseded one)."""
+        worker = self._g2_bayesian_worker
+        return worker is not None and getattr(worker, "worker_id", None) == worker_id
+
     def _on_g2_bayesian_error(self, worker_id, error_msg, _tb, _retry):
         """Handle G2 Bayesian fit error."""
+        if not self._is_current_g2_worker(worker_id):
+            return
         self._g2_bayesian_worker_active = False
         self._g2_bayesian_worker = None
+        self._g2_bayesian_launch = None
         self.btn_g2_bayesian.setEnabled(True)
         q_idx_current = self.sb_g2_bayesian_qidx.value()
         self.btn_g2_bayesian.setText(f"Fit Q-{q_idx_current}")
@@ -4751,8 +4870,11 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
 
     def _on_g2_bayesian_cancelled(self, worker_id, reason):
         """Handle G2 Bayesian fit cancellation."""
+        if not self._is_current_g2_worker(worker_id):
+            return
         self._g2_bayesian_worker_active = False
         self._g2_bayesian_worker = None
+        self._g2_bayesian_launch = None
         self.btn_g2_bayesian.setEnabled(True)
         q_idx_current = self.sb_g2_bayesian_qidx.value()
         self.btn_g2_bayesian.setText(f"Fit Q-{q_idx_current}")
@@ -4768,10 +4890,13 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
 
         Returns
         -------
-        tuple or None
-            ``(specs, q_arr, t_el, fit_func_name)`` on success,
-            where *specs* is a list of dicts for
-            :class:`BatchBayesianCoordinator`, or ``None`` on failure.
+        dict or None
+            Everything the batch needs, captured now: ``specs`` (dicts for
+            :class:`BatchBayesianCoordinator`, each carrying its own
+            :class:`BayesianBundle` as ``launch``), ``q_arr``, ``t_el``,
+            ``g2`` (the fitted observation matrix, NaN where not fitted), ``bin_ids``,
+            ``fit_func_name``, ``fname``, ``xf`` and the Q/delay ranges;
+            ``None`` on failure.
         """
         if not self._guard_no_data("g2"):
             return None
@@ -4797,7 +4922,12 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
 
         _, _, fit_func_name = self.check_g2_fitting_number()
 
+        bins = self._g2_resolved_bins(xf_list[0], p, q_arr)
+        if bins is None:
+            return None
+
         from .fitting import fit_double_exp, fit_single_exp
+        from .fitting.bayesian_assembly import BayesianBundle
 
         fit_func = fit_single_exp if fit_func_name == "single" else fit_double_exp
 
@@ -4807,22 +4937,38 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             "num_chains": self.sb_g2_bayesian_chains.value(),
         }
 
+        fname = xf_list[0].fname
         specs: list[dict] = []
+        # Exactly the points that enter the fits (NaN elsewhere), for plotting.
+        fitted_g2 = np.full(np.shape(g2[0]), np.nan)
         for q_idx in range(len(q_arr)):
             y = np.asarray(g2[0][:, q_idx])
             yerr = np.asarray(g2_err[0][:, q_idx])
             valid = np.isfinite(y) & np.isfinite(yerr) & (yerr > 0)
             if not np.any(valid):
                 continue
+            fitted_g2[valid, q_idx] = y[valid]
+            bin_id, _, label = bins[q_idx]
+            bundle = BayesianBundle.create(
+                fname,
+                bin_id,
+                label,
+                float(q_arr[q_idx]),
+                fit_func_name,
+                x[valid],
+                y[valid],
+                yerr[valid],
+            )
             specs.append(
                 {
                     "q_idx": q_idx,
-                    "x": x[valid],
-                    "y": y[valid],
-                    "yerr": yerr[valid],
-                    "q_value": float(q_arr[q_idx]),
+                    "x": np.array(x[valid]),
+                    "y": np.array(y[valid]),
+                    "yerr": np.array(yerr[valid]),
+                    "q_value": bundle.q_value,
                     "fit_func": fit_func,
                     "sampler_kwargs": sampler_kwargs,
+                    "launch": bundle,
                 }
             )
 
@@ -4830,7 +4976,18 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             self.statusbar.showMessage("No valid Q-bins for Bayesian fitting", 2000)
             return None
 
-        return specs, q_arr, x, fit_func_name
+        return {
+            "specs": specs,
+            "q_arr": q_arr,
+            "t_el": x,
+            "g2": fitted_g2,
+            "bin_ids": [b[0] for b in bins],
+            "fit_func_name": fit_func_name,
+            "fname": fname,
+            "xf": xf_list[0],
+            "q_range": q_range,
+            "t_range": t_range,
+        }
 
     def _fit_g2_bayesian_all(self):
         """Launch batched Bayesian (NUTS) fit for all Q-bins."""
@@ -4842,29 +4999,21 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         if extracted is None:
             return
 
-        specs, q_arr, t_el, fit_func_name = extracted
+        specs = extracted["specs"]
 
         from .fitting.models import double_exp_func, single_exp_func
         from .threading.batch_bayesian_coordinator import BatchBayesianCoordinator
 
-        if fit_func_name == "single":
-            self._g2_batch_model_func = single_exp_func
-        else:
-            self._g2_batch_model_func = double_exp_func
-
-        # Store metadata for assembly — capture target xf and range settings
-        # now so results are stored on the correct file even if selection
-        # changes during batch, and so we can detect t_range/q_range drift
-        p = self.check_g2_number()
-        self._g2_batch_q_range = (p[0], p[1])
-        self._g2_batch_t_range = (p[2], p[3])
-        self._g2_batch_q_arr = q_arr
-        self._g2_batch_q_x = {s["q_idx"]: np.array(s["x"]) for s in specs}
-        self._g2_batch_t_el = t_el
-        self._g2_batch_fit_func_name = fit_func_name
-        rows = self.get_selected_rows()
-        xf_list = self.vk.get_xf_list(rows)
-        self._g2_batch_target_xf = xf_list[0] if xf_list else None
+        # Everything the assembly needs is captured now, as one record: the
+        # target file, its bin IDs, the fitted ranges and observations.  Plots
+        # later read them from the file's own summary, never from "the last
+        # batch" or from the current selection.
+        self._g2_batch_launch = {
+            **extracted,
+            "model_func": single_exp_func
+            if extracted["fit_func_name"] == "single"
+            else double_exp_func,
+        }
 
         max_workers = self.sb_g2_bayesian_workers.value()
         coordinator = BatchBayesianCoordinator(
@@ -4906,15 +5055,17 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
 
     def _on_g2_batch_single_q_done(self, q_idx, result):
         """Store individual Q-bin result for diagnosis access."""
-        # q_arr is None when the dataset was reset mid-batch; drop the stale result
-        if result is not None and getattr(self, "_g2_batch_q_arr", None) is not None:
-            self._g2_bayesian_results[q_idx] = result.get("fit_result")
-            xf = getattr(self, "_g2_batch_target_xf", None)
-            self._g2_bayesian_context[q_idx] = (
-                xf.fname if xf is not None else None,
-                float(self._g2_batch_q_arr[q_idx]),
-                self._g2_batch_q_x.get(q_idx),
-            )
+        # No launch record when the dataset was reset mid-batch: drop the result
+        if result is None or self._g2_batch_launch is None:
+            return
+        # The result travels with the bundle it was launched for (observations,
+        # file, absolute bin ID); commit both as one unit.
+        launch = result.get("launch")
+        fit_result = result.get("fit_result")
+        if launch is None or fit_result is None:
+            return
+        done = launch.with_result(fit_result)
+        self._g2_bayesian_store[done.key] = done
 
     def _on_g2_batch_single_q_error(self, q_idx, error_msg):
         """Log individual Q-bin failure."""
@@ -4925,9 +5076,11 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         from .fitting.bayesian_assembly import assemble_fit_summary
 
         # The workspace was reset (state cleared) after this batch was started.
-        if self._g2_batch_q_arr is None:
+        launch = self._g2_batch_launch
+        if launch is None:
             logger.debug("Ignoring batch Bayesian results: batch state was reset")
             return
+        self._g2_batch_launch = None  # consumed: a repeated signal is ignored
 
         # Extract FitResult and per-Q timing from worker result dicts
         fit_results: dict[int, object | None] = {}
@@ -4953,16 +5106,23 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
                 max_time,
             )
 
+        # The summary carries its own file, bin IDs, ranges and observations.
         fit_summary = assemble_fit_summary(
             results=fit_results,
-            q_arr=self._g2_batch_q_arr,
-            t_el=self._g2_batch_t_el,
-            fit_func_name=self._g2_batch_fit_func_name,
-            model_func=self._g2_batch_model_func,
+            q_arr=launch["q_arr"],
+            t_el=launch["t_el"],
+            fit_func_name=launch["fit_func_name"],
+            model_func=launch["model_func"],
+            fname=launch["fname"],
+            bin_ids=launch["bin_ids"],
+            fit_q_range=launch["q_range"],
+            fit_t_range=launch["t_range"],
+            obs_g2=launch["g2"],
+            obs_t_el=launch["t_el"],
         )
 
         # Store on the target file captured at batch start — DUAL STORAGE
-        xf = getattr(self, "_g2_batch_target_xf", None)
+        xf = launch["xf"]
         if xf is not None:
             xf.bayesian_fit_summary = fit_summary  # Bayesian owns this
             xf.bayesian_results = dict(fit_results)  # Per-Q FitResult objects
@@ -4979,8 +5139,11 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             final_message=f"Bayesian fit: {succeeded}/{total} Q-bins succeeded{timing_str}",
         )
 
-        # Restore UI state
-        self._g2_batch_coordinator = None
+        # Restore UI state; the finished coordinator (and the results it holds)
+        # is retired instead of lingering as a child of this window.
+        coordinator, self._g2_batch_coordinator = self._g2_batch_coordinator, None
+        if coordinator is not None:
+            coordinator.dispose()
         self.btn_g2_bayesian_all.setText("Fit All Q")
         self.btn_g2_bayesian.setEnabled(True)
         self.sb_g2_bayesian_workers.setEnabled(True)
@@ -4990,7 +5153,7 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         self.btn_g2_plot_all_q.setEnabled(True)
         q_idx_current = self.sb_g2_bayesian_qidx.value()
         self.btn_g2_bayesian.setText(f"Fit Q-{q_idx_current}")
-        has_result = q_idx_current in self._g2_bayesian_results
+        has_result = self._g2_current_bundle() is not None
         self.btn_g2_diagnosis.setEnabled(has_result)
         self.btn_g2_diagnosis.setText(
             f"Diagnosis Q-{q_idx_current}"
@@ -5013,11 +5176,14 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
     def _cancel_g2_bayesian_batch(self):
         """Cancel the running batch Bayesian fitting."""
         if self._g2_batch_coordinator is not None:
+            # cancel() mutes and retires the coordinator; it is deleted once
+            # its still-running workers have reported.
             self._g2_batch_coordinator.cancel()
             self.progress_manager.complete_operation(
                 "bayesian_batch_g2", success=False, final_message="Batch cancelled"
             )
             self._g2_batch_coordinator = None
+            self._g2_batch_launch = None
             self.btn_g2_bayesian_all.setText("Fit All Q")
             self.btn_g2_bayesian.setEnabled(True)
             self.sb_g2_bayesian_workers.setEnabled(True)
@@ -5044,48 +5210,12 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             )
             return
 
-        # Get raw G2 data for overlay — use the SAME ranges that were used
-        # during fitting so scatter points align with fit curves
-        from .module import g2mod
-
-        p = self.check_g2_number()
-        current_q_range = (p[0], p[1])
-        current_t_range = (p[2], p[3])
-
-        # Warn if the user changed q_range or t_range since fitting
-        fit_q_range = self._g2_batch_q_range
-        fit_t_range = self._g2_batch_t_range
-        if fit_q_range is not None and fit_t_range is not None:
-            if current_q_range != fit_q_range or current_t_range != fit_t_range:
-                logger.warning(
-                    "Plot range differs from fit range "
-                    "(fit q=%.4g-%.4g t=%.4g-%.4g, "
-                    "current q=%.4g-%.4g t=%.4g-%.4g); "
-                    "using fit-time ranges for consistency",
-                    *fit_q_range,
-                    *fit_t_range,
-                    *current_q_range,
-                    *current_t_range,
-                )
-                self.statusbar.showMessage(
-                    "Range changed since fit — using fit-time ranges", 3000
-                )
-                current_q_range = fit_q_range
-                current_t_range = fit_t_range
-
-        result = g2mod.get_data(
-            xf_list, q_range=current_q_range, t_range=current_t_range
-        )
-        if result[0] is False or len(result[0]) == 0:
-            self.statusbar.showMessage("No G2 data available", 2000)
-            return
-        _, tel, g2, _g2_err, _ = result
-        g2_data = np.asarray(g2[0], dtype=np.float64)
-        data_t_el = np.asarray(tel[0], dtype=np.float64)
-
+        # The summary is self-contained: it carries the bins, ranges and
+        # observations it was fitted to, so the plot never re-extracts data
+        # with the current (or another file's) selection.
         from .fitting.viz import plot_bayesian_all_q
 
-        fig = plot_bayesian_all_q(bfs, g2_data, data_t_el=data_t_el)
+        fig = plot_bayesian_all_q(bfs)
         if fig is None:
             return
 
@@ -5208,47 +5338,26 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         always reflects the user's current selection.
         """
         q_idx = self.sb_g2_bayesian_qidx.value()
-        fit_result = self._g2_bayesian_results.get(q_idx)
-        if fit_result is None:
+        # Looked up by the physical bin (file, absolute bin ID) that the
+        # spinbox position currently addresses.  The stored bundle brings its
+        # own observations; nothing is re-extracted to pair with it.
+        bundle = self._g2_current_bundle()
+        if bundle is None:
             self.statusbar.showMessage(
-                f"No Bayesian fit result for Q-bin {q_idx} — run Fit first", 3000
+                f"No Bayesian fit result for Q-bin {q_idx} of the selected file "
+                "— run Fit first",
+                3000,
             )
             return
+        self._update_g2_diagnosis(bundle)
 
-        # Extract fresh data for the current Q-bin (uses q_idx from spinbox
-        # which we already captured above — safe from race conditions)
-        extracted = self._extract_g2_for_bayesian()
-        if extracted is None:
-            return
-        x, y, yerr, extracted_q_idx, q_value, _ = extracted
-
-        # Guard against spinbox change between our read and extraction
-        if extracted_q_idx != q_idx:
-            fit_result = self._g2_bayesian_results.get(extracted_q_idx)
-            if fit_result is None:
-                self.statusbar.showMessage(
-                    f"No Bayesian fit for Q-bin {extracted_q_idx}", 3000
-                )
-                return
-            q_idx = extracted_q_idx
-
-        # The cache is keyed by relative index only; refuse a fit that was
-        # computed for another file, Q value or delay window.
-        if not self._g2_fit_matches_current(q_idx, q_value, x):
-            self.statusbar.showMessage(
-                f"Cached fit for Q-bin {q_idx} belongs to a different file, Q "
-                "value or delay window — re-run Fit",
-                4000,
-            )
-            return
-
-        self._g2_bayesian_data = (x, y, yerr, q_idx, q_value)
-        self._update_g2_diagnosis(fit_result, x, y, yerr, q_value)
-
-    def _update_g2_diagnosis(self, fit_result, x, y, yerr, q_value):
-        """Create/update the G2 diagnosis window with current results."""
+    def _update_g2_diagnosis(self, bundle):
+        """Create/update the G2 diagnosis window from a stored bundle."""
         from .fitting.models import double_exp_func, single_exp_func
         from .gui.bayesian_diagnosis import BayesianDiagnosisWindow
+
+        fit_result, x, y, yerr = bundle.result, bundle.x, bundle.y, bundle.yerr
+        q_value = bundle.q_value
 
         if self._g2_diagnosis_window is None:
             self._g2_diagnosis_window = BayesianDiagnosisWindow(
@@ -5258,15 +5367,11 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
                 lambda: setattr(self, "_g2_diagnosis_window", None)
             )
 
-        # Resolve model_func from fit_result's param_names to avoid stale
-        # reference if user changed fitting function between fit and diagnosis
-        param_names = fit_result.param_names
-        if set(param_names) == {"tau", "baseline", "contrast"}:
-            model_func = single_exp_func
-        elif set(param_names) == {"tau1", "tau2", "baseline", "contrast1", "contrast2"}:
-            model_func = double_exp_func
-        else:
-            model_func = self._g2_bayesian_model_func
+        # The model is the one the bundle was fitted with (not whatever the
+        # fitting-function combo box says now).
+        model_func = {"single": single_exp_func, "double": double_exp_func}.get(
+            bundle.model_name
+        )
         if model_func is None:
             self.statusbar.showMessage(
                 "No model function available — re-fit first", 3000
@@ -5282,7 +5387,10 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             y_data=y,
             yerr=yerr,
             q_value=q_value,
-            title=f"G2 Bayesian Diagnosis - Q={q_value:.4g}",
+            title=(
+                f"G2 Bayesian Diagnosis - Q={q_value:.4g} "
+                f"({bundle.label}, bin {bundle.bin_id})"
+            ),
         )
         win.show()
         win.raise_()
@@ -5298,9 +5406,10 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
 
         Returns
         -------
-        tuple or None
-            ``(q_valid, tau_valid, tau_err_valid)`` on success, ``None``
-            if no valid data is available.
+        BayesianBundle or None
+            The captured observations ``(q, tau, tau_err)`` of the first
+            selected file as a result-less bundle, ``None`` if no valid data
+            is available.
         """
         if not self._guard_no_data("diffusion"):
             return None
@@ -5328,9 +5437,13 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             tau_err = np.asarray(fit_summary["tauq_tau_err"])
         else:
             q = np.asarray(fit_summary["q_val"])
+            from .fitting.legacy import fit_success_mask
+
             fit_val = np.asarray(fit_summary["fit_val"])
-            tau = fit_val[:, 0, 1]
-            tau_err = fit_val[:, 1, 1]
+            # a Q bin without a usable G2 fit never contributes a tau value
+            ok = fit_success_mask(fit_summary)
+            tau = np.where(ok, fit_val[:, 0, 1], np.nan)
+            tau_err = np.where(ok, fit_val[:, 1, 1], np.nan)
 
             # Trim to consistent length
             min_len = min(len(q), len(tau), len(tau_err))
@@ -5353,7 +5466,18 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             self.statusbar.showMessage("No valid diffusion data in Q-range", 2000)
             return None
 
-        return q[valid], tau[valid], tau_err[valid]
+        from .fitting.bayesian_assembly import BayesianBundle
+
+        return BayesianBundle.create(
+            xf.fname,
+            "tau-q",
+            "tau(q) power law",
+            0.0,
+            "power_law",
+            q[valid],
+            tau[valid],
+            tau_err[valid],
+        )
 
     def _fit_diff_bayesian(self):
         """Launch Bayesian (NUTS) power-law fit for diffusion data."""
@@ -5365,12 +5489,13 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         if extracted is None:
             return
 
-        q, tau, tau_err = extracted
+        # The observations are captured with the launch and committed with the
+        # result; the displayed (previous) result keeps its own observations.
+        bundle = extracted
+        q, tau, tau_err = bundle.x, bundle.y, bundle.yerr
 
         from .fitting import fit_power_law
         from .threading.bayesian_worker import BayesianFitWorker
-
-        self._diff_bayesian_data = (q, tau, tau_err)
 
         # Forward MCMC config from G2 Bayesian spinboxes (shared controls).
         sampler_kwargs: dict = {
@@ -5399,18 +5524,21 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
 
         worker = BayesianFitWorker(
             fit_func=fit_power_law,
-            x=q,
-            y=tau,
-            yerr=tau_err,
+            x=np.array(q),
+            y=np.array(tau),
+            yerr=np.array(tau_err),
             q_index=-1,
             q_value=0.0,
             context="diffusion",
             sampler_kwargs=sampler_kwargs,
+            launch=bundle,
         )
         worker.signals.finished.connect(self._on_diff_bayesian_finished)
         worker.signals.error.connect(self._on_diff_bayesian_error)
         worker.signals.cancelled.connect(self._on_diff_bayesian_cancelled)
 
+        self._diff_bayesian_launch = bundle
+        self._diff_bayesian_worker = worker
         self._diff_bayesian_worker_active = True
         self.btn_diff_bayesian.setEnabled(False)
         self.btn_diff_bayesian.setText("fitting...")
@@ -5419,7 +5547,16 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
 
     def _on_diff_bayesian_finished(self, result):
         """Handle successful diffusion Bayesian fit."""
+        launch = result.get("launch") if isinstance(result, dict) else None
+        if result is not None and (
+            launch is None or launch is not self._diff_bayesian_launch
+        ):
+            # A superseded fit (workspace reset, newer launch): drop it.
+            logger.info("Ignoring Bayesian diffusion result of a superseded fit")
+            return
         self._diff_bayesian_worker_active = False
+        self._diff_bayesian_worker = None
+        self._diff_bayesian_launch = None
         self.btn_diff_bayesian.setEnabled(True)
         self.btn_diff_bayesian.setText("Fit Bayesian")
 
@@ -5427,15 +5564,17 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             self.statusbar.showMessage("Bayesian fit returned no result", 2000)
             return
 
-        self._diff_bayesian_result = result["fit_result"]
+        # Commit posterior + the observations it was fitted to as one unit.
+        done = launch.with_result(result["fit_result"])
+        self._diff_bayesian_store[done.fname] = done
         self.btn_diff_diagnosis.setEnabled(True)
 
-        converged = self._diff_bayesian_result.diagnostics.converged
+        converged = done.result.diagnostics.converged
         status = "converged" if converged else "NOT converged"
 
         # Show parameter estimates with NLSQ-equivalent conversion:
         # Bayesian uses tau0 * q^(-alpha), NLSQ uses a * x^b, so b = -alpha.
-        summary = self._diff_bayesian_result.summary
+        summary = done.result.summary
         try:
             alpha = summary.loc["alpha", "mean"]
             tau0 = summary.loc["tau0", "mean"]
@@ -5446,9 +5585,18 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             f"Bayesian power-law fit done ({status}){param_str}", 6000
         )
 
+    def _is_current_diff_worker(self, worker_id):
+        """True if *worker_id* is the diffusion fit in flight (not a superseded one)."""
+        worker = self._diff_bayesian_worker
+        return worker is not None and getattr(worker, "worker_id", None) == worker_id
+
     def _on_diff_bayesian_error(self, worker_id, error_msg, _tb, _retry):
         """Handle diffusion Bayesian fit error."""
+        if not self._is_current_diff_worker(worker_id):
+            return
         self._diff_bayesian_worker_active = False
+        self._diff_bayesian_worker = None
+        self._diff_bayesian_launch = None
         self.btn_diff_bayesian.setEnabled(True)
         self.btn_diff_bayesian.setText("Fit Bayesian")
         logger.error("Bayesian diffusion fit failed: %s", error_msg)
@@ -5456,7 +5604,11 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
 
     def _on_diff_bayesian_cancelled(self, worker_id, reason):
         """Handle diffusion Bayesian fit cancellation (P1-04)."""
+        if not self._is_current_diff_worker(worker_id):
+            return
         self._diff_bayesian_worker_active = False
+        self._diff_bayesian_worker = None
+        self._diff_bayesian_launch = None
         self.btn_diff_bayesian.setEnabled(True)
         self.btn_diff_bayesian.setText("Fit Bayesian")
         logger.info("Bayesian diffusion fit cancelled: %s", reason)
@@ -5464,17 +5616,27 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
 
     def _show_diff_diagnosis(self):
         """Show or create the diffusion Bayesian diagnosis window."""
-        if self._diff_bayesian_data is None or self._diff_bayesian_result is None:
-            self.statusbar.showMessage("No Bayesian fit data available", 2000)
+        # The stored bundle of the selected file brings its own observations.
+        xf_list = (
+            self.vk.get_xf_list(self.get_selected_rows())
+            if self.vk and self.get_selected_rows()
+            else []
+        )
+        bundle = self._diff_bayesian_store.get(xf_list[0].fname) if xf_list else None
+        if bundle is None:
+            self.statusbar.showMessage(
+                "No Bayesian diffusion fit for the selected file — run Fit first",
+                2000,
+            )
             return
+        self._update_diff_diagnosis(bundle)
 
-        q, tau, tau_err = self._diff_bayesian_data
-        self._update_diff_diagnosis(self._diff_bayesian_result, q, tau, tau_err)
-
-    def _update_diff_diagnosis(self, fit_result, q, tau, tau_err):
-        """Create/update the diffusion diagnosis window with current results."""
+    def _update_diff_diagnosis(self, bundle):
+        """Create/update the diffusion diagnosis window from a stored bundle."""
         from .fitting.models import power_law_func
         from .gui.bayesian_diagnosis import BayesianDiagnosisWindow
+
+        fit_result, q, tau, tau_err = bundle.result, bundle.x, bundle.y, bundle.yerr
 
         if self._diff_diagnosis_window is None:
             self._diff_diagnosis_window = BayesianDiagnosisWindow(
@@ -5492,7 +5654,7 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             x_data=q,
             y_data=tau,
             yerr=tau_err,
-            title="Diffusion Bayesian Diagnosis - Power Law",
+            title=f"Diffusion Bayesian Diagnosis - Power Law ({bundle.fname})",
         )
         win.show()
         win.raise_()
@@ -5513,7 +5675,7 @@ def setup_windows_icon():
     ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(appid)
 
 
-def main_gui(path=None, label_style=None, path_explicit=False):
+def main_gui(path=None, label_style=None, path_explicit=None):
     if os.name == "nt":
         setup_windows_icon()
 

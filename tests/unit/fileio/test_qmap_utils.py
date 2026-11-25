@@ -4,6 +4,7 @@ This module provides comprehensive unit tests for Q-space mapping utilities,
 covering Q-space calculations and detector geometry.
 """
 
+from collections.abc import MutableMapping
 from unittest.mock import Mock, patch
 
 import numpy as np
@@ -20,7 +21,7 @@ class TestQMapManager:
         manager = QMapManager()
 
         assert hasattr(manager, "db")
-        assert isinstance(manager.db, dict)
+        assert isinstance(manager.db, MutableMapping)
         assert len(manager.db) == 0
 
     @patch("xpcsviewer.fileIO.qmap_utils.get_hash")
@@ -661,9 +662,11 @@ def test_qmap_manager_cache_behavior(manager_cache_size, expected_behavior):
     """Test QMapManager cache behavior with different sizes."""
     manager = QMapManager()
 
-    # Pre-populate cache
+    # Pre-populate cache (the manager holds maps weakly, so keep owners alive)
+    owners = []
     for i in range(manager_cache_size):
         mock_qmap = Mock()
+        owners.append(mock_qmap)
         manager.db[f"hash_{i}"] = mock_qmap
 
     assert len(manager.db) == manager_cache_size

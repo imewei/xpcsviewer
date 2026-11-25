@@ -19,6 +19,7 @@ import traceback
 from collections.abc import Callable
 
 # Local imports
+from .fileIO.hdf_reader import _file_identity
 from .fileIO.qmap_utils import QMapManager
 from .helper.listmodel import ListDataModel
 from .utils.log_utils import log_timing
@@ -26,6 +27,8 @@ from .utils.logging_config import get_logger
 from .xpcs_file import XpcsFile as XF
 
 logger = get_logger(__name__)
+
+_UNTRACKED = object()  # cache entry without a recorded file revision
 
 
 def _get_file_size_mb(fname: str) -> float:
@@ -75,6 +78,10 @@ class FileLocator:
         self.target = ListDataModel()
         self.qmap_manager = QMapManager()
         self.cache = {}
+        # Source revision (``_file_identity``) each cache entry was loaded from;
+        # an entry, including a failed-load sentinel, is only served while the
+        # file at its path is still that revision.
+        self._cache_identity: dict[str, tuple[int, ...] | None] = {}
         self._cache_lock = threading.Lock()
         self.timestamp = None
 
@@ -85,6 +92,26 @@ class FileLocator:
     def clear(self):
         self.source.clear()
         self.source_search.clear()
+
+    def _is_current(self, full_fname):
+        """Whether the cached entry still matches the file on disk.
+
+        Must be called with ``_cache_lock`` held.
+        """
+        recorded = self._cache_identity.get(full_fname, _UNTRACKED)
+        return recorded is _UNTRACKED or recorded == _file_identity(full_fname)
+
+    def _drop_stale_cache(self):
+        """Forget cache entries whose source file was replaced or modified."""
+        with self._cache_lock:
+            for full_fname in [p for p in self.cache if not self._is_current(p)]:
+                del self.cache[full_fname]
+                self._cache_identity.pop(full_fname, None)
+
+    def _store(self, full_fname, xf_obj, identity):
+        """Insert ``xf_obj`` loaded from revision ``identity`` (lock held)."""
+        self.cache[full_fname] = xf_obj
+        self._cache_identity[full_fname] = identity
 
     def get_xf_list(
         self,
@@ -127,7 +154,11 @@ class FileLocator:
             with self._cache_lock:
                 if check_cancelled is not None:
                     check_cancelled()
-                ret = [xf for xf in self.cache.values() if xf is not None]
+                ret = [
+                    xf
+                    for p, xf in self.cache.items()
+                    if xf is not None and self._is_current(p)
+                ]
             # Apply filters if specified
             if filter_fitted:
                 ret = [xf for xf in ret if xf.fit_summary is not None]
@@ -147,9 +178,11 @@ class FileLocator:
             # to read or insert different files. (BUG-033)
             # Test membership, not None: a failed load is cached as None on
             # purpose so we don't re-read a broken file on every plot update.
+            # An entry loaded from another revision of the file is stale.
+            identity = _file_identity(full_fname)
             with self._cache_lock:
-                is_cached = full_fname in self.cache
-                xf_obj = self.cache.get(full_fname)
+                is_cached = full_fname in self.cache and self._is_current(full_fname)
+                xf_obj = self.cache.get(full_fname) if is_cached else None
 
             if not is_cached:
                 # Construct the XpcsFile object outside the lock so HDF5 I/O
@@ -163,10 +196,10 @@ class FileLocator:
                 with self._cache_lock:
                     if check_cancelled is not None:
                         check_cancelled()
-                    if full_fname not in self.cache:
-                        self.cache[full_fname] = xf_obj
-                    else:
+                    if full_fname in self.cache and self._is_current(full_fname):
                         xf_obj = self.cache[full_fname]
+                    else:
+                        self._store(full_fname, xf_obj, identity)
 
             # Skip None objects (failed to load)
             if xf_obj is None:
@@ -207,11 +240,12 @@ class FileLocator:
                     continue
                 full_fname = os.path.normpath(os.path.join(self.path, fn))
                 file_size = _get_file_size_mb(full_fname)
+                identity = _file_identity(full_fname)  # before the read
                 xf_obj = create_xpcs_dataset(full_fname, qmap_manager=self.qmap_manager)
                 if xf_obj is not None:
                     self.target.append(fn)
                     with self._cache_lock:
-                        self.cache[full_fname] = xf_obj
+                        self._store(full_fname, xf_obj, identity)
                     loaded_count += 1
                     total_size_mb += file_size
             logger.info(
@@ -230,13 +264,16 @@ class FileLocator:
         self.target.clear()
         with self._cache_lock:
             self.cache.clear()
+            self._cache_identity.clear()
 
     def remove_target(self, rlist):
         for x in rlist:
             if x in self.target:
                 self.target.remove(x)
             with self._cache_lock:
-                self.cache.pop(os.path.normpath(os.path.join(self.path, x)), None)
+                full_fname = os.path.normpath(os.path.join(self.path, x))
+                self.cache.pop(full_fname, None)
+                self._cache_identity.pop(full_fname, None)
         if not self.target:
             self.clear_target()
         self.timestamp = str(datetime.datetime.now())
@@ -278,6 +315,8 @@ class FileLocator:
             return False
 
         self.set_path(path)
+        # Reload: entries loaded from a since-replaced file must not outlive it.
+        self._drop_stale_cache()
         flist = [
             entry.name
             for entry in os.scandir(path)

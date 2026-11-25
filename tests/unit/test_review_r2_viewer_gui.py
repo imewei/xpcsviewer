@@ -204,82 +204,67 @@ def test_r2_20_click_outside_processed_bins_keeps_selection(qapp):
 # ---------------------------------------------------------------------------
 
 
-def _diag_stub(ctx, cur_x):
-    stub = SimpleNamespace()
-    stub.sb_g2_bayesian_qidx = MagicMock()
-    stub.sb_g2_bayesian_qidx.value.return_value = 0
-    stub._g2_bayesian_results = {0: object()}
-    stub._g2_bayesian_context = {0: ctx}
-    stub.statusbar = MagicMock()
-    stub._extract_g2_for_bayesian = lambda: (
-        cur_x,
-        np.ones_like(cur_x),
-        np.full_like(cur_x, 0.1),
-        0,
-        0.02,
-        "single",
-    )
-    stub._g2_first_fname = lambda: "A.h5"
-    stub._g2_fit_matches_current = lambda *a: _viewer_cls()._g2_fit_matches_current(
-        stub, *a
-    )
-    stub._update_g2_diagnosis = MagicMock()
-    stub._g2_bayesian_data = None
-    return stub
+def _fit_bundle(x, y=None, bin_id=1, q=0.02, result="posterior"):
+    from xpcsviewer.fitting.bayesian_assembly import BayesianBundle
+
+    y = np.ones_like(x) if y is None else y
+    return BayesianBundle.create(
+        "A.h5", bin_id, f"q={q}", q, "single", x, y, np.full_like(x, 0.1)
+    ).with_result(result)
 
 
-def test_r2_22_diagnosis_refuses_fit_from_other_delay_window():
+def test_r2_22_diagnosis_shows_stored_delay_window_not_current_one():
+    """The delay window may change after the fit: the stored observations (not
+    the current window) are what the stored posterior is shown with."""
     fit_x = np.array([0.001, 0.01])
-    stub = _diag_stub(("A.h5", 0.02, fit_x), cur_x=np.array([0.1, 1.0]))
+    stored = _fit_bundle(fit_x)
+    stub = SimpleNamespace(
+        sb_g2_bayesian_qidx=MagicMock(value=lambda: 0),
+        statusbar=MagicMock(),
+        _g2_current_bundle=lambda: stored,
+        _update_g2_diagnosis=MagicMock(),
+    )
     _viewer_cls()._show_g2_diagnosis(stub)
-    stub._update_g2_diagnosis.assert_not_called()
-    assert "re-run" in stub.statusbar.showMessage.call_args[0][0].lower()
-
-
-def test_r2_22_diagnosis_accepts_same_delay_window():
-    fit_x = np.array([0.001, 0.01])
-    stub = _diag_stub(("A.h5", 0.02, fit_x.copy()), cur_x=fit_x.copy())
-    _viewer_cls()._show_g2_diagnosis(stub)
-    stub._update_g2_diagnosis.assert_called_once()
+    shown = stub._update_g2_diagnosis.call_args[0][0]
+    np.testing.assert_array_equal(shown.x, fit_x)
+    assert shown.result == "posterior"
 
 
 def test_r2_22_single_fit_records_fit_time_delays():
     x = np.array([0.001, 0.01])
     fit_result = SimpleNamespace(diagnostics=SimpleNamespace(converged=True))
+    launch = _fit_bundle(x, bin_id=3, q=0.07, result=None)
     stub = SimpleNamespace(
         _g2_bayesian_worker_active=True,
         _g2_bayesian_worker=None,
+        _g2_bayesian_launch=launch,
         btn_g2_bayesian=MagicMock(),
         btn_g2_diagnosis=MagicMock(),
         sb_g2_bayesian_qidx=MagicMock(),
         statusbar=MagicMock(),
-        _g2_bayesian_results={},
-        _g2_bayesian_context={},
-        _g2_bayesian_fit_fname="A.h5",
-        _g2_bayesian_fit_x=x,
+        _g2_bayesian_store={},
+        _g2_current_bundle=lambda: None,
     )
     stub.sb_g2_bayesian_qidx.value.return_value = 3
     _viewer_cls()._on_g2_bayesian_finished(
-        stub, {"fit_result": fit_result, "q_index": 3, "q_value": 0.07}
+        stub,
+        {"fit_result": fit_result, "q_index": 3, "q_value": 0.07, "launch": launch},
     )
-    fname, q, ctx_x = stub._g2_bayesian_context[3]
-    assert (fname, q) == ("A.h5", 0.07)
-    np.testing.assert_array_equal(ctx_x, x)
+    done = stub._g2_bayesian_store[("A.h5", 3)]
+    assert done.q_value == 0.07
+    np.testing.assert_array_equal(done.x, x)
 
 
 def test_r2_22_batch_fit_records_fit_time_delays():
     x = np.array([0.001, 0.01])
-    stub = SimpleNamespace(
-        _g2_bayesian_results={},
-        _g2_bayesian_context={},
-        _g2_batch_q_arr=np.array([0.01, 0.02]),
-        _g2_batch_q_x={1: x},
-        _g2_batch_target_xf=SimpleNamespace(fname="A.h5"),
+    launch = _fit_bundle(x, bin_id=4, q=0.02, result=None)
+    stub = SimpleNamespace(_g2_bayesian_store={}, _g2_batch_launch={"specs": []})
+    _viewer_cls()._on_g2_batch_single_q_done(
+        stub, 1, {"fit_result": "fit", "launch": launch}
     )
-    _viewer_cls()._on_g2_batch_single_q_done(stub, 1, {"fit_result": "fit"})
-    fname, q, ctx_x = stub._g2_bayesian_context[1]
-    assert (fname, q) == ("A.h5", 0.02)
-    np.testing.assert_array_equal(ctx_x, x)
+    done = stub._g2_bayesian_store[("A.h5", 4)]
+    assert done.q_value == 0.02
+    np.testing.assert_array_equal(done.x, x)
 
 
 # ---------------------------------------------------------------------------
@@ -303,9 +288,15 @@ def test_r2_23_spinbox_draw_drops_older_async_saxs_result():
         toast_manager=MagicMock(),
         spinBox_saxs2d_selection=MagicMock(value=lambda: 1),
         async_vk=None,
+        _plot_pending=set(),
+        _retiring_plots=False,
+        plot_kwargs_record={},
     )
     stub.progress_manager.is_operation_active.return_value = False
     stub._plot_request_is_stale = lambda *a: cls._plot_request_is_stale(stub, *a)
+    stub._settle_plot_operation = lambda *a, **k: cls._settle_plot_operation(
+        stub, *a, **k
+    )
     stub.cancel_async_operation = lambda op: cls.cancel_async_operation(stub, op)
     stub._retire_plot_operations = lambda *a: cls._retire_plot_operations(stub, *a)
 
@@ -355,11 +346,7 @@ def test_r2_28_cancelled_coordinator_emits_nothing_more(qapp):
 
 def test_r2_28_batch_finished_after_state_reset_is_ignored():
     stub = SimpleNamespace(
-        _g2_batch_q_arr=None,
-        _g2_batch_t_el=None,
-        _g2_batch_fit_func_name=None,
-        _g2_batch_model_func=None,
-        _g2_batch_target_xf=None,
+        _g2_batch_launch=None,  # cleared by the workspace reset
         progress_manager=MagicMock(),
     )
     _viewer_cls()._on_g2_batch_finished(stub, {0: None, 1: None})  # must not raise

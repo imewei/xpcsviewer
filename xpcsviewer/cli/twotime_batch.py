@@ -4,6 +4,7 @@ import gc
 import math
 import os
 import re
+from collections.abc import Sequence
 from pathlib import Path
 
 import matplotlib
@@ -75,6 +76,11 @@ def extract_q_phi_from_label(label: str) -> tuple[float | None, float | None]:
     return q_value, phi_value
 
 
+def _angular_diff(a: float, b: float) -> float:
+    """Absolute angular difference in degrees on the circle, in [0, 180]."""
+    return abs((a - b + 180.0) % 360.0 - 180.0)
+
+
 def _collect_valid_qbins(
     xfile: XpcsFile, require_phi: bool = True
 ) -> list[tuple[int, str, float, float | None]]:
@@ -91,6 +97,15 @@ def _collect_valid_qbins(
         else:
             logger.warning(f"Could not extract q/phi from qbin {i}: {label}")
     return valid_qbins
+
+
+def _qbins_with_phi(xfile: XpcsFile) -> list[tuple[int, str, float, float]]:
+    """Qbins whose label carries both q and phi (the angle-based modes need phi)."""
+    return [
+        (i, label, q, phi)
+        for i, label, q, phi in _collect_valid_qbins(xfile)
+        if phi is not None
+    ]
 
 
 def find_qbins_for_q(
@@ -157,7 +172,7 @@ def find_qbins_for_phi(
         List of tuples (qbin_index, label, q_value, phi_value) for closest
         matching qbins
     """
-    valid_qbins = _collect_valid_qbins(xfile)
+    valid_qbins = _qbins_with_phi(xfile)
 
     if not valid_qbins:
         logger.warning("No valid qbins found for phi selection")
@@ -165,15 +180,15 @@ def find_qbins_for_phi(
 
     # Find the closest phi-value(s)
     phi_values = [qbin[3] for qbin in valid_qbins]
-    closest_phi = min(phi_values, key=lambda phi: abs(phi - target_phi))
-    closest_phi_diff = abs(closest_phi - target_phi)
+    closest_phi = min(phi_values, key=lambda phi: _angular_diff(phi, target_phi))
+    closest_phi_diff = _angular_diff(closest_phi, target_phi)
 
     # Get all qbins with the closest phi-value
     phi_tolerance = 1e-10  # Use tight tolerance for exact match
     matching_qbins = [
         (i, label, q_val, phi_val)
         for i, label, q_val, phi_val in valid_qbins
-        if abs(phi_val - closest_phi) < phi_tolerance
+        if _angular_diff(phi_val, closest_phi) < phi_tolerance
     ]
 
     logger.info(
@@ -208,7 +223,7 @@ def find_qbin_for_qphi(
     Returns:
         Tuple (qbin_index, label, q_value, phi_value) for closest matching qbin or None
     """
-    valid_qbins = _collect_valid_qbins(xfile)
+    valid_qbins = _qbins_with_phi(xfile)
 
     if not valid_qbins:
         logger.warning("No valid qbins found for q-phi selection")
@@ -227,7 +242,7 @@ def find_qbin_for_qphi(
     for i, label, q_value, phi_value in valid_qbins:
         # Normalized euclidean distance
         q_norm = abs(q_value - target_q) / q_range
-        phi_norm = abs(phi_value - target_phi) / phi_range
+        phi_norm = _angular_diff(phi_value, target_phi) / phi_range
         distance = (q_norm**2 + phi_norm**2) ** 0.5
 
         if distance < best_distance:
@@ -236,7 +251,7 @@ def find_qbin_for_qphi(
 
     if best_match:
         q_diff = abs(best_match[2] - target_q)
-        phi_diff = abs(best_match[3] - target_phi)
+        phi_diff = _angular_diff(best_match[3], target_phi)
         logger.info(
             f"Found closest qbin: q={best_match[2]:.6f} (diff={q_diff:.6f}), "
             f"phi={best_match[3]:.2f}° (diff={phi_diff:.2f}°)"
@@ -347,15 +362,28 @@ def generate_output_filename(
     return f"{rel}{qbin}_q{q_value:.4f}{phi}.{output_format}"
 
 
-def process_single_file(file_path: str, args, written: set[str] | None = None) -> int:
+def process_single_file(
+    file_path: str,
+    args,
+    written: dict[tuple[str, str], str] | None = None,
+    refused: list[str] | None = None,
+) -> int:
     """
     Process a single HDF file and generate twotime images.
+
+    Within one run, two different (input file, Q-bin) pairs never write the same
+    output file, however the paths are spelled: the destination is keyed on the
+    real (symlink-resolved) output directory and the case-normalised file name.
+    Re-running the CLI into the same output folder in a separate run overwrites
+    the earlier images by design.
 
     Args:
         file_path: Path to HDF file
         args: Command line arguments
-        written: Output paths already written in this run; an image whose path
-            is in it is not saved again. Updated in place.
+        written: Destinations already written in this run, mapped to the source
+            that wrote them. Updated in place.
+        refused: Descriptions of images refused because their destination was
+            already written in this run. Appended to in place.
 
     Returns:
         Number of images generated
@@ -363,7 +391,9 @@ def process_single_file(file_path: str, args, written: set[str] | None = None) -
     logger.info(f"Processing file: {file_path}")
 
     if written is None:
-        written = set()
+        written = {}
+    if refused is None:
+        refused = []
     xfile = None  # Initialize outside try block for finally cleanup
     try:
         # Load XpcsFile
@@ -388,7 +418,7 @@ def process_single_file(file_path: str, args, written: set[str] | None = None) -
             logger.debug(f"  Qbin {i}: {label} -> q={q_val}, phi={phi_val}")
 
         # Determine qbins to process based on selection mode
-        qbins_to_process = []
+        qbins_to_process: Sequence[tuple[int, str, float, float | None]] = []
 
         if args.q is not None:
             # Mode 1: All phi angles at specific q
@@ -398,8 +428,8 @@ def process_single_file(file_path: str, args, written: set[str] | None = None) -
             qbins_to_process = find_qbins_for_phi(xfile, args.phi)
         elif args.q_phi is not None:
             # Mode 3: Specific q-phi pair
-            q_value, phi_value = parse_q_phi_pair(args.q_phi)
-            qbin_match = find_qbin_for_qphi(xfile, q_value, phi_value)
+            target_q, target_phi = parse_q_phi_pair(args.q_phi)
+            qbin_match = find_qbin_for_qphi(xfile, target_q, target_phi)
             if qbin_match:
                 qbins_to_process = [qbin_match]
 
@@ -446,15 +476,25 @@ def process_single_file(file_path: str, args, written: set[str] | None = None) -
                         root=args.input if os.path.isdir(args.input) else None,
                     )
                     output_path = os.path.join(args.output, output_filename)
-                    key = os.path.normcase(os.path.abspath(output_path))
+                    out_dir = os.path.dirname(output_path)
+                    os.makedirs(out_dir, exist_ok=True)
+                    key = (
+                        os.path.normcase(os.path.realpath(out_dir)),
+                        os.path.normcase(os.path.basename(output_path)),
+                    )
+                    source = f"{file_path} (qbin {qbin_index})"
                     if key in written:
-                        raise FileExistsError(
-                            f"{output_path} was already written in this run"
+                        message = (
+                            f"Refusing to overwrite {output_path}: already written "
+                            f"in this run from {written[key]}, now requested by "
+                            f"{source}"
                         )
+                        logger.error(message)
+                        refused.append(message)
+                        continue
 
-                    os.makedirs(os.path.dirname(output_path), exist_ok=True)
                     fig.savefig(output_path, dpi=args.dpi, bbox_inches="tight")
-                    written.add(key)
+                    written[key] = source
                     logger.info(f"Saved image: {output_path}")
                     images_generated += 1
                 finally:
@@ -508,13 +548,15 @@ def find_hdf_files(directory: str) -> list[str]:
     return sorted(hdf_files)
 
 
-def process_directory(directory: str, args) -> int:
+def process_directory(directory: str, args, refused: list[str] | None = None) -> int:
     """
     Process all HDF files in directory.
 
     Args:
         directory: Directory containing HDF files
         args: Command line arguments
+        refused: Appended with one description per image refused because its
+            destination was already written in this run
 
     Returns:
         Total number of images generated
@@ -530,13 +572,13 @@ def process_directory(directory: str, args) -> int:
 
     total_images = 0
     successful_files = 0
-    written: set[str] = set()
+    written: dict[tuple[str, str], str] = {}
 
     for i, file_path in enumerate(hdf_files, 1):
         logger.info(f"Processing file {i}/{len(hdf_files)}: {file_path}")
 
         try:
-            images_count = process_single_file(file_path, args, written)
+            images_count = process_single_file(file_path, args, written, refused)
             total_images += images_count
             if images_count > 0:
                 successful_files += 1
@@ -615,12 +657,20 @@ def run_twotime_batch(args) -> int:
             return 1
 
         # Process input (file or directory)
+        refused: list[str] = []
         if os.path.isfile(args.input):
-            images_generated = process_single_file(args.input, args)
+            images_generated = process_single_file(args.input, args, refused=refused)
         elif os.path.isdir(args.input):
-            images_generated = process_directory(args.input, args)
+            images_generated = process_directory(args.input, args, refused)
         else:
             logger.error(f"Input path is neither file nor directory: {args.input}")
+            return 1
+
+        if refused:
+            logger.error(
+                f"{len(refused)} image(s) were refused because another source "
+                f"already wrote the same output file in this run"
+            )
             return 1
 
         if images_generated == 0:

@@ -71,8 +71,8 @@ def test_r2_15_imported_partition_does_not_relabel_twotime_bins():
     # The file's partition has bin 1 left, bin 2 right; C2 was computed on it.
     xf = _maps_stub([[1, 2]], [1, 2])
     _disp, _saxs, before = xf.get_twotime_maps(auto_crop=False, highlight_xy=(0, 0))
-    # import_partition sets xf.dqmap (display layer) to a map with swapped IDs
-    xf.dqmap = np.array([[2, 1]])
+    # import_partition stores the imported map (swapped IDs) on the display layer
+    xf.display_dqmap = np.array([[2, 1]])
     _disp, _saxs, after = xf.get_twotime_maps(auto_crop=False, highlight_xy=(0, 0))
     assert before == after == 0
 

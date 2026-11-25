@@ -34,7 +34,7 @@ _DOUBLE_COLS = (
 
 def plot_bayesian_all_q(
     bayesian_summary: dict[str, Any] | None,
-    g2_data: NDArray | None,
+    g2_data: NDArray | None = None,
     *,
     data_t_el: NDArray | None = None,
 ) -> Figure | None:
@@ -44,8 +44,12 @@ def plot_bayesian_all_q(
     ----------
     bayesian_summary : dict or None
         Output of ``assemble_fit_summary`` with ``source='bayesian'``.
-    g2_data : ndarray, shape (num_t, num_q)
-        Raw G2 correlation data.
+    g2_data : ndarray, shape (num_t, num_q) or None
+        Raw G2 correlation data.  Ignored when the summary carries the
+        observations it was fitted to (``obs_g2``/``obs_t_el``): those are
+        always plotted with the summary's own bins and ranges, never other
+        data.  Legacy summaries without them use this argument; with neither,
+        only the fit lines are drawn.
     data_t_el : ndarray or None
         Time axis matching ``g2_data`` rows.  When the caller applies a
         ``t_range`` filter the resulting array may be shorter than the
@@ -56,10 +60,13 @@ def plot_bayesian_all_q(
     Returns
     -------
     Figure or None
-        Matplotlib figure, or None if no data.
+        Matplotlib figure, or None if no summary.
     """
-    if bayesian_summary is None or g2_data is None:
+    if bayesian_summary is None:
         return None
+    if bayesian_summary.get("obs_g2") is not None:
+        g2_data = bayesian_summary["obs_g2"]
+        data_t_el = bayesian_summary.get("obs_t_el")
 
     import matplotlib.pyplot as plt
     from matplotlib.cm import ScalarMappable
@@ -84,12 +91,14 @@ def plot_bayesian_all_q(
     all_t: list[np.ndarray] = []
     all_y: list[np.ndarray] = []
     all_c: list[np.ndarray] = []
-    for qi in range(min(num_q, g2_data.shape[1])):
-        valid = np.isfinite(g2_data[:, qi])
+    # no stored observations: draw the fit lines only
+    obs = g2_data if g2_data is not None else np.empty((0, 0))
+    for qi in range(min(num_q, obs.shape[1])):
+        valid = np.isfinite(obs[:, qi])
         n_valid = int(valid.sum())
         if n_valid > 0:
             all_t.append(t_el[valid])
-            all_y.append(g2_data[valid, qi])
+            all_y.append(obs[valid, qi])
             all_c.append(np.full(n_valid, q_val[qi]))
 
     if all_t:

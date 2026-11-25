@@ -13,6 +13,13 @@ from xpcsviewer.utils.validation import (
 logger = get_logger(__name__)
 
 
+def fit_success_mask(fit_summary):
+    """Per-Q mask of usable G2 fits (lazy import: the fitting package pulls in JAX)."""
+    from xpcsviewer.fitting.legacy import fit_success_mask as _mask
+
+    return _mask(fit_summary)
+
+
 def plot(xf_list, hdl, q_range, offset, plot_type=3):
     """Plot relaxation time tau versus scattering vector q.
 
@@ -72,6 +79,10 @@ def plot(xf_list, hdl, q_range, offset, plot_type=3):
                 x = np.array(x)
             y = fit_summary["fit_val"][:, 0, 1]
             e = fit_summary["fit_val"][:, 1, 1]
+            # a Q bin whose G2 fit failed is not a tau measurement
+            ok = fit_success_mask(fit_summary)
+            if ok.shape == np.shape(x) == y.shape:
+                x, y, e = x[ok], y[ok], e[ok]
 
         # Validate all arrays have the same length (raises on mismatch)
         file_label = get_file_label_safe(xf)
@@ -83,7 +94,7 @@ def plot(xf_list, hdl, q_range, offset, plot_type=3):
 
         # Filter invalid points (redundant for tauq path but needed
         # for the fit_val fallback where sigma=0 marks failed fits)
-        valid_idx = e > 0
+        valid_idx = (e > 0) & np.isfinite(y) & np.isfinite(e)
         if not np.any(valid_idx):
             logger.debug(
                 f"Skipping file {getattr(xf, 'label', 'unknown')} - no valid data points"
@@ -226,6 +237,9 @@ def plot_pre(xf_list, hdl):
             min_length = min(len(x), fit_val.shape[0])
             x = x[:min_length]
             fit_val = fit_val[:min_length]
+            # failed Q bins are not parameter measurements: NaN is never drawn
+            failed = ~fit_success_mask(fit_summary)[:min_length]
+            fit_val = np.where(failed[:, None, None], np.nan, fit_val)
 
             # Plot all parameters at once with vectorized operations
             for n in range(4):

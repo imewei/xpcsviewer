@@ -33,8 +33,20 @@ def test_r1_11_all_finished_delivers_int_keyed_mapping(qapp):
 FIT_X = [1.0]  # delay array every stubbed fit/extraction in this section shares
 
 
-def _diagnosis_stub(fit_fname, fit_q, cur_fname, cur_q):
-    """Minimal stand-in for XpcsViewer exercising _show_g2_diagnosis."""
+def _bundle(fname="A.h5", bin_id=0, q=0.01, result=None):
+    from xpcsviewer.fitting.bayesian_assembly import BayesianBundle
+
+    return BayesianBundle.create(
+        fname, bin_id, f"q={q}", q, "single", FIT_X, [1.0], [0.1]
+    ).with_result(result)
+
+
+def _diagnosis_stub(fit_fname, fit_bin, cur_fname, cur_bin):
+    """Minimal stand-in for XpcsViewer exercising _show_g2_diagnosis.
+
+    The diagnosis looks the stored bundle up by the physical bin the spinbox
+    currently addresses: (current file, current absolute bin ID).
+    """
     from types import SimpleNamespace
     from unittest.mock import MagicMock
 
@@ -43,89 +55,84 @@ def _diagnosis_stub(fit_fname, fit_q, cur_fname, cur_q):
     stub = SimpleNamespace()
     stub.sb_g2_bayesian_qidx = MagicMock()
     stub.sb_g2_bayesian_qidx.value.return_value = 0
-    stub._g2_bayesian_results = {0: object()}
-    stub._g2_bayesian_context = {0: (fit_fname, fit_q, FIT_X)}
+    stored = _bundle(fit_fname, fit_bin, result=object())
+    stub._g2_bayesian_store = {stored.key: stored}
     stub.statusbar = MagicMock()
-    stub._extract_g2_for_bayesian = lambda: ([1.0], [1.0], [0.1], 0, cur_q, "single")
-    stub._g2_first_fname = lambda: cur_fname
-    stub._g2_fit_matches_current = lambda *a: XpcsViewer._g2_fit_matches_current(
-        stub, *a
-    )
+    stub._g2_bin_table = lambda: (cur_fname, [(cur_bin, 0.01, "q")])
+    stub._g2_current_bundle = lambda: XpcsViewer._g2_current_bundle(stub)
     stub._update_g2_diagnosis = MagicMock()
-    stub._g2_bayesian_data = None
     return stub
 
 
 @pytest.mark.unit
 @pytest.mark.parametrize(
-    ("cur_fname", "cur_q"),
-    [("B.h5", 0.01), ("A.h5", 0.02)],
-    ids=["other-file", "other-q-bin"],
+    ("cur_fname", "cur_bin"),
+    [("B.h5", 0), ("A.h5", 1)],
+    ids=["other-file", "other-bin"],
 )
-def test_r1_12_diagnosis_refuses_mismatched_fit(cur_fname, cur_q):
+def test_r1_12_diagnosis_refuses_mismatched_fit(cur_fname, cur_bin):
     from xpcsviewer.xpcs_viewer import XpcsViewer
 
-    stub = _diagnosis_stub("A.h5", 0.01, cur_fname, cur_q)
+    stub = _diagnosis_stub("A.h5", 0, cur_fname, cur_bin)
     XpcsViewer._show_g2_diagnosis(stub)
     stub._update_g2_diagnosis.assert_not_called()
-    msg = stub.statusbar.showMessage.call_args[0][0]
-    assert "Re-run" in msg or "re-run" in msg
+    assert "run Fit first" in stub.statusbar.showMessage.call_args[0][0]
 
 
 @pytest.mark.unit
 def test_r1_12_diagnosis_accepts_matching_fit():
     from xpcsviewer.xpcs_viewer import XpcsViewer
 
-    stub = _diagnosis_stub("A.h5", 0.01, "A.h5", 0.01)
+    stub = _diagnosis_stub("A.h5", 0, "A.h5", 0)
     XpcsViewer._show_g2_diagnosis(stub)
     stub._update_g2_diagnosis.assert_called_once()
 
 
 @pytest.mark.unit
-def test_r1_12_single_fit_records_file_and_q_value():
+def test_r1_12_single_fit_records_file_and_bin():
     from types import SimpleNamespace
     from unittest.mock import MagicMock
 
     from xpcsviewer.xpcs_viewer import XpcsViewer
 
     fit_result = SimpleNamespace(diagnostics=SimpleNamespace(converged=True))
+    launch = _bundle("A.h5", 5, 0.07)
     stub = SimpleNamespace(
         _g2_bayesian_worker_active=True,
         _g2_bayesian_worker=None,
+        _g2_bayesian_launch=launch,
         btn_g2_bayesian=MagicMock(),
         btn_g2_diagnosis=MagicMock(),
         sb_g2_bayesian_qidx=MagicMock(),
         statusbar=MagicMock(),
-        _g2_bayesian_results={},
-        _g2_bayesian_context={},
-        _g2_bayesian_fit_fname="A.h5",
-        _g2_bayesian_fit_x=FIT_X,
+        _g2_bayesian_store={},
+        _g2_current_bundle=lambda: None,
     )
     stub.sb_g2_bayesian_qidx.value.return_value = 3
     XpcsViewer._on_g2_bayesian_finished(
-        stub, {"fit_result": fit_result, "q_index": 3, "q_value": 0.07}
+        stub,
+        {"fit_result": fit_result, "q_index": 3, "q_value": 0.07, "launch": launch},
     )
-    assert stub._g2_bayesian_context == {3: ("A.h5", 0.07, FIT_X)}
+    # keyed by (file, absolute bin), not by the relative index 3
+    assert list(stub._g2_bayesian_store) == [("A.h5", 5)]
+    assert stub._g2_bayesian_store[("A.h5", 5)].result is fit_result
 
 
 @pytest.mark.unit
-def test_r1_12_batch_fit_records_file_and_q_value():
+def test_r1_12_batch_fit_records_file_and_bin():
     from types import SimpleNamespace
-
-    import numpy as np
 
     from xpcsviewer.xpcs_viewer import XpcsViewer
 
+    launch = _bundle("A.h5", 7, 0.03)
     stub = SimpleNamespace(
-        _g2_bayesian_results={},
-        _g2_bayesian_context={},
-        _g2_batch_q_arr=np.array([0.01, 0.02, 0.03]),
-        _g2_batch_q_x={2: FIT_X},
-        _g2_batch_target_xf=SimpleNamespace(fname="A.h5"),
+        _g2_bayesian_store={}, _g2_batch_launch={"specs": [], "fname": "A.h5"}
     )
-    XpcsViewer._on_g2_batch_single_q_done(stub, 2, {"fit_result": "fit"})
-    assert stub._g2_bayesian_results == {2: "fit"}
-    assert stub._g2_bayesian_context == {2: ("A.h5", 0.03, FIT_X)}
+    XpcsViewer._on_g2_batch_single_q_done(
+        stub, 2, {"fit_result": "fit", "launch": launch}
+    )
+    assert list(stub._g2_bayesian_store) == [("A.h5", 7)]
+    assert stub._g2_bayesian_store[("A.h5", 7)].result == "fit"
 
 
 # ---------------------------------------------------------------------------
@@ -192,8 +199,14 @@ def _plot_stub(request, current):
         progress_manager=MagicMock(),
         toast_manager=MagicMock(),
         async_vk=None,
+        _plot_pending=set(),
+        _retiring_plots=False,
+        plot_kwargs_record={},
     )
     stub._plot_request_is_stale = lambda *a: XpcsViewer._plot_request_is_stale(stub, *a)
+    stub._settle_plot_operation = lambda *a, **k: XpcsViewer._settle_plot_operation(
+        stub, *a, **k
+    )
     return stub
 
 
@@ -236,13 +249,21 @@ def test_r1_15_workspace_reset_retires_all_plot_operations():
         _plot_op_requests={"op1": {}, "op2": {}},
         progress_manager=MagicMock(),
         async_vk=None,
+        _plot_pending=set(),
+        _retiring_plots=False,
+        plot_kwargs_record={},
+        update_plot_async=MagicMock(),
     )
     stub.progress_manager.is_operation_active.return_value = False
     stub.cancel_async_operation = lambda op: XpcsViewer.cancel_async_operation(stub, op)
+    stub._settle_plot_operation = lambda *a, **k: XpcsViewer._settle_plot_operation(
+        stub, *a, **k
+    )
     XpcsViewer._retire_plot_operations(stub, "g2")
     assert stub.active_plot_operations == {"op1": "saxs_2d"}
     XpcsViewer._retire_plot_operations(stub)
     assert stub.active_plot_operations == {}
+    stub.update_plot_async.assert_not_called()  # retirement never replays a plot
 
 
 # ---------------------------------------------------------------------------

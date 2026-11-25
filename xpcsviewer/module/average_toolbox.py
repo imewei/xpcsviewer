@@ -1,13 +1,14 @@
 # Standard library imports
 import multiprocessing
 import os
+import stat
 import threading
 import time
 import traceback
 import uuid
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from contextlib import suppress
-from shutil import copyfile
+from shutil import copyfile, copymode
 
 # Third-party imports
 import numpy as np
@@ -32,6 +33,67 @@ logger = get_logger(__name__)
 # Fields whose rows are delay/Q-bin ordered; saxs_1d is ordered by sqlist.
 _TIME_FIELDS = frozenset({"g2", "g2_err", "G2", "IP", "IF"})
 
+# Which coordinates define the meaning of every element of an averaged field.
+# Averaging a field is only valid when ALL of its coordinates match the first
+# accepted file.  IP/IF are channels of G2 (see _canonical_fields).
+#
+#   field          coordinates
+#   -------------  ---------------------------------------------------------
+#   g2, g2_err     _DYNAMIC: delays t_el; Q dqlist; azimuth dplist; occupancy
+#                  dynamic_index_mapping; layout dynamic_num_pts
+#   G2 (IP, IF)    _DYNAMIC + _DETECTOR (unnormalised per-pixel sums, so the
+#                  pixel geometry and pixel maps matter as well)
+#   saxs_1d        _STATIC: Q sqlist; azimuth splist; occupancy
+#                  static_index_mapping; layout static_num_pts
+#   saxs_2d        _DETECTOR: image shape (compared as the array shape), beam
+#                  centre bcx/bcy, distance det_dist, pixel_size, X_energy,
+#                  mask, dqmap, sqmap
+#   anything else  all of the above (no field escapes the check)
+_DYNAMIC = (
+    "t_el",
+    "dqlist",
+    "dplist",
+    "dynamic_index_mapping",
+    "dynamic_num_pts",
+)
+_STATIC = ("sqlist", "splist", "static_index_mapping", "static_num_pts")
+_DETECTOR = (
+    "bcx",
+    "bcy",
+    "det_dist",
+    "pixel_size",
+    "X_energy",
+    "mask",
+    "dqmap",
+    "sqmap",
+)
+_FIELD_COORDS = {
+    "g2": _DYNAMIC,
+    "g2_err": _DYNAMIC,
+    "G2": _DYNAMIC + _DETECTOR,
+    "IP": _DYNAMIC + _DETECTOR,
+    "IF": _DYNAMIC + _DETECTOR,
+    "saxs_1d": _STATIC,
+    "saxs_2d": _DETECTOR,
+}
+
+# Identities (bin IDs, index mappings, pixel maps, counts) match exactly, as
+# does every integer/bool array whatever its name.  Only continuous
+# coordinates (delays, Q, angles, geometry) use this relative tolerance, with
+# no absolute floor so that small delays and Q values are not swamped.
+_EXACT_COORDS = frozenset(
+    {
+        "dynamic_index_mapping",
+        "static_index_mapping",
+        "dynamic_num_pts",
+        "static_num_pts",
+        "mask",
+        "dqmap",
+        "sqmap",
+    }
+)
+_COORD_RTOL = 1e-6
+
 
 def _canonical_fields(fields):
     """IP and IF are channels of the NeXus ``G2`` dataset, not datasets of their own."""
@@ -45,13 +107,16 @@ def _attr_of(xf, name):
 
 
 def _coords_of(xf, fields):
-    """Coordinates (delay, Q, index mapping, azimuth) the packed ``fields`` are indexed by."""
-    names = ()
-    if _TIME_FIELDS.intersection(fields):
-        names += ("t_el", "dqlist", "dynamic_index_mapping", "dplist")
-    if "saxs_1d" in fields:
-        names += ("sqlist", "static_index_mapping", "splist")
-    return {name: _attr_of(xf, name) for name in names}
+    """Every coordinate (see the table above) that the packed ``fields`` depend on."""
+    names = []
+    for field in fields:
+        names += _FIELD_COORDS.get(field, _DYNAMIC + _STATIC + _DETECTOR)
+    return {name: _attr_of(xf, name) for name in dict.fromkeys(names)}
+
+
+def _owned(data):
+    """An owned float64 copy: safe to accumulate into without touching ``data``."""
+    return np.array(data, dtype=np.float64)
 
 
 def _term(key, data):
@@ -59,8 +124,34 @@ def _term(key, data):
     return np.square(data) if key == "g2_err" else data
 
 
+def _accumulate_into(result, fields, file_result):
+    """Add one file's fields to ``result``; the first file becomes an owned copy.
+
+    ``file_result`` arrays are cached by the readers and shared with every
+    other open ``XpcsFile``, so they are never used as an accumulator.
+    """
+    for key in fields:
+        if result.get(key) is None:
+            result[key] = _owned(_term(key, file_result[key]))
+        else:
+            result[key] += _term(key, file_result[key])
+    return result
+
+
+def _same_coord(name, a, b):
+    a, b = np.asarray(a), np.asarray(b)
+    if a.shape != b.shape:
+        return False
+    if name in _EXACT_COORDS or a.dtype.kind not in "fc" or b.dtype.kind not in "fc":
+        return bool(np.array_equal(a, b))
+    return bool(np.allclose(a, b, rtol=_COORD_RTOL, atol=0.0, equal_nan=True))
+
+
 def _accept_coords(ref, path, coords):
-    """True if ``coords`` match the reference; the first caller becomes the reference."""
+    """True if ``coords`` match the reference; the first caller becomes the reference.
+
+    A coordinate present in only one of the two files is a mismatch.
+    """
     if not ref:
         ref.update(path=path, coords=coords)
         return True
@@ -68,12 +159,20 @@ def _accept_coords(ref, path, coords):
         b = coords.get(key)
         if a is None and b is None:
             continue
-        if a is None or b is None:
-            return False
-        a, b = np.asarray(a), np.asarray(b)
-        if a.shape != b.shape or not np.allclose(a, b, equal_nan=True):
+        if a is None or b is None or not _same_coord(key, a, b):
             return False
     return True
+
+
+def _fresh_file_mode(directory):
+    """Mode a newly created file gets under the current umask (thread-safe probe)."""
+    probe = os.path.join(directory, f".avg-{uuid.uuid4().hex}.mode")
+    fd = os.open(probe, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666)
+    try:
+        return stat.S_IMODE(os.fstat(fd).st_mode)
+    finally:
+        os.close(fd)
+        os.remove(probe)
 
 
 def _publish_average(template, save_path, result, input_paths):
@@ -81,14 +180,21 @@ def _publish_average(template, save_path, result, input_paths):
 
     A failure at any step leaves a previous ``save_path`` untouched, and the
     rename replaces a link at ``save_path`` instead of writing through it.
+    The staging file is private (0600) while written; the published file keeps
+    an existing output's permission bits or gets the umask-derived mode of a
+    freshly created file.
     """
     out_dir = os.path.dirname(os.path.abspath(save_path))
     tmp = os.path.join(out_dir, f".avg-{uuid.uuid4().hex}.tmp")
-    open(tmp, "xb").close()  # unique name, default permissions
+    os.close(os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
     try:
         copyfile(template, tmp)
         put(tmp, result, ftype="nexus", mode="alias")
         _check_output_not_input(save_path, input_paths)
+        if os.path.exists(save_path):
+            copymode(save_path, tmp)
+        else:
+            os.chmod(tmp, _fresh_file_mode(out_dir))
         os.replace(tmp, save_path)
     except BaseException:
         with suppress(OSError):
@@ -431,15 +537,7 @@ class AverageToolbox(QtCore.QRunnable):
                     elif not shapes_ok:
                         logger.info(f"data shape does not match, skipping {fname}")
                     if shapes_ok:
-                        for key in fields:
-                            if result[key] is None:
-                                # float64 so an integer-typed first file
-                                # cannot truncate or reject later additions
-                                result[key] = np.array(
-                                    _term(key, file_data[key]), dtype=np.float64
-                                )
-                            else:
-                                result[key] += _term(key, file_data[key])
+                        _accumulate_into(result, fields, file_data)
                         mask[m] = 1
 
                 # Clear the XpcsFile to release memory immediately
@@ -552,14 +650,7 @@ class AverageToolbox(QtCore.QRunnable):
                                     self.model[m],
                                 )
                             else:
-                                for key in fields:
-                                    if result[key] is None:
-                                        result[key] = np.array(
-                                            _term(key, file_result[key]),
-                                            dtype=np.float64,
-                                        )
-                                    else:
-                                        result[key] += _term(key, file_result[key])
+                                _accumulate_into(result, fields, file_result)
                                 # counted only after every field was summed
                                 mask[m] = 1
 
@@ -794,12 +885,7 @@ def do_average(
             logger.warning(f"delay/Q coordinates do not match, skipping {flist[m]}")
             return False
         mask[m] = 1
-        for key in fields:
-            data = _term(key, file_result[key])
-            if result[key] is None:
-                result[key] = data
-            else:
-                result[key] += data
+        _accumulate_into(result, fields, file_result)
         return True
 
     # Determine number of workers

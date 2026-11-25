@@ -10,6 +10,7 @@ returns.  Cancellation is checked before and after the sampler call.
 
 from __future__ import annotations
 
+import itertools
 import logging
 import time
 from typing import Any
@@ -17,6 +18,8 @@ from typing import Any
 from .async_workers import BaseAsyncWorker
 
 logger = logging.getLogger(__name__)
+
+_WORKER_SEQ = itertools.count(1)
 
 
 class BayesianFitWorker(BaseAsyncWorker):
@@ -38,6 +41,10 @@ class BayesianFitWorker(BaseAsyncWorker):
         ``"g2"`` or ``"diffusion"`` — used to route callbacks.
     sampler_kwargs : dict
         Extra keyword arguments forwarded to the fit function.
+    launch : object or None
+        Opaque record of what this fit was launched for (observations,
+        bin identity).  Echoed back as ``result["launch"]`` so the receiver
+        can ignore a result whose launch was superseded.
     """
 
     def __init__(
@@ -50,8 +57,12 @@ class BayesianFitWorker(BaseAsyncWorker):
         q_value: float = 0.0,
         context: str = "g2",
         sampler_kwargs: dict[str, Any] | None = None,
+        launch: Any = None,
     ) -> None:
-        super().__init__(worker_id=f"bayesian_{context}_{q_index}")
+        # Unique per instance: error/cancel signals carry only the worker id,
+        # and a superseded worker must not be mistaken for the current one.
+        super().__init__(worker_id=f"bayesian_{context}_{q_index}_{next(_WORKER_SEQ)}")
+        self.launch = launch
         self.fit_func = fit_func
         self.x = x
         self.y = y
@@ -101,4 +112,5 @@ class BayesianFitWorker(BaseAsyncWorker):
             "q_value": self.q_value,
             "context": self.context,
             "elapsed_s": elapsed,
+            "launch": self.launch,
         }

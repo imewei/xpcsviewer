@@ -200,11 +200,13 @@ def pg_plot_stability(
     # Handle case where data is not available
     if g2 is False or g2 is None:
         logger.warning("G2 stability data not available for this file")
+        hdl.clear()  # never leave the previous selection's curves on screen
         return
 
     num_figs, num_lines = compute_geometry(g2, plot_type)
     if num_figs < 1 or num_lines < 1:
         logger.warning("G2 stability plot skipped: the Q selection has no Q bins")
+        hdl.clear()
         return
 
     num_data, num_qval = len(g2), g2[0].shape[1]
@@ -296,7 +298,9 @@ def compute_geometry(g2, plot_type):
     """Compute subplot grid dimensions for G2 plots.
 
     Determines how many figures (subplots) and how many overlay
-    lines per figure are needed based on the layout mode.
+    lines per figure are needed based on the layout mode.  The Q-bin count
+    is that of the first file that has Q bins (file 0 whenever it has any),
+    so an empty first file does not suppress later valid files.
 
     Args:
         g2: List of 2-D G2 arrays, each shaped
@@ -313,58 +317,81 @@ def compute_geometry(g2, plot_type):
     Raises:
         ValueError: If *plot_type* is not a recognised layout mode.
     """
+    ref = _reference_index(g2)
+    n_ref = 0 if ref is None else _n_q(g2[ref])
     if plot_type == "multiple":
-        num_figs = g2[0].shape[1]
+        num_figs = n_ref
         num_lines = len(g2)
     elif plot_type == "single":
+        # one panel per file keeps panel index == file index for the renderers
         num_figs = len(g2)
-        num_lines = g2[0].shape[1]
+        num_lines = n_ref
     elif plot_type == "single-combined":
         num_figs = 1
-        num_lines = g2[0].shape[1] * len(g2)
+        num_lines = n_ref * len(g2)
     else:
         raise ValueError("plot_type not support.")
     return num_figs, num_lines
 
 
-def _q_panel_indices(q, m, n_curves, labels=None):
-    """Map each curve of file ``m`` to the Q-bin panel (defined by file 0).
+def _n_q(arr) -> int:
+    """Number of Q-bin columns of one file's G2 array (0 when it has no data)."""
+    arr = np.asarray(arr)
+    # a non-empty 1-D array is malformed: shape[1] raises IndexError as before
+    return 0 if arr.size == 0 else arr.shape[1]
 
-    Identical ordered grids (same count, same Q, same bin labels) map
-    positionally.  Otherwise curves are matched one-to-one in order, by full
-    bin label when both files have labels (so equal radial Q at different
-    azimuth stay apart), else by Q.  Returns one panel index per curve, or
-    ``None`` (after logging a warning) where no free panel matches, so a curve
-    is never drawn under another bin.
+
+def _reference_index(g2) -> int | None:
+    """Index of the first file with Q bins; it defines the reference panels."""
+    return next((m for m, arr in enumerate(g2) if _n_q(arr) > 0), None)
+
+
+# Q identity tolerance: float32-storage noise (~6e-8) passes, while bins that
+# merely share a 5-decimal label (0.100001 vs 0.100004) stay apart.
+_Q_RTOL = 1e-6
+
+
+def _q_panel_indices(q, m, n_curves, labels=None, ref=0):
+    """Map each curve of file ``m`` to the Q-bin panel defined by file ``ref``.
+
+    A curve belongs to a panel only if it is the same physical bin: its numeric
+    Q equals the panel's within ``_Q_RTOL`` (relative) AND, when both files
+    carry bin labels, the full labels are equal (the label also holds the
+    azimuth, which the renderers are not given numerically).  Neither the
+    rounded label nor Q alone can alias two bins.  Identical ordered grids map
+    positionally; otherwise curves are matched one-to-one in order.  Returns
+    one panel index per curve, or ``None`` (after logging a warning) where no
+    free panel matches, so a curve is never drawn under another bin.
     """
-    if m == 0:
+    if m == ref:
         return list(range(n_curves))
-    ref = np.asarray(q[0], dtype=float)
+    ref_q = np.asarray(q[ref], dtype=float)
     own = np.asarray(q[m], dtype=float)
-    ref_lab = labels[0] if labels is not None and len(labels) > 0 else None
+    ref_lab = labels[ref] if labels is not None and len(labels) > ref else None
     own_lab = labels[m] if labels is not None and m < len(labels) else None
     use_labels = (
         ref_lab is not None
         and own_lab is not None
-        and len(ref_lab) == ref.size
+        and len(ref_lab) == ref_q.size
         and len(own_lab) == own.size
     )
     if (
-        own.size == ref.size == n_curves
-        and np.allclose(ref, own)
+        own.size == ref_q.size == n_curves
+        and np.allclose(ref_q, own, rtol=_Q_RTOL, atol=1e-12)
         and (not use_labels or list(ref_lab) == list(own_lab))
     ):
         return list(range(n_curves))
     taken: set[int] = set()
     out = []
     for j in range(n_curves):
-        if j >= own.size:
-            free = []
-        elif use_labels:
-            free = [i for i in range(ref.size) if ref_lab[i] == own_lab[j]]
-        else:
-            free = np.flatnonzero(np.isclose(ref, own[j])).tolist()
-        free = [i for i in free if i not in taken]
+        free = (
+            np.flatnonzero(np.isclose(ref_q, own[j], rtol=_Q_RTOL, atol=1e-12))
+            if j < own.size
+            else []
+        )
+        if use_labels:
+            free = [i for i in free if ref_lab[i] == own_lab[j]]
+        free = [int(i) for i in free if i not in taken]
         if not free:
             logger.warning(
                 "G2 curve %d of file %d (Q=%s) has no free panel with matching "
@@ -451,13 +478,15 @@ def pg_plot(
         y_range = None
 
     q, tel, g2, g2_err, labels = get_data(xf_list, q_range=q_range, t_range=t_range)
-    num_figs, _num_lines = compute_geometry(g2, plot_type)
+    num_figs, _num_lines = compute_geometry(g2 or [], plot_type)
     # single/single-combined keep one figure, so also check the curve count
     if num_figs < 1 or _num_lines < 1:
         logger.warning("G2 plot skipped: the Q selection contains no Q bins")
+        hdl.clear()  # never leave the previous selection's curves on screen
         return
 
     num_data = len(g2)
+    ref = _reference_index(g2)
     # col and rows for the 2d layout
     col = min(num_figs, num_col)
     row = (num_figs + col - 1) // col
@@ -495,15 +524,18 @@ def pg_plot(
     symbol_len = len(symbols)
     for m in range(num_data):
         # each file has its own number of Q bins
-        num_qval = g2[m].shape[1]
+        num_qval = _n_q(g2[m])
+        if num_qval == 0:
+            continue  # a file without Q bins draws and fits nothing
         panels = (
-            _q_panel_indices(q, m, num_qval, labels)
+            _q_panel_indices(q, m, num_qval, labels, ref)
             if plot_type == "multiple"
             else None
         )
         # default base line to be 1.0; used for non-fitting or fit error cases
         baseline_offset = np.ones(num_qval)
         fit_summary = None
+        fit_ok = np.zeros(num_qval, dtype=bool)
         if show_fit:
             # Extract force_refit parameter from kwargs
             force_refit = kwargs.get("force_refit", False)
@@ -531,19 +563,9 @@ def pg_plot(
                     force_refit=force_refit,
                 )
 
+            fit_ok = _fit_ok_mask(fit_summary, num_qval)
             if fit_summary is not None and subtract_baseline:
-                # Check if fitting was successful by validating fit_val
-                if (
-                    fit_summary["fit_val"] is not None
-                    and len(fit_summary["fit_val"]) > 0
-                ):
-                    # Model is a*exp(-2(x/b)^c) + d: the baseline is param 3 only
-                    # (param 2 is the stretch exponent c).
-                    try:
-                        baseline_offset = fit_summary["fit_val"][:, 0, 3]
-                    except (IndexError, TypeError):
-                        # Fallback to default baseline if shape doesn't match
-                        baseline_offset = np.ones(num_qval)
+                baseline_offset = _fit_baseline(fit_summary, fit_ok, num_qval)
 
         color = colors[rows[m] % color_len]
         symbol = symbols[rows[m] % symbol_len]
@@ -555,7 +577,7 @@ def pg_plot(
                     continue
                 ax = axes[panels[n]]
                 label = xf_list[m].label
-                if m == 0:
+                if m == ref:
                     ax.setTitle(labels[m][n])
             elif plot_type == "single":
                 ax = axes[m]
@@ -588,8 +610,8 @@ def pg_plot(
             if not t_auto:
                 ax.setRange(xRange=t0_range)
 
-            if show_fit and fit_summary is not None:
-                # Check if we have valid fit_line data for this q-index
+            if show_fit and fit_summary is not None and fit_ok[n]:
+                # Only a successful fit of this Q bin is drawn or annotated
                 if (
                     fit_summary["fit_line"] is not None
                     and n < fit_summary["fit_line"].shape[0]
@@ -618,6 +640,44 @@ def pg_plot(
 
 
 _TAU_NAMES = ("τ", "τ1", "τ2")
+
+
+def _fit_ok_mask(fit_summary, num_qval):
+    """Per-Q bool array (length ``num_qval``): True where the fit may be shown.
+
+    A failed, non-converged or unidentifiable fit (see ``fit_success_mask``) is
+    never drawn, annotated or used to shift the data.
+    """
+    from xpcsviewer.fitting.legacy import fit_success_mask  # lazy: pulls in nlsq/JAX
+
+    ok = np.zeros(num_qval, dtype=bool)
+    if fit_summary is None:
+        return ok
+    try:
+        mask = fit_success_mask(fit_summary)
+    except (KeyError, TypeError, ValueError, IndexError):
+        return ok
+    n = min(num_qval, len(mask))
+    ok[:n] = mask[:n]
+    return ok
+
+
+def _fit_baseline(fit_summary, fit_ok, num_qval):
+    """Baseline offset per Q: fitted baseline (param 3) where the fit succeeded.
+
+    Model is a*exp(-2(x/b)^c) + d, so the baseline is param 3 only (param 2 is
+    the stretch exponent c). Failed Q bins use the default baseline 1.0, so
+    their data curve is neither shifted by a placeholder nor blanked by a NaN.
+    """
+    baseline = np.ones(num_qval)
+    try:
+        fitted = np.asarray(fit_summary["fit_val"], dtype=float)[:, 0, 3]
+    except (IndexError, TypeError, KeyError, ValueError):
+        return baseline
+    n = min(num_qval, len(fitted))
+    use = fit_ok[:n] & np.isfinite(fitted[:n])
+    baseline[:n][use] = fitted[:n][use]
+    return baseline
 
 
 def _add_fit_param_annotation(ax, fit_val, fit_func, color):
@@ -723,13 +783,16 @@ def pg_plot_from_data(
     Parameters mirror the ``pg_plot`` signature where applicable.
     """
     if not q or g2 is None or len(g2) == 0:
+        hdl.clear()  # nothing selected: never leave the previous curves on screen
         return
 
     if num_figs < 1:
         logger.warning("G2 plot skipped: the Q selection contains no Q bins")
+        hdl.clear()
         return
 
     num_data = len(g2)
+    ref = _reference_index(g2)
     col = min(num_figs, num_col)
     row = (num_figs + col - 1) // col
 
@@ -763,9 +826,11 @@ def pg_plot_from_data(
     symbol_len = len(symbols)
     for m in range(num_data):
         # each file has its own number of Q bins
-        num_qval = g2[m].shape[1] if g2[m].ndim > 1 else 1
+        num_qval = _n_q(g2[m])
+        if num_qval == 0:
+            continue
         panels = (
-            _q_panel_indices(q, m, num_qval, labels)
+            _q_panel_indices(q, m, num_qval, labels, ref)
             if plot_type == "multiple"
             else None
         )
@@ -773,18 +838,12 @@ def pg_plot_from_data(
 
         # Use pre-computed fit_results from worker if available
         fit_summary = None
+        fit_ok = np.zeros(num_qval, dtype=bool)
         if show_fit and fit_results is not None and m < len(fit_results):
             fit_summary = fit_results[m]
+            fit_ok = _fit_ok_mask(fit_summary, num_qval)
             if fit_summary is not None and subtract_baseline:
-                try:
-                    if (
-                        fit_summary.get("fit_val") is not None
-                        and len(fit_summary["fit_val"]) > 0
-                    ):
-                        # param 3 is the baseline; param 2 is the stretch exponent
-                        baseline_offset = fit_summary["fit_val"][:, 0, 3]
-                except (IndexError, TypeError, KeyError):
-                    baseline_offset = np.ones(num_qval)
+                baseline_offset = _fit_baseline(fit_summary, fit_ok, num_qval)
 
         color = colors[rows[m] % color_len]
         symbol = symbols[rows[m] % symbol_len]
@@ -795,7 +854,7 @@ def pg_plot_from_data(
                 if panels[n] is None:
                     continue
                 ax = axes[panels[n]]
-                if m == 0:
+                if m == ref:
                     ax.setTitle(labels[m][n] if labels and m < len(labels) else "")
             elif plot_type == "single":
                 ax = axes[m]
@@ -828,7 +887,7 @@ def pg_plot_from_data(
             if not t_auto and t0_range is not None:
                 ax.setRange(xRange=t0_range)
 
-            if show_fit and fit_summary is not None:
+            if show_fit and fit_summary is not None and fit_ok[n]:
                 try:
                     if (
                         fit_summary.get("fit_line") is not None

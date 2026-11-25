@@ -97,11 +97,12 @@ def test_import_partition_sets_attrs_on_all_xf_and_calls_update_plot():
 
     viewer.import_partition(partition)
 
-    # Each XpcsFile must have dqmap / sqmap set
-    assert xf1.dqmap is dqmap, "xf1.dqmap was not set to dynamic_roi_map"
-    assert xf1.sqmap is sqmap, "xf1.sqmap was not set to static_roi_map"
-    assert xf2.dqmap is dqmap, "xf2.dqmap was not set to dynamic_roi_map"
-    assert xf2.sqmap is sqmap, "xf2.sqmap was not set to static_roi_map"
+    # The partition is display-only (R3-13): every XpcsFile gets it on the display
+    # layer and its own dqmap / sqmap stay untouched
+    for xf in (xf1, xf2):
+        assert xf.display_dqmap is dqmap, "display_dqmap was not set to dynamic_roi_map"
+        assert xf.display_sqmap is sqmap, "display_sqmap was not set to static_roi_map"
+        assert xf.dqmap is None and xf.sqmap is None
 
     # update_plot must be called exactly once
     viewer.update_plot.assert_called_once()

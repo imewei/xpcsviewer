@@ -943,6 +943,15 @@ class ScientificAccuracyValidationFramework:
         print(f"Summary report saved to: {text_file}")
 
 
+def report_passed(report) -> bool:
+    """Pass/fail predicate for an accuracy report, shared with the comprehensive runner.
+
+    Fails when any case failed or the accuracy score is in the CRITICAL range
+    (< 80).
+    """
+    return report.tests_failed == 0 and report.overall_accuracy_score >= 80
+
+
 def main() -> int:
     """Run scientific accuracy validation.
 
@@ -982,7 +991,7 @@ def main() -> int:
             for i, rec in enumerate(report.recommendations[:5], 1):
                 print(f"  {i}. {rec}")
 
-        return 1 if report.tests_failed > 0 or report.overall_accuracy_score < 80 else 0
+        return 0 if report_passed(report) else 1
 
     except KeyboardInterrupt:
         print("\nValidation interrupted by user")

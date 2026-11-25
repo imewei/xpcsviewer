@@ -55,6 +55,8 @@ class BatchBayesianCoordinator(QObject):
         self._completed = 0
         self._total = len(q_specs)
         self._cancelled = False
+        self._retired = False
+        self._deleting = False
         # Maps q_idx → worker for active workers only; entries are removed
         # on completion to avoid holding references to finished QRunnables.
         self._active_workers: dict[int, Any] = {}
@@ -85,6 +87,46 @@ class BatchBayesianCoordinator(QObject):
             if hasattr(worker, "cancel"):
                 worker.cancel()
         logger.info("Batch Bayesian fitting cancelled")
+        self.dispose()
+
+    def dispose(self) -> None:
+        """Retire the coordinator: drop its data, then delete it once idle.
+
+        Called by the owner when the batch finished or was cancelled.  A
+        worker that is still running (NUTS cannot be interrupted) keeps
+        reporting into this object, so deletion waits until every launched
+        worker has reported; only then are the connections dropped and the
+        QObject scheduled for deletion.
+        """
+        self._retired = True
+        self.blockSignals(True)  # a retired coordinator emits nothing further
+        self._results = {}
+        self._q_specs = []
+        self._delete_when_idle()
+
+    def _delete_when_idle(self) -> None:
+        if not self._retired or self._active_workers or self._deleting:
+            return
+        self._deleting = True
+        for sig in (
+            self.progress,
+            self.all_finished,
+            self.single_q_finished,
+            self.single_q_error,
+        ):
+            try:
+                sig.disconnect()
+            except (RuntimeError, TypeError):  # nothing connected / already gone
+                pass
+        self.deleteLater()  # unparents in the GUI thread when it runs
+
+    def _retired_report(self, q_idx: int) -> bool:
+        """Account for a worker reporting after retirement; True if retired."""
+        if not self._retired:
+            return False
+        self._active_workers.pop(q_idx, None)
+        self._delete_when_idle()
+        return True
 
     def _launch_next(self) -> None:
         """Launch the next worker in the queue if available."""
@@ -106,6 +148,7 @@ class BatchBayesianCoordinator(QObject):
             q_value=spec["q_value"],
             context="g2",
             sampler_kwargs=spec.get("sampler_kwargs"),
+            launch=spec.get("launch"),
         )
         self._active_workers[q_idx] = worker
 
@@ -125,6 +168,8 @@ class BatchBayesianCoordinator(QObject):
 
     def _on_worker_finished(self, q_idx: int, result: dict[str, Any] | None) -> None:
         """Handle a successful worker completion."""
+        if self._retired_report(q_idx):
+            return
         self._active_workers.pop(q_idx, None)
         self._active_count -= 1
         self._completed += 1
@@ -144,6 +189,8 @@ class BatchBayesianCoordinator(QObject):
 
     def _on_worker_error(self, q_idx: int, error_msg: str) -> None:
         """Handle a worker failure — store None and continue."""
+        if self._retired_report(q_idx):
+            return
         self._active_workers.pop(q_idx, None)
         self._active_count -= 1
         self._completed += 1
@@ -164,6 +211,8 @@ class BatchBayesianCoordinator(QObject):
 
     def _on_worker_cancelled(self, q_idx: int) -> None:
         """Handle a cancelled worker — treat as failure to keep accounting correct."""
+        if self._retired_report(q_idx):
+            return
         self._active_workers.pop(q_idx, None)
         self._active_count -= 1
         self._completed += 1

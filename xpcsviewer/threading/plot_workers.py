@@ -605,7 +605,8 @@ class QMapPlotWorker(BaseAsyncWorker):
                 }
         elif target == "dynamic_roi_map":
             if hasattr(xf, "dqmap"):
-                value = xf.dqmap
+                # designated map display: shows an imported partition if any
+                value = xf.get_display_qmap("dqmap")
                 vmin, vmax = value.min(), value.max()
             else:
                 return {
@@ -614,7 +615,7 @@ class QMapPlotWorker(BaseAsyncWorker):
                 }
         elif target == "static_roi_map":
             if hasattr(xf, "sqmap"):
-                value = xf.sqmap
+                value = xf.get_display_qmap("sqmap")
                 vmin, vmax = value.min(), value.max()
             else:
                 return {

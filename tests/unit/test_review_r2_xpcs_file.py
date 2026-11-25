@@ -372,18 +372,36 @@ class _BigArray(np.ndarray):
         return 600 * 1024 * 1024
 
 
-def _roi_stub(pressure: MemoryPressure, spmap=None) -> XpcsFile:
+def _roi_qmap(mask=None, sqmap=None, sqlist=None) -> QMap:
+    """A real ``QMap`` (real ``compute_qmap`` geometry) for a 4x4 detector.
+
+    The ROI export reads q / phi / radius from the QMap, not from attributes
+    on the file object (R3-20), so the stubs below only hold a ``qmap``.
+    Beam centre at pixel (0, 0); pixel_size == det_dist == 1; 12.398 keV
+    gives k0 = 2 pi / (1 Angstrom).
+    """
+    qmap = QMap.__new__(QMap)
+    qmap.mask = np.ones((4, 4)) if mask is None else mask
+    qmap.bcx = qmap.bcy = 0.0
+    qmap.pixel_size = qmap.det_dist = 1.0
+    qmap.X_energy = 12.398
+    qmap.k0 = 2 * np.pi
+    qmap._qmap_cache = None
+    qmap.qmap, qmap.qmap_units = qmap.compute_qmap()
+    qmap.sqmap = np.ones((4, 4), dtype=int) if sqmap is None else sqmap
+    qmap.sqlist = np.array([1.0]) if sqlist is None else sqlist
+    qmap.splist = np.zeros(1)  # one azimuth bin
+    qmap.static_num_pts = np.array([len(qmap.sqlist), 1])
+    qmap.static_index_mapping = np.arange(len(qmap.sqlist))
+    return qmap
+
+
+def _roi_stub(pressure: MemoryPressure) -> XpcsFile:
     saxs = np.arange(16, dtype=float).reshape(4, 4).view(_BigArray)
     return _stub(
         _saxs_2d_data=saxs,
         _memory_manager=SimpleNamespace(get_memory_pressure=lambda: pressure),
-        mask=np.ones((4, 4)),
-        bcx=0.0,
-        bcy=0.0,
-        sqmap=np.ones((4, 4)),
-        spmap=np.zeros((4, 4)) if spmap is None else spmap,
-        sqspan=np.array([0.0, 2.0]),
-        sqlist=np.array([1.0]),
+        qmap=_roi_qmap(),
         label="roi",
     )
 
@@ -399,10 +417,10 @@ def test_large_saxs_roi_uses_initialised_memory_manager(monkeypatch):
 def test_large_saxs_roi_without_pressure_takes_normal_path():
     xf = _roi_stub(MemoryPressure.LOW)
     x, y = xf.get_roi_data({"sl_type": "Ring", "radius": (0.5, 2.5)})
-    assert np.all(np.isfinite(y))
+    assert x.size == 180 and np.isfinite(y).any()
 
 
-def test_large_saxs_ring_roi_falls_back_when_streaming_has_no_ring_support():
+def test_large_saxs_ring_roi_under_memory_pressure_still_returns_a_profile():
     xf = _roi_stub(MemoryPressure.HIGH)
     out = xf.get_roi_data({"sl_type": "Ring", "radius": (0.5, 2.5)})
     assert out is not None
@@ -413,19 +431,13 @@ def test_streaming_pie_roi_matches_eager_pie_roi(dist):
     rng = np.random.default_rng(0)
     xf = _stub(
         _saxs_2d_data=rng.uniform(1.0, 2.0, (4, 4)),
-        mask=np.ones((4, 4)),
-        bcx=0.0,
-        bcy=0.0,
-        sqmap=np.linspace(0.05, 0.95, 16).reshape(4, 4),
-        spmap=np.zeros((4, 4)),
-        sqspan=np.array([0.0, 0.25, 0.5, 0.75, 1.0]),
-        sqlist=np.array([0.125, 0.375, 0.625, 0.875]),
-        X_energy=12.398,
-        pixel_size=1.0,
-        det_dist=1.0,
+        qmap=_roi_qmap(
+            sqmap=np.arange(16).reshape(4, 4) // 4 + 1,  # 4 static bins, 4 pixels each
+            sqlist=np.array([0.125, 0.375, 0.625, 0.875]),
+        ),
         label="pie",
     )
-    roi = {"sl_type": "Pie", "angle_range": (-10.0, 10.0), "dist": dist}
+    roi = {"sl_type": "Pie", "angle_range": (0.0, 360.0), "dist": dist}
     x_e, y_e = xf.get_roi_data(roi)
     x_s, y_s = xf._get_roi_data_streaming(roi)
     np.testing.assert_allclose(x_s, x_e)
@@ -434,40 +446,40 @@ def test_streaming_pie_roi_matches_eager_pie_roi(dist):
 
 
 # --------------------------------------------------------------------- R2-31
-def _ring_stub(spmap) -> XpcsFile:
+def _ring_stub(mask=None) -> XpcsFile:
     return _stub(
         _saxs_2d_data=np.arange(1.0, 17.0).reshape(4, 4),
-        mask=np.ones((4, 4)),
-        bcx=0.0,
-        bcy=0.0,
-        sqmap=np.ones((4, 4)),
-        spmap=spmap,
+        qmap=_roi_qmap(mask=mask),
         label="ring",
     )
 
 
 def test_empty_annulus_returns_empty_result_instead_of_raising():
-    xf = _ring_stub(np.zeros((4, 4)))
+    xf = _ring_stub()
     x, y = xf.get_roi_data({"sl_type": "Ring", "radius": (10, 20)})
     assert x.size == 0
     assert y.size == 0
 
 
 def test_one_angle_annulus_has_no_zero_division():
-    xf = _ring_stub(np.full((4, 4), 30.0))
+    # only row 0 is unmasked: every pixel of the annulus lies on the +x axis
+    # (phi = 0), a single angle
+    mask = np.zeros((4, 4))
+    mask[0] = 1
+    xf = _ring_stub(mask)
     with np.errstate(all="raise"):
-        x, y = xf.get_roi_data({"sl_type": "Ring", "radius": (0.5, 1.5)})
-    # pixels with 0.5 <= r < 1.5: (0,1), (1,0), (1,1) -> values 2, 5, 6
-    np.testing.assert_allclose(x, [30.0])
-    np.testing.assert_allclose(y, [np.mean([2.0, 5.0, 6.0])])
+        x, y = xf.get_roi_data({"sl_type": "Ring", "radius": (0.5, 3.5)})
+    # pixels (0,1), (0,2), (0,3) -> values 2, 3, 4
+    np.testing.assert_allclose(x, [0.0])
+    np.testing.assert_allclose(y, [np.mean([2.0, 3.0, 4.0])])
 
 
 def test_multi_angle_annulus_unchanged():
-    yy, xx = np.mgrid[0:4, 0:4]
-    phi = np.degrees(np.arctan2(yy, xx))
-    xf = _ring_stub(phi)
+    xf = _ring_stub()
     x, y = xf.get_roi_data({"sl_type": "Ring", "radius": (0.5, 5.0)}, phi_num=9)
     assert x.shape == (9,)
     assert y.shape == (9,)
+    # QMap phi runs clockwise from +x: 0 on the x axis, 360 - atan2(y, x) below it;
+    # the extreme pixels of the annulus are (x=1..3, y=0) and (x=3, y=1)
     assert x[0] == pytest.approx(0.0)
-    assert x[-1] == pytest.approx(90.0)
+    assert x[-1] == pytest.approx(360.0 - np.degrees(np.arctan2(1, 3)))

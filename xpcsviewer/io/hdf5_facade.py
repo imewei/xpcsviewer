@@ -403,7 +403,12 @@ class HDF5Facade:
                 g2_group = f[group]
 
                 # Read G2 data. g2 shape is (n_delay, n_q); the Q-bin is axis 1.
-                n_q = g2_group["g2"].shape[1]
+                g2_shape = g2_group["g2"].shape
+                if len(g2_shape) != 2:
+                    raise ValueError(
+                        f"g2 must be 2-D (n_delay, n_q), got shape {g2_shape}"
+                    )
+                n_q = g2_shape[1]
                 if q_idx is not None:
                     if q_idx < 0 or q_idx >= n_q:
                         raise ValueError(

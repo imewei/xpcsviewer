@@ -1,4 +1,5 @@
 # Standard library imports
+import contextlib
 import os
 import threading
 import weakref
@@ -46,6 +47,54 @@ def _export_stems(xf_list) -> list[str]:
         used.add(candidate.casefold())
         stems.append(candidate)
     return stems
+
+
+def _diffusion_fit(xf) -> tuple[dict | None, str | None]:
+    """``(G2 fit summary, method)`` the diffusion plot AND export both use.
+
+    One rule: the Bayesian fit when the file has one, else the deterministic
+    (NLSQ) fit; ``(None, None)`` when neither exists.
+    """
+    bayesian = getattr(xf, "bayesian_fit_summary", None)
+    if bayesian is not None:
+        return bayesian, "bayesian"
+    nlsq = getattr(xf, "fit_summary", None)
+    return (nlsq, "nlsq") if nlsq is not None else (None, None)
+
+
+# What the exported tau-q parameters and error columns mean, per fit method.
+_DIFFUSION_PROVENANCE = {
+    "nlsq": (
+        "tau(q) per Q bin: deterministic NLSQ fit of the G2 curve; its 1-sigma "
+        "standard errors weight the power-law fit.",
+        "a, b: weighted least-squares power-law fit; error columns are the "
+        "1-sigma standard errors from that fit's covariance.",
+    ),
+    "bayesian": (
+        "tau(q) per Q bin: posterior mean of the Bayesian (NUTS) G2 fit; the "
+        "posterior standard deviation of tau weights the power-law fit.",
+        "a, b: weighted least-squares power-law fit to those posterior means; "
+        "error columns are the 1-sigma standard errors from that fit's "
+        "covariance, NOT credible intervals (no posterior of a, b is sampled).",
+    ),
+}
+
+
+@contextlib.contextmanager
+def _diffusion_fits_shown(xf_list):
+    """Show each file's ``_diffusion_fit`` as ``xf.fit_summary`` (restored on exit).
+
+    ``fit_tauq`` and the tau-q plot read ``xf.fit_summary``; the tau-q results
+    are written into the shown summary, which is the one the export reads.
+    """
+    original = {id(xf): xf.fit_summary for xf in xf_list}
+    try:
+        for xf in xf_list:
+            xf.fit_summary = _diffusion_fit(xf)[0]
+        yield
+    finally:
+        for xf in xf_list:
+            xf.fit_summary = original[id(xf)]
 
 
 def _get_module(module_name: str) -> ModuleType | type:
@@ -399,7 +448,9 @@ class ViewerKernel(FileLocator):
         g2map_hdl.setImage(g2_data)
         g2map_hdl.setColorMap(pg.colormap.getFromMatplotlib(g2map_cmap))
 
-        # Cropped Q-map image
+        # Cropped Q-map image: the file's own detector map, because it sits next
+        # to G2 columns that are fixed to that partition (an imported partition
+        # is display-only and is not drawn here)
         qmap_hdl.setImage(ensure_numpy(xf_obj.get_cropped_qmap("dqmap")))
         qmap_hdl.setColorMap(pg.colormap.getFromMatplotlib(qmap_cmap))
 
@@ -497,9 +548,10 @@ class ViewerKernel(FileLocator):
                 vmin, vmax = np.percentile(value, (2, 98))
                 hdl.setImage(ensure_numpy(value), levels=(vmin, vmax))
             elif target == "dynamic_roi_map":
-                hdl.setImage(ensure_numpy(xf_list[0].dqmap))
+                # designated map display: shows an imported partition
+                hdl.setImage(ensure_numpy(xf_list[0].get_display_qmap("dqmap")))
             elif target == "static_roi_map":
-                hdl.setImage(ensure_numpy(xf_list[0].sqmap))
+                hdl.setImage(ensure_numpy(xf_list[0].get_display_qmap("sqmap")))
             # Apply colormap
             hdl.setColorMap(pg.colormap.getFromMatplotlib(cmap))
 
@@ -518,68 +570,52 @@ class ViewerKernel(FileLocator):
         xf_list = g2_compatible_list
         logger.debug(f"Filtered to {len(xf_list)} G2-compatible files")
 
-        # For tau-q, prefer Bayesian results when available
-        _restore: dict[int, object] = {}
-        for xf in xf_list:
-            if getattr(xf, "bayesian_fit_summary", None) is not None:
-                _restore[id(xf)] = xf.fit_summary
-                xf.fit_summary = xf.bayesian_fit_summary
+        # For tau-q, prefer Bayesian results when available (_diffusion_fit)
+        with _diffusion_fits_shown(xf_list):
+            short_list = [xf for xf in xf_list if xf.fit_summary is not None]
+            logger.debug(f"Found {len(short_list)} files with fit_summary")
 
-        short_list = [xf for xf in xf_list if xf.fit_summary is not None]
-        logger.debug(f"Found {len(short_list)} files with fit_summary")
-
-        if len(short_list) == 0:
-            # Restore original fit_summary before early return
-            for xf in xf_list:
-                if id(xf) in _restore:
-                    xf.fit_summary = _restore[id(xf)]
-
-            logger.warning(
-                f"No files with G2 fitting results found for diffusion analysis. "
-                f"Found {len(xf_list)} G2-compatible files but none have been fitted."
-            )
-            # Clear the plot and show a message
-            if hdl is not None:
-                logger.debug("Clearing plot and showing empty message")
-                hdl.clear()
-                ax = hdl.subplots(1, 1)
-                ax.text(
-                    0.5,
-                    0.5,
-                    'No G2 fitting results available.\n\nPlease:\n1. Go to "g2" tab\n2. Select files\n3. Click "update plot" to perform G2 fitting\n4. Return to "Diffusion" tab',
-                    ha="center",
-                    va="center",
-                    fontsize=12,
-                    bbox={
-                        "boxstyle": "round,pad=0.3",
-                        "facecolor": "lightblue",
-                        "alpha": 0.7,
-                    },
+            if len(short_list) == 0:
+                logger.warning(
+                    f"No files with G2 fitting results found for diffusion analysis. "
+                    f"Found {len(xf_list)} G2-compatible files but none have been fitted."
                 )
-                ax.set_xlim(0, 1)
-                ax.set_ylim(0, 1)
-                ax.axis("off")
-                hdl.fig.tight_layout()
-                hdl.draw()  # Add missing draw call
-                logger.debug("Empty message plot drawn")
+                # Clear the plot and show a message
+                if hdl is not None:
+                    logger.debug("Clearing plot and showing empty message")
+                    hdl.clear()
+                    ax = hdl.subplots(1, 1)
+                    ax.text(
+                        0.5,
+                        0.5,
+                        'No G2 fitting results available.\n\nPlease:\n1. Go to "g2" tab\n2. Select files\n3. Click "update plot" to perform G2 fitting\n4. Return to "Diffusion" tab',
+                        ha="center",
+                        va="center",
+                        fontsize=12,
+                        bbox={
+                            "boxstyle": "round,pad=0.3",
+                            "facecolor": "lightblue",
+                            "alpha": 0.7,
+                        },
+                    )
+                    ax.set_xlim(0, 1)
+                    ax.set_ylim(0, 1)
+                    ax.axis("off")
+                    hdl.fig.tight_layout()
+                    hdl.draw()  # Add missing draw call
+                    logger.debug("Empty message plot drawn")
+                else:
+                    logger.warning("hdl is None, cannot display empty message")
             else:
-                logger.warning("hdl is None, cannot display empty message")
-        else:
-            logger.info(
-                f"Found {len(short_list)} files with G2 fitting results for diffusion analysis"
-            )
-            try:
+                logger.info(
+                    f"Found {len(short_list)} files with G2 fitting results for diffusion analysis"
+                )
                 if hdl is not None:
                     logger.debug("Calling tauq.plot_pre with files")
                     _get_module("tauq").plot_pre(short_list, hdl)
                     logger.debug("tauq.plot_pre completed")
                 else:
                     logger.warning("hdl is None, cannot call tauq.plot_pre")
-            finally:
-                # Restore original fit_summary even if an exception is raised
-                for xf in xf_list:
-                    if id(xf) in _restore:
-                        xf.fit_summary = _restore[id(xf)]
 
     def plot_tauq(
         self,
@@ -597,29 +633,23 @@ class ViewerKernel(FileLocator):
         )
         if rows is None:
             rows = []
-        xf_list = self.get_xf_list(
-            rows=rows, filter_atype="Multitau", filter_fitted=True
-        )
+        # a file counts as fitted when it has any G2 fit (NLSQ or Bayesian)
+        xf_list = [
+            xf
+            for xf in self.get_xf_list(rows=rows, filter_atype="Multitau")
+            if _diffusion_fit(xf)[0] is not None
+        ]
 
-        # For tau-q, prefer Bayesian results when available
-        _restore: dict[int, object] = {}
-        for xf in xf_list:
-            if getattr(xf, "bayesian_fit_summary", None) is not None:
-                _restore[id(xf)] = xf.fit_summary
-                xf.fit_summary = xf.bayesian_fit_summary
-
-        try:
-            result = {}
+        # For tau-q, prefer Bayesian results when available (_diffusion_fit)
+        result = {}
+        with _diffusion_fits_shown(xf_list):
             for x in xf_list:
-                if x.fit_summary is None:
-                    logger.info("g2 fitting is not available for %s", x.fname)
+                x.fit_tauq(q_range, bounds, fit_flag, force_refit=force_refit)
+                if (x.fit_summary or {}).get("tauq_success", False):
+                    result[x.label] = x.get_fitting_info(mode="tauq_fitting")
                 else:
-                    x.fit_tauq(q_range, bounds, fit_flag, force_refit=force_refit)
-                    if (x.fit_summary or {}).get("tauq_success", False):
-                        result[x.label] = x.get_fitting_info(mode="tauq_fitting")
-                    else:
-                        logger.error("tau-q fit failed for %s", x.label)
-                        result[x.label] = "tauq fitting failed"
+                    logger.error("tau-q fit failed for %s", x.label)
+                    result[x.label] = "tauq fitting failed"
 
             if len(result) > 0:
                 _get_module("tauq").plot(
@@ -629,11 +659,6 @@ class ViewerKernel(FileLocator):
                     offset=offset,
                     plot_type=plot_type,
                 )
-        finally:
-            # Restore original fit_summary even if an exception is raised
-            for xf in xf_list:
-                if id(xf) in _restore:
-                    xf.fit_summary = _restore[id(xf)]
 
         return result
 
@@ -811,7 +836,9 @@ class ViewerKernel(FileLocator):
             f"ViewerKernel.plot_twotime: current_dset cached={current_dset is not None}, fname={xfile.fname}"
         )
 
-        if current_dset is None or current_dset.fname != xfile.fname:
+        # identity, not fname: the cache is keyed by fname and can hold an older
+        # XpcsFile of the same path (the file was reloaded or replaced)
+        if current_dset is None or current_dset is not xfile:
             logger.debug(f"Dataset changed, loading new qbin labels for {xfile.fname}")
             current_dset = xfile
             with self._dset_cache_lock:
@@ -1089,28 +1116,41 @@ class ViewerKernel(FileLocator):
                         else:
                             param_names = ["a", "b", "c", "d", "b2", "c2", "f"]
 
-                        # Write header for fitting parameters
+                        # Write header for fitting parameters; fit_status is
+                        # "ok" or "failed" (a failed Q bin has nan values, never
+                        # solver placeholders)
                         f.write("q_value\t")
                         for param in param_names:
                             f.write(f"{param}\t{param}_error\t")
-                        f.write("\n")
+                        f.write("fit_status\n")
 
                         # Write fitting parameters
                         # row i of the fit belongs to the fit's own q_val, which
                         # is a subset of the exported q_val when the fit was cropped
                         fit_val = xf.fit_summary["fit_val"]
                         fit_q = np.asarray(xf.fit_summary["q_val"])
+                        from .fitting.legacy import fit_success_mask
+
+                        fit_ok = fit_success_mask(xf.fit_summary)
                         for i, q in enumerate(fit_q):
                             if i < fit_val.shape[0]:
                                 f.write(f"{q:.6f}\t")
                                 for j in range(len(param_names)):
-                                    if j < fit_val.shape[2]:
+                                    if j >= fit_val.shape[2]:
+                                        f.write("N/A\tN/A\t")
+                                    elif fit_ok[i]:
                                         f.write(
                                             f"{fit_val[i, 0, j]:.6e}\t{fit_val[i, 1, j]:.6e}\t"
                                         )
                                     else:
-                                        f.write("N/A\tN/A\t")
-                                f.write("\n")
+                                        f.write("nan\tnan\t")
+                                f.write("ok\n" if fit_ok[i] else "failed\n")
+                        n_failed = int(np.count_nonzero(~fit_ok[: len(fit_q)]))
+                        if n_failed:
+                            logger.warning(
+                                f"G2 export kernel: {n_failed} failed Q fit(s) for "
+                                f"{xf.label} written as nan with fit_status=failed"
+                            )
                     logger.info(
                         f"G2 export kernel: Saved fitting results file: {fit_filename}"
                     )
@@ -1130,9 +1170,14 @@ class ViewerKernel(FileLocator):
                         header = "tau(s)"
                         for i in range(n_curves):
                             header += f"\tG2_fit_q{i:03d}(q={fit_q[i]:.6f})"
+                            if not fit_ok[i]:
+                                header += "[failed]"
 
                         curve_data = [fit_x]
-                        curve_data.extend(fit_line[i, :] for i in range(n_curves))
+                        curve_data.extend(
+                            fit_line[i, :] if fit_ok[i] else np.full(len(fit_x), np.nan)
+                            for i in range(n_curves)
+                        )
 
                         curve_matrix = np.column_stack(curve_data)
                         np.savetxt(
@@ -1192,22 +1237,27 @@ class ViewerKernel(FileLocator):
         import os
         import time
 
-        xf_list = self.get_xf_list(
-            rows=rows, filter_atype="Multitau", filter_fitted=True
-        )
+        # same fit selection as the plot (_diffusion_fit): Bayesian when present
+        xf_list = [
+            xf
+            for xf in self.get_xf_list(rows=rows, filter_atype="Multitau")
+            if _diffusion_fit(xf)[0] is not None
+        ]
 
         if not xf_list:
             raise ValueError("No files with tau-q fitting results found")
 
         # tauq_success is the single truth: a failed fit has no valid parameters
         valid_xf_list = []
+        fits: dict[int, tuple[dict, str]] = {}  # id(xf) -> (summary, method)
         n_failed = 0
         for xf in xf_list:
-            fs = xf.fit_summary
+            fs, method = _diffusion_fit(xf)
             if not fs or not ("tauq_fit_val" in fs or "tauq_success" in fs):
                 continue
             if fs.get("tauq_success", False):
                 valid_xf_list.append(xf)
+                fits[id(xf)] = (fs, method)
             else:
                 n_failed += 1
                 logger.error(
@@ -1232,7 +1282,8 @@ class ViewerKernel(FileLocator):
             try:
                 filename = os.path.join(folder, f"{stem}_diffusion_fitting.txt")
 
-                tauq_data = xf.fit_summary[
+                fs, method = fits[id(xf)]
+                tauq_data = fs[
                     "tauq_fit_val"
                 ]  # Shape: (2, 2) - [[a_val, b_val], [a_err, b_err]]
 
@@ -1240,11 +1291,15 @@ class ViewerKernel(FileLocator):
                     f.write(f"# Power Law Fitting Results for {xf.label}\n")
                     f.write("# Model: tau = a * q^b\n")
                     f.write(f"# File: {xf.fname}\n")
-                    f.write(f"# Q-range: {xf.fit_summary.get('tauq_q_range', 'N/A')}\n")
-                    f.write(f"# Bounds: {xf.fit_summary.get('tauq_bounds', 'N/A')}\n")
-                    f.write(
-                        f"# Fit flags: {xf.fit_summary.get('tauq_fit_flag', 'N/A')}\n\n"
-                    )
+                    f.write(f"# Fit method: {method}\n")
+                    for line in _DIFFUSION_PROVENANCE[method]:
+                        f.write(f"# {line}\n")
+                    f.write(f"# G2 fit function: {fs.get('fit_func', 'N/A')}\n")
+                    if fs.get("fname") is not None:  # Bayesian summaries record it
+                        f.write(f"# G2 fit source file: {fs['fname']}\n")
+                    f.write(f"# Q-range: {fs.get('tauq_q_range', 'N/A')}\n")
+                    f.write(f"# Bounds: {fs.get('tauq_bounds', 'N/A')}\n")
+                    f.write(f"# Fit flags: {fs.get('tauq_fit_flag', 'N/A')}\n\n")
 
                     f.write("parameter\tvalue\terror\n")
                     f.write(f"a\t{tauq_data[0, 0]:.6e}\t{tauq_data[1, 0]:.6e}\n")
@@ -1277,27 +1332,29 @@ class ViewerKernel(FileLocator):
                 f.write("# Power Law Fitting Summary\n")
                 f.write("# Model: tau = a * q^b\n")
                 f.write(f"# Export date: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-                f.write(f"# Total files: {len(valid_xf_list)}\n\n")
+                f.write(f"# Total files: {len(valid_xf_list)}\n")
+                for method in sorted({m for _, m in fits.values()}):
+                    f.write(f"# Fit method {method}:\n")
+                    for line in _DIFFUSION_PROVENANCE[method]:
+                        f.write(f"#   {line}\n")
+                f.write("\n")
 
-                f.write("file_label\ta_value\ta_error\tb_value\tb_error\tfile_name\n")
+                f.write(
+                    "file_label\tfit_method\ta_value\ta_error\tb_value\tb_error\t"
+                    "file_name\n"
+                )
 
-                # Debug: Check what data is available for each file
                 logger.info(f"Creating summary table for {len(valid_xf_list)} files")
                 for xf in valid_xf_list:
-                    logger.debug(
-                        f"File {xf.label}: fit_summary keys = {list(xf.fit_summary.keys()) if xf.fit_summary else 'None'}"
-                    )
-
-                    if xf.fit_summary and "tauq_fit_val" in xf.fit_summary:
-                        tauq_data = xf.fit_summary["tauq_fit_val"]
+                    fs, method = fits[id(xf)]
+                    if "tauq_fit_val" in fs:
+                        tauq_data = fs["tauq_fit_val"]
                         f.write(
-                            f"{xf.label}\t{tauq_data[0, 0]:.6e}\t{tauq_data[1, 0]:.6e}\t{tauq_data[0, 1]:.6f}\t{tauq_data[1, 1]:.6f}\t{xf.fname}\n"
+                            f"{xf.label}\t{method}\t{tauq_data[0, 0]:.6e}\t{tauq_data[1, 0]:.6e}\t{tauq_data[0, 1]:.6f}\t{tauq_data[1, 1]:.6f}\t{xf.fname}\n"
                         )
                         logger.info(f"Added summary data for {xf.label}")
                     else:
-                        logger.warning(
-                            f"No tauq_fit_val found for {xf.label} - fit_summary: {xf.fit_summary is not None}"
-                        )
+                        logger.warning(f"No tauq_fit_val found for {xf.label}")
 
             logger.info(f"Summary table exported to {summary_filename}")
 

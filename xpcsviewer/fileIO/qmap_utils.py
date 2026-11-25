@@ -1,6 +1,8 @@
 # Standard library imports
 import logging
+import threading
 import warnings
+import weakref
 
 # Third-party imports
 import numpy as np
@@ -9,7 +11,7 @@ from xpcsviewer.utils.logging_config import get_logger
 
 # Local imports
 from .aps_8idi import key as key_map
-from .hdf_reader import _connection_pool
+from .hdf_reader import _connection_pool, _file_identity
 
 logger = get_logger(__name__)
 
@@ -79,15 +81,30 @@ DEFAULT_BEAM_CENTER = DEFAULT_DETECTOR_SIZE // 2  # 512
 
 
 class QMapManager:
+    """Share one QMap between files of the same geometry (same stored hash).
+
+    Values are weak: a map lives only while some XpcsFile owns it, so removing
+    files releases their detector-sized arrays. Files without a stored hash are
+    keyed by path *and* file revision, so a replaced file never reuses the old
+    revision's map.
+    """
+
     def __init__(self):
-        self.db = {}
+        self.db: weakref.WeakValueDictionary = weakref.WeakValueDictionary()
+        self._lock = threading.Lock()
 
     def get_qmap(self, fname):
+        identity = _file_identity(fname)  # before the read
         hash_value = get_hash(fname)  # Compute hash
-        if hash_value not in self.db:
-            qmap = QMap(fname=fname)
-            self.db[hash_value] = qmap
-        return self.db[hash_value]
+        if isinstance(hash_value, str) and hash_value == fname:  # hash-less file
+            hash_value = (fname, identity)
+        with self._lock:
+            qmap = self.db.get(hash_value)
+        if qmap is None:
+            qmap = QMap(fname=fname)  # I/O outside the lock
+            with self._lock:
+                qmap = self.db.setdefault(hash_value, qmap)
+        return qmap
 
 
 class QMap:

@@ -8,6 +8,8 @@ with the tau-q diffusion pipeline and GUI plotting.
 from __future__ import annotations
 
 import logging
+from collections.abc import Hashable
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -18,6 +20,95 @@ if TYPE_CHECKING:
     from .results import FitResult
 
 logger = logging.getLogger(__name__)
+
+
+def _frozen(a: Any) -> NDArray:
+    """Private read-only float copy, so later edits cannot alter a bundle."""
+    out = np.array(a, dtype=float, copy=True)
+    out.setflags(write=False)
+    return out
+
+
+@dataclass(frozen=True, eq=False)  # identity semantics: fields hold arrays
+class BayesianBundle:
+    """A posterior together with the exact data and bin it was fitted to.
+
+    Created when a fit is launched (``result is None``) and completed with
+    :meth:`with_result` when it finishes, so diagnosis and plotting always
+    show the stored observations with the stored posterior and never
+    re-extract current data.  ``bin_id`` is the absolute (physical) bin
+    identity, not a position within the currently selected Q range.
+    """
+
+    fname: str | None
+    bin_id: Hashable
+    label: str
+    q_value: float
+    model_name: str
+    x: NDArray
+    y: NDArray
+    yerr: NDArray | None
+    result: Any = None
+
+    @classmethod
+    def create(
+        cls,
+        fname: str | None,
+        bin_id: Hashable,
+        label: str,
+        q_value: float,
+        model_name: str,
+        x: Any,
+        y: Any,
+        yerr: Any = None,
+    ) -> BayesianBundle:
+        return cls(
+            fname,
+            bin_id,
+            str(label),
+            float(q_value),
+            model_name,
+            _frozen(x),
+            _frozen(y),
+            None if yerr is None else _frozen(yerr),
+        )
+
+    @property
+    def key(self) -> tuple[str | None, Hashable]:
+        return (self.fname, self.bin_id)
+
+    def with_result(self, result: Any) -> BayesianBundle:
+        return replace(self, result=result)
+
+
+def resolve_g2_bins(xf: Any, q_range: Any) -> list[tuple[int, float, str]]:
+    """Absolute ``(bin_id, q, label)`` of each G2 column for *q_range*.
+
+    Mirrors the column selection of ``XpcsFile.get_g2_data`` so that column
+    ``j`` of the returned G2 matrix is the physical bin ``result[j]``.
+    """
+    sel, qvals = xf.qmap.get_qbin_in_qrange(q_range, zero_based=True)
+    sel = [int(i) for i in sel]
+    atype = xf.atype
+    if "Multitau" in atype and hasattr(xf, "g2") and hasattr(xf, "g2_err"):
+        hi = min(xf.g2.shape[1], xf.g2_err.shape[1]) - 1
+        keep = [0 <= i <= hi for i in sel]
+    elif "Twotime" in atype and hasattr(xf, "c2_g2"):
+        processed = getattr(xf, "c2_processed_bins", None)
+        if processed is None:
+            cols = set(range(xf.c2_g2.shape[1]))
+        else:
+            n = xf.c2_g2.shape[1]
+            cols = {int(b) - 1 for c, b in enumerate(np.ravel(processed)) if c < n}
+        keep = [i in cols for i in sel]
+    else:
+        keep = [True] * len(sel)
+    return [
+        (i, float(qvals[k]), xf.qmap.get_qbin_label(i + 1))
+        for k, (i, ok) in enumerate(zip(sel, keep, strict=True))
+        if ok
+    ]
+
 
 # Legacy parameter order for single_exp_all(x, a, b, c, d):
 #   idx 0 = a = contrast
@@ -119,6 +210,12 @@ def assemble_fit_summary(
     bounds: Any = None,
     fit_flag: str = "",
     label: str = "",
+    fname: str | None = None,
+    bin_ids: Any = None,
+    fit_q_range: tuple[float, float] | None = None,
+    fit_t_range: tuple[float, float] | None = None,
+    obs_g2: Any = None,
+    obs_t_el: Any = None,
 ) -> dict[str, Any]:
     """Convert per-Q Bayesian results into NLSQ-compatible fit_summary.
 
@@ -136,6 +233,11 @@ def assemble_fit_summary(
         Bayesian model function (``single_exp_func`` or ``double_exp_func``).
     q_range, t_range, bounds, fit_flag, label : optional
         Metadata fields matching the NLSQ fit_summary format.
+    fname, bin_ids, fit_q_range, fit_t_range, obs_g2, obs_t_el : optional
+        Provenance that makes the summary self-contained: the file, the
+        absolute bin ID of every column, the Q/delay ranges of the fit and
+        the observations (G2 matrix and delays) that were fitted.  Plotting
+        uses these instead of re-extracting current data.
 
     Returns
     -------
@@ -147,6 +249,10 @@ def assemble_fit_summary(
         ``failed_mask[q_idx] == True``.
     """
     num_q = len(q_arr)
+    if bin_ids is not None and len(bin_ids) != num_q:
+        raise ValueError(f"bin_ids has {len(bin_ids)} entries for {num_q} Q-bins")
+    if obs_g2 is not None and np.shape(obs_g2)[1:2] != (num_q,):
+        raise ValueError("obs_g2 columns do not match the Q-bins of the summary")
     nparams = _SINGLE_EXP_NPARAMS if fit_func_name == "single" else _DOUBLE_EXP_NPARAMS
     extract_fn = (
         _extract_single_exp_params
@@ -222,4 +328,10 @@ def assemble_fit_summary(
         "fit_x": fit_x,
         "label": label,
         "failed_mask": failed_mask,
+        "fname": fname,
+        "bin_ids": None if bin_ids is None else np.asarray(bin_ids),
+        "fit_q_range": fit_q_range,
+        "fit_t_range": fit_t_range,
+        "obs_g2": None if obs_g2 is None else _frozen(obs_g2),
+        "obs_t_el": None if obs_t_el is None else _frozen(obs_t_el),
     }

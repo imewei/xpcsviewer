@@ -43,6 +43,7 @@ from xpcsviewer.xpcs_file.memory import MemoryMonitor
 
 # Local imports
 from .fileIO.hdf_reader import (
+    _file_identity,
     batch_read_fields,
     get,
     get_analysis_type,
@@ -64,13 +65,6 @@ from .utils.memory_predictor import (
     record_operation_memory,
 )
 from .utils.streaming_processor import AdaptiveChunkSizer, process_saxs_log_streaming
-from .utils.vectorized_roi import (
-    ParallelROIProcessor,
-    PieROICalculator,
-    RingROICalculator,
-    ROIParameters,
-    ROIType,
-)
 
 logger = get_logger(__name__)
 
@@ -128,12 +122,68 @@ def _get_cached_singletons():
 
 
 def _tauq_failure() -> dict:
-    """tau-q result for a failed fit: overwrites any earlier fit's numbers."""
+    """tau-q result for a failed fit: overwrites every field of an earlier fit.
+
+    The observation arrays are emptied too, so no stale point from a previous
+    q range survives to be plotted or exported.
+    """
     return {
         "tauq_success": False,
+        "tauq_q": np.empty(0),
+        "tauq_tau": np.empty(0),
+        "tauq_tau_err": np.empty(0),
         "tauq_fit_line": None,
         "tauq_fit_val": np.full((2, 2), np.nan),  # rows: value, error; cols: a, b
     }
+
+
+def _positive_delay_fit_data(t_el, g2, sigma):
+    """Restrict a G2 fit to finite, strictly positive delays.
+
+    Rule: the models are functions of tau / delay with a non-integer stretch
+    exponent, so delay 0 (e.g. the lag-0 point of a two-time file) gives an
+    invalid derivative, and the fit grid is logarithmic. Such points, and any
+    non-finite delay, are dropped before fitting and the count is logged.
+    """
+    t = np.asarray(t_el, dtype=float)
+    keep = np.isfinite(t) & (t > 0)
+    n_drop = int(t.size - np.count_nonzero(keep))
+    if n_drop:
+        logger.warning(
+            "G2 fit: dropped %d of %d delay point(s) that are non-positive or "
+            "non-finite (fits use finite, strictly positive delays only)",
+            n_drop,
+            t.size,
+        )
+    if not keep.any():
+        raise ValueError(
+            "Cannot fit G2: no finite positive delays in the selected range"
+        )
+    return t[keep], np.asarray(g2)[keep], np.asarray(sigma)[keep]
+
+
+def _blank_failed_fits(fit_val, fit_line, ok):
+    """Copies of ``fit_val`` / ``fit_line`` with NaN rows for every failed Q.
+
+    Solver placeholders (bounds midpoints, zero errors, last iterates of a
+    non-converged solve) are not measurements, so nothing downstream can
+    mistake them for values. A "successful" row with non-finite parameters is
+    failed too. Returns ``(fit_val, fit_line, ok)`` with ``ok`` a bool array.
+    """
+    fit_val = np.array(fit_val, dtype=float)
+    fit_line = np.array(fit_line, dtype=float)
+    ok = np.asarray(ok, dtype=bool).copy()
+    ok &= np.isfinite(fit_val[:, 0, :]).all(axis=1)
+    fit_val[~ok] = np.nan
+    fit_line[~ok] = np.nan
+    n_failed = int(np.count_nonzero(~ok))
+    if n_failed:
+        logger.warning(
+            "G2 fit failed for %d of %d Q bin(s); their values are NaN",
+            n_failed,
+            ok.size,
+        )
+    return fit_val, fit_line, ok
 
 
 def _g2_fit_digest(fit_summary: dict) -> str:
@@ -241,6 +291,23 @@ class XpcsFile:
 
     _G2_PARTIAL_KEYS = frozenset({"g2_partial", "g2_partial_err", "g2_partial_labels"})
 
+    # An imported Q-map partition (SimpleMask) is DISPLAY ONLY. xf.dqmap and
+    # xf.sqmap always stay the file's own maps (delegated to xf.qmap) for every
+    # selection and numerical path; only the designated Q-map displays read the
+    # import, through get_display_qmap().
+    display_dqmap = None
+    display_sqmap = None
+
+    def get_display_qmap(self, target):
+        """Map for the Q-map displays: the imported partition, else the file's own.
+
+        ``target`` is "dqmap" (dynamic) or "sqmap" (static).
+        """
+        if target not in ("dqmap", "sqmap"):
+            raise ValueError(f"target must be 'dqmap' or 'sqmap', got '{target}'")
+        override = getattr(self, f"display_{target}")
+        return getattr(self, target) if override is None else override
+
     def __init__(self, fname, fields=None, label_style=None, qmap_manager=None):
         self.fname = fname
         if qmap_manager is None:
@@ -256,6 +323,10 @@ class XpcsFile:
         # arbitrary keys returned from the HDF5 file. (BUG-015)
         _PROTECTED = frozenset(self.__dict__.keys())
         for k, v in payload_dictionary.items():
+            if k == "c2_processed_bins" and v is not None:
+                # a single processed bin stored as shape (1, 1) is read back as a
+                # Python scalar; consumers expect a 1-D sequence of bin IDs
+                v = np.atleast_1d(np.ravel(v))
             if k not in _PROTECTED:
                 self.__dict__[k] = v
         self.hdf_info = None
@@ -1381,12 +1452,24 @@ class XpcsFile:
         else:
             q, Iq = self.saxs_1d["q"], self.Iqp
         if bkg_xf is not None:
-            if np.allclose(q, bkg_xf.saxs_1d["q"]):
-                Iq = Iq - bkg_weight * bkg_xf.saxs_1d["Iq"]
+            bkg_q, bkg_iq = bkg_xf.saxs_1d["q"], bkg_xf.saxs_1d["Iq"]
+            # Compare shapes before values: allclose raises on different Q counts.
+            if (
+                np.shape(q) == np.shape(bkg_q)
+                and np.shape(bkg_iq)[-1] == np.shape(Iq)[-1]
+                and np.shape(bkg_iq)[0] in (1, np.shape(Iq)[0])
+                and np.allclose(q, bkg_q)
+            ):
+                Iq = Iq - bkg_weight * bkg_iq
                 Iq[Iq < 0] = np.nan
             else:
                 logger.warning(
-                    "background subtraction is not applied because q is not matched"
+                    "background subtraction is not applied for %s because its "
+                    "q axis does not match the sample's (%s vs %s Q bins); "
+                    "the sample trace is kept",
+                    getattr(bkg_xf, "label", "background"),
+                    np.shape(bkg_q)[-1:] or "scalar",
+                    np.shape(q)[-1:] or "scalar",
                 )
         if qrange is not None:
             q_roi = (q >= qrange[0]) * (q <= qrange[1])
@@ -1396,7 +1479,9 @@ class XpcsFile:
             else:
                 logger.warning("qrange is not applied because it is out of range")
         if use_absolute_crosssection and self.abs_cross_section_scale is not None:
-            Iq *= self.abs_cross_section_scale
+            Iq = (
+                Iq * self.abs_cross_section_scale
+            )  # not in place: Iq may be stored data
 
         # apply sampling (Iq is 2D (n_curves, n_q); sample the q-axis to stay
         # aligned with q)
@@ -1418,15 +1503,22 @@ class XpcsFile:
             Iq = Iq * np.square(np.square(q))
             ylabel = ylabel + " * q^4"
         elif norm_method == "I0":
-            baseline = Iq[0]
-            Iq = Iq / baseline
+            # each curve (row) is divided by its own first valid non-zero point
+            # along Q; a curve without one cannot be normalised and becomes NaN
+            Iq = np.asarray(Iq, dtype=float)
+            usable = np.isfinite(Iq) & (Iq != 0)
+            first = np.argmax(usable, axis=-1)
+            ref = np.take_along_axis(Iq, first[..., None], axis=-1)
+            ref = np.where(usable.any(axis=-1, keepdims=True), ref, np.nan)
+            with np.errstate(invalid="ignore"):
+                Iq = Iq / ref
             ylabel = ylabel + " / I_0"
         xlabel = f"q ({Q_UNIT_DISPLAY})"
         return q, Iq, xlabel, ylabel
 
     def get_twotime_qbin_labels(self):
         qbin_labels = []
-        for qbin in self.c2_processed_bins.tolist():
+        for qbin in np.ravel(self.c2_processed_bins).tolist():
             qbin_labels.append(self.get_qbin_label(qbin, append_qbin=True))
         return qbin_labels
 
@@ -1434,10 +1526,10 @@ class XpcsFile:
     def get_twotime_maps(
         self, scale="log", auto_crop=True, highlight_xy=None, selection=None
     ):
-        # Two-time bins are bound to the file's own dynamic map: an imported
-        # partition (xf.dqmap, display only) must not relabel c2_processed_bins.
+        # Two-time bins are bound to the file's own dynamic map (xf.dqmap is
+        # always canonical; an imported partition lives in xf.display_dqmap).
         # Work on a view until we need to mutate (astype creates a copy)
-        dqmap = self.qmap.dqmap
+        dqmap = self.dqmap
         saxs = self.saxs_2d_log if scale == "log" else self.saxs_2d
 
         # Handle 3D SAXS data by taking the first frame if needed
@@ -1523,11 +1615,12 @@ class XpcsFile:
         return dqmap_disp, saxs, selection
 
     def get_twotime_c2(self, selection=0, correct_diag=True, max_size=32678):
-        dq_processed = tuple(self.c2_processed_bins.tolist())
+        dq_processed = tuple(np.ravel(self.c2_processed_bins).tolist())
         assert selection >= 0 and selection < len(dq_processed), (
             f"selection {selection} out of range {dq_processed}"
         )
-        config = (selection, correct_diag, max_size)
+        # the file revision is part of the key: a replaced file must not reuse C2
+        config = (selection, correct_diag, max_size, _file_identity(self.fname))
         if self.c2_kwargs == config:
             return self.c2_all_data
         # Monitor memory for large two-time correlation data
@@ -1600,8 +1693,14 @@ class XpcsFile:
             else:
                 prefix = ["a", "b", "c", "d", "b2", "c2", "f"]
 
+            from xpcsviewer.fitting.legacy import fit_success_mask
+
+            fit_ok = fit_success_mask(self.fit_summary)
             msg = []
             for n in range(val.shape[0]):
+                if not fit_ok[n]:
+                    msg.append("fit failed: no valid parameters")
+                    continue
                 temp = []
                 for m in range(len(prefix)):
                     value = val[n, 0, m]
@@ -1770,12 +1869,14 @@ class XpcsFile:
         q_val, t_el, g2, sigma, label = self.get_g2_data(qrange=q_range, trange=t_range)
         if np.shape(g2)[-1] == 0:
             raise ValueError(f"Cannot fit G2: no Q bins in range {q_range}")
+        t_el, g2, sigma = _positive_delay_fit_data(t_el, g2, sigma)
 
         # The fit UI has no initial-value entry: the bounds midpoint (geometric
         # mean for tau) is both the starting point and the documented fixed value.
         p0 = initial_fit_guess(bounds, [1, 4] if fit_func == "double" else [1])
 
         # Optimized fit_x generation - cache if t_el doesn't change
+        # (t_el is strictly positive here, so the log grid is finite)
         t_range_key = (
             f"{self._cache_prefix}_fit_x_{np.min(t_el):.6e}_{np.max(t_el):.6e}"
         )
@@ -1793,7 +1894,7 @@ class XpcsFile:
         # Perform the fitting - use robust fitting if requested
         if robust_fitting:
             # Use comprehensive robust fitting for enhanced reliability
-            fit_line, fit_val = self._perform_robust_g2_fitting(
+            fit_line, fit_val, fit_ok = self._perform_robust_g2_fitting(
                 func,
                 t_el,
                 g2,
@@ -1820,7 +1921,7 @@ class XpcsFile:
                 logger.info(
                     f"Using parallel G2 fitting for {num_qvals} q-values with {max_workers or 'auto'} workers"
                 )
-                fit_line, fit_val = fit_with_fixed_parallel(
+                fit_line, fit_val, fit_ok = fit_with_fixed_parallel(
                     func,
                     t_el,
                     g2,
@@ -1831,6 +1932,7 @@ class XpcsFile:
                     p0=p0,
                     max_workers=max_workers,
                     use_threads=True,
+                    return_status=True,
                 )
             else:
                 # Standard sequential fitting
@@ -1846,14 +1948,27 @@ class XpcsFile:
                         "Using sequential fitting due to critical memory pressure"
                     )
 
-                fit_line, fit_val = fit_with_fixed(
-                    func, t_el, g2, sigma, bounds, fit_flag, fit_x, p0=p0
+                fit_line, fit_val, fit_ok = fit_with_fixed(
+                    func,
+                    t_el,
+                    g2,
+                    sigma,
+                    bounds,
+                    fit_flag,
+                    fit_x,
+                    p0=p0,
+                    return_status=True,
                 )
+
+        # Failed Q bins carry NaN, never solver placeholders, and are listed in
+        # "fit_success" (one bool per fitted Q, same order as "q_val").
+        fit_val, fit_line, fit_ok = _blank_failed_fits(fit_val, fit_line, fit_ok)
 
         # Create optimized fit summary
         self.fit_summary = {
             "fit_func": fit_func,
             "fit_val": fit_val,
+            "fit_success": fit_ok,
             "t_el": t_el,
             "q_val": np.asarray(q_val),  # Ensure q_val is always a numpy array
             "q_range": str(q_range),
@@ -1904,8 +2019,11 @@ class XpcsFile:
         """
         Perform robust G2 fitting using sequential method approach.
 
-        Uses the enhanced fitting sequence: robust → least squares → differential evolution
+        Uses the enhanced fitting sequence: robust -> least squares -> differential evolution
         for improved reliability and convergence.
+
+        Returns ``(fit_line, fit_val, success)``; ``success`` is the per-Q status
+        mask under the same rules as every other solver path.
         """
         logger.info(f"Starting sequential G2 fitting with {g2.shape[1]} q-values")
 
@@ -1913,54 +2031,37 @@ class XpcsFile:
 
         # Use the new sequential fitting approach
         try:
-            fit_line, fit_val, _fit_methods = fit_with_fixed_sequential(
-                func, t_el, g2, sigma, bounds, fit_flag, fit_x, p0=p0
+            fit_line, fit_val, _fit_methods, fit_ok = fit_with_fixed_sequential(
+                func,
+                t_el,
+                g2,
+                sigma,
+                bounds,
+                fit_flag,
+                fit_x,
+                p0=p0,
+                return_status=True,
             )
 
-            # Keep fit_val as numpy array for backward compatibility with get_fitting_info
             # fit_val is already in the correct format (n_q, 2, n_params)
-            logger.info("Sequential G2 fitting completed successfully")
-            return fit_line, fit_val
+            logger.info("Sequential G2 fitting completed")
+            return fit_line, fit_val, fit_ok
 
         except Exception as e:
             logger.error(f"Sequential fitting failed: {e}")
             # Fallback to original method
             logger.info("Falling back to standard fitting")
-            fallback_fit_line, fallback_fit_val = fit_with_fixed(
-                func, t_el, g2, sigma, bounds, fit_flag, fit_x, p0=p0
+            return fit_with_fixed(
+                func,
+                t_el,
+                g2,
+                sigma,
+                bounds,
+                fit_flag,
+                fit_x,
+                p0=p0,
+                return_status=True,
             )
-            return fallback_fit_line, fallback_fit_val
-
-    def _fallback_standard_fit(
-        self, func, t_el, g2_col, sigma_col, bounds, fit_flag, fit_x, p0
-    ):
-        """
-        Fallback to standard fitting when robust fitting is not applicable.
-        Maintains full backward compatibility.
-        """
-        try:
-            from xpcsviewer.fitting import fit_with_fixed
-
-            # Use the original fit_with_fixed function
-            g2_single = g2_col.reshape(-1, 1)
-            sigma_single = sigma_col.reshape(-1, 1)
-
-            fit_line_single, fit_val_single = fit_with_fixed(
-                func, t_el, g2_single, sigma_single, bounds, fit_flag, fit_x, p0=p0
-            )
-
-            return fit_line_single[:, 0], fit_val_single[0] if fit_val_single else {
-                "params": p0,
-                "robust_fit": False,
-            }
-
-        except Exception as e:
-            logger.warning(f"Standard fitting fallback also failed: {e}")
-            return np.ones_like(fit_x), {
-                "params": p0,
-                "error": str(e),
-                "robust_fit": False,
-            }
 
     def fit_g2_robust(
         self,
@@ -2047,6 +2148,7 @@ class XpcsFile:
         q_val, t_el, g2, sigma, label = self.get_g2_data(qrange=q_range, trange=t_range)
         if np.shape(g2)[-1] == 0:
             raise ValueError(f"Cannot fit G2: no Q bins in range {q_range}")
+        t_el, g2, sigma = _positive_delay_fit_data(t_el, g2, sigma)
 
         # Check if we should use parallel processing
         num_qvals = g2.shape[1] if g2.ndim > 1 else 1
@@ -2085,19 +2187,28 @@ class XpcsFile:
         else:
             raise ValueError(f"Unknown fit function: {fit_func}")
 
-        # Generate fit_x for evaluation
+        # Generate fit_x for evaluation (t_el is strictly positive here)
         fit_x = np.logspace(
             np.log10(np.min(t_el)) - 0.5, np.log10(np.max(t_el)) + 0.5, 128
         )
 
         # Perform fitting using parallel or sequential method
-        from xpcsviewer.fitting import fit_with_fixed, fit_with_fixed_parallel
+        from xpcsviewer.fitting import (
+            fit_with_fixed,
+            fit_with_fixed_parallel,
+            initial_fit_guess,
+        )
+
+        # Same starting point / fixed values as fit_g2.
+        if fit_flag is None:
+            fit_flag = [True] * len(bounds[0])
+        p0 = initial_fit_guess(bounds, [1, 4] if fit_func == "double" else [1])
 
         if use_parallel_actual:
             logger.info(
                 f"Using parallel G2 fitting with {max_workers or 'auto'} workers"
             )
-            fit_line, fit_val = fit_with_fixed_parallel(
+            fit_line, fit_val, fit_ok = fit_with_fixed_parallel(
                 func,
                 t_el,
                 g2,
@@ -2105,19 +2216,33 @@ class XpcsFile:
                 bounds,
                 fit_flag,
                 fit_x,
+                p0=p0,
                 max_workers=max_workers,
                 use_threads=True,
+                return_status=True,
             )
         else:
             logger.info("Using sequential G2 fitting")
-            fit_line, fit_val = fit_with_fixed(
-                func, t_el, g2, sigma, bounds, fit_flag, fit_x
+            fit_line, fit_val, fit_ok = fit_with_fixed(
+                func,
+                t_el,
+                g2,
+                sigma,
+                bounds,
+                fit_flag,
+                fit_x,
+                p0=p0,
+                return_status=True,
             )
+
+        # Failed Q bins carry NaN, never solver placeholders ("fit_success" lists them)
+        fit_val, fit_line, fit_ok = _blank_failed_fits(fit_val, fit_line, fit_ok)
 
         # Create results structure
         results = {
             "fit_line": fit_line,
             "fit_results": fit_val,
+            "fit_success": fit_ok,
             "q_values": q_val,
             "tau": t_el,
             "g2_data": g2,
@@ -2170,6 +2295,7 @@ class XpcsFile:
         return {
             "fit_func": fit_func,
             "fit_val": results["fit_results"],
+            "fit_success": results["fit_success"],
             "t_el": t_el,
             "q_val": np.asarray(q_val),  # Ensure q_val is always a numpy array
             "q_range": str(q_range),
@@ -2265,6 +2391,18 @@ class XpcsFile:
                 )
                 self.fit_summary.update(tauq_result)
                 return self.fit_summary
+
+            # Only Q bins whose G2 fit succeeded are tau(q) observations.
+            from xpcsviewer.fitting.legacy import fit_success_mask
+
+            g2_ok = fit_success_mask({**self.fit_summary, "fit_val": fit_val})
+            g2_ok = g2_ok[: len(q_slice)]
+            n_failed = int(np.count_nonzero(q_slice & ~g2_ok))
+            if n_failed:
+                logger.warning(
+                    "fit_tauq: ignoring %d Q bin(s) whose G2 fit failed", n_failed
+                )
+            q_slice = q_slice & g2_ok
 
             x = x[q_slice]
             y = fit_val[q_slice, 0, 1]
@@ -2432,252 +2570,131 @@ class XpcsFile:
     def get_roi_data_vectorized(
         self, roi_parameter, phi_num=180, use_vectorized=True, use_parallel=False
     ):
+        """Compatibility entry point; the ROI profile comes from ``get_roi_data``.
+
+        The vectorized calculators in ``utils.vectorized_roi`` need static bin
+        edges and angle maps that a loaded file does not provide, so there is
+        one ROI implementation (``get_roi_data``) and these arguments are
+        accepted but ignored.
         """
-        Enhanced ROI calculation using vectorized operations for optimal performance.
-
-        Parameters
-        ----------
-        roi_parameter : dict
-            ROI parameters with sl_type, angle_range/radius, etc.
-        phi_num : int
-            Number of angular bins for ring ROI (default: 180)
-        use_vectorized : bool
-            Whether to use vectorized ROI calculators (default: True)
-        use_parallel : bool
-            Whether to use parallel processing for multiple ROIs (default: False)
-
-        Returns
-        -------
-        tuple
-            (x_values, roi_data) or ROIResult object if use_vectorized=True
-        """
-        # Monitor memory usage for ROI calculations
-        memory_before_mb, _ = MemoryMonitor.get_memory_usage()
-
-        if not use_vectorized:
-            # Fallback to original method
-            return self.get_roi_data(roi_parameter, phi_num)
-
-        # Prepare geometry data for vectorized calculators
-        geometry_data = {
-            "qmap": self.qmap,
-            "rmap": getattr(self, "rmap", None),
-            "pmap": getattr(self, "pmap", None),
-            "mask": getattr(self, "mask", np.ones_like(self.qmap)),
-        }
-
-        # Determine ROI type and prepare parameters
-        roi_type_map = {
-            "Pie": ROIType.PIE,
-            "Ring": ROIType.RING,
-            "Phi_ring": ROIType.PHI_RING,
-        }
-
-        sl_type = roi_parameter.get("sl_type", "Pie")
-        roi_type = roi_type_map.get(sl_type, ROIType.PIE)
-
-        # Prepare ROI parameters based on type
-        if roi_type == ROIType.PIE:
-            # Pie ROI parameters
-            roi_params = ROIParameters(
-                roi_type=roi_type,
-                parameters={
-                    "angle_range": roi_parameter.get("angle_range", (0, 360)),
-                    "qmap_idx": getattr(self, "qmap_idx", None),
-                    "qsize": len(getattr(self, "sqlist", []))
-                    if hasattr(self, "sqlist")
-                    else 1000,
-                    "qspan": getattr(self, "sqspan", None),
-                    "qmax": roi_parameter.get("dist", None),
-                    "phi_num": phi_num,
-                },
-                label=f"pie_{roi_parameter.get('angle_range', (0, 360))}",
-            )
-
-            # Ensure we have necessary geometry data
-            if geometry_data["pmap"] is None:
-                # Generate pmap from qmap if not available
-                if hasattr(self, "qmap") and hasattr(self, "mask"):
-                    y, x = np.mgrid[: self.qmap.shape[0], : self.qmap.shape[1]]
-                    center_x = self.qmap.shape[1] // 2
-                    center_y = self.qmap.shape[0] // 2
-                    geometry_data["pmap"] = (
-                        np.degrees(np.arctan2(y - center_y, x - center_x)) % 360
-                    )
-                else:
-                    logger.error("Cannot create pie ROI without angular map data")
-                    return self.get_roi_data(roi_parameter, phi_num)
-
-            calculator = PieROICalculator()
-
-        elif roi_type == ROIType.RING:
-            # Ring ROI parameters
-            roi_params = ROIParameters(
-                roi_type=roi_type,
-                parameters={
-                    "radius_range": roi_parameter.get("radius", (0, 100)),
-                    "pmap": geometry_data["pmap"],
-                    "phi_num": phi_num,
-                },
-                label=f"ring_{roi_parameter.get('radius', (0, 100))}",
-            )
-
-            # Ensure we have radial map
-            if geometry_data["rmap"] is None:
-                # Generate rmap from qmap if not available
-                if hasattr(self, "qmap"):
-                    y, x = np.mgrid[: self.qmap.shape[0], : self.qmap.shape[1]]
-                    center_x = self.qmap.shape[1] // 2
-                    center_y = self.qmap.shape[0] // 2
-                    geometry_data["rmap"] = np.sqrt(
-                        (y - center_y) ** 2 + (x - center_x) ** 2
-                    )
-                else:
-                    logger.error("Cannot create ring ROI without radial map data")
-                    return self.get_roi_data(roi_parameter, phi_num)
-
-            calculator = RingROICalculator()
-
-        else:
-            logger.warning(
-                f"Unsupported ROI type {sl_type}, falling back to original method"
-            )
-            return self.get_roi_data(roi_parameter, phi_num)
-
-        # Predict memory requirements for ROI calculation
-        saxs_size_mb = (
-            self.saxs_2d.nbytes / (1024 * 1024)
-            if hasattr(self.saxs_2d, "nbytes")
-            else 10.0
-        )
-        prediction = predict_operation_memory("roi_calculation", saxs_size_mb)
-
-        logger.info(
-            f"Vectorized ROI calculation: type={sl_type}, "
-            f"data_size={saxs_size_mb:.1f}MB, predicted={prediction.predicted_mb:.1f}MB, "
-            f"pressure={prediction.pressure_level.value}"
-        )
-
-        # Act on memory pressure predictions
-        use_streaming = prediction.pressure_level in [
-            MemoryPressure.HIGH,
-            MemoryPressure.CRITICAL,
-        ]
-
-        if use_streaming:
-            logger.info(
-                "Using streaming for vectorized ROI calculation due to memory pressure"
-            )
-
-        # Perform vectorized ROI calculation
-        try:
-            result = calculator.calculate_roi(
-                self.saxs_2d, geometry_data, roi_params, use_streaming=use_streaming
-            )
-
-            # Log memory usage after calculation
-            memory_after_mb, _ = MemoryMonitor.get_memory_usage()
-            memory_used = memory_after_mb - memory_before_mb
-
-            logger.info(
-                f"Vectorized ROI calculation completed: {result.processing_time:.3f}s, "
-                f"memory used: {memory_used:+.1f}MB"
-            )
-
-            # Record operation for memory predictor learning
-            record_operation_memory(
-                operation_type="roi_calculation",
-                input_size_mb=saxs_size_mb,
-                memory_before_mb=memory_before_mb,
-                memory_after_mb=memory_after_mb,
-                duration_seconds=result.processing_time,
-            )
-
-            # Return results in the expected format (x_values, roi_data)
-            return result.x_values, result.roi_data
-
-        except Exception as e:
-            logger.error(f"Vectorized ROI calculation failed: {e}")
-            logger.info("Falling back to original ROI calculation method")
-            return self.get_roi_data(roi_parameter, phi_num)
+        return self.get_roi_data(roi_parameter, phi_num)
 
     def get_multiple_roi_data_parallel(self, roi_list, phi_num=180, max_workers=None):
+        """Return ``[(x, y), ...]`` for each ROI in ``roi_list`` (see ``get_roi_data``)."""
+        return [self.get_roi_data(roi, phi_num) for roi in roi_list]
+
+    def _roi_geometry(self):
+        """Calibrated per-pixel geometry for ROI profiles, from the file's own QMap.
+
+        Returns ``(r_pixel, phi, qbin, qlist, mask)``:
+
+        - ``r_pixel``: distance from the beam centre [pixel]
+        - ``phi``: azimuth of each pixel [degree], wrapped to [0, 360)
+        - ``qbin``: 1-based index into ``qlist`` of the static q bin that owns
+          the pixel (0 = in no static bin). Read from the canonical ``sqmap``
+          through ``static_index_mapping``: bin k of ``sqmap`` is flat index
+          ``static_index_mapping[k - 1]`` of the row-major
+          ``(len(sqlist), len(splist))`` static grid (the layout of
+          ``QMap.reshape_phi_analysis``), i.e. q bin ``index // len(splist)``.
+        - ``qlist``: q of each static q bin [1/Angstrom]
+        - ``mask``: detector mask (> 0 is a valid pixel)
         """
-        Calculate multiple ROIs in parallel for enhanced performance.
-
-        Parameters
-        ----------
-        roi_list : list
-            List of ROI parameter dictionaries
-        phi_num : int
-            Number of angular bins for ring ROIs
-        max_workers : int, optional
-            Maximum number of parallel workers
-
-        Returns
-        -------
-        list
-            List of (x_values, roi_data) tuples
-        """
-        if not roi_list:
-            return []
-
-        # Convert to ROIParameters format
-        roi_params_list = []
-        for i, roi_param in enumerate(roi_list):
-            sl_type = roi_param.get("sl_type", "Pie")
-            roi_type_map = {
-                "Pie": ROIType.PIE,
-                "Ring": ROIType.RING,
-                "Phi_ring": ROIType.PHI_RING,
-            }
-            roi_type = roi_type_map.get(sl_type, ROIType.PIE)
-
-            if roi_type == ROIType.PIE:
-                params = {
-                    "angle_range": roi_param.get("angle_range", (0, 360)),
-                    "qmap_idx": getattr(self, "qmap_idx", None),
-                    "qsize": len(getattr(self, "sqlist", []))
-                    if hasattr(self, "sqlist")
-                    else 1000,
-                    "qspan": getattr(self, "sqspan", None),
-                    "qmax": roi_param.get("dist", None),
-                    "phi_num": phi_num,
-                }
-            elif roi_type == ROIType.RING:
-                params = {
-                    "radius_range": roi_param.get("radius", (0, 100)),
-                    "pmap": getattr(self, "pmap", None),
-                    "phi_num": phi_num,
-                }
-            else:
-                params = {}
-
-            roi_params_list.append(
-                ROIParameters(
-                    roi_type=roi_type, parameters=params, label=f"{sl_type}_{i}"
-                )
+        maps = self.qmap.qmap
+        if "r_pixel" not in maps or "phi" not in maps:
+            raise ValueError(
+                f"{self.fname}: the Q map has no per-pixel geometry (it failed to "
+                "load); ROI profiles are unavailable"
             )
-
-        # Prepare geometry data
-        geometry_data = {
-            "qmap": self.qmap,
-            "rmap": getattr(self, "rmap", None),
-            "pmap": getattr(self, "pmap", None),
-            "mask": getattr(self, "mask", np.ones_like(self.qmap)),
-        }
-
-        # Calculate ROIs in parallel
-        processor = ParallelROIProcessor(max_workers=max_workers)
-        results = processor.calculate_multiple_rois(
-            self.saxs_2d, geometry_data, roi_params_list, use_parallel=True
+        qlist = np.asarray(self.sqlist, dtype=float)
+        sqmap = np.asarray(self.sqmap)
+        q_of_bin = np.asarray(self.qmap.static_index_mapping) // max(
+            len(self.splist), 1
+        )
+        if q_of_bin.size and q_of_bin.max() >= len(qlist):
+            raise ValueError(
+                f"{self.fname}: static_index_mapping addresses q bin "
+                f"{q_of_bin.max()} but the file lists {len(qlist)} static q values"
+            )
+        owned = (sqmap >= 1) & (sqmap <= len(q_of_bin))
+        qbin = np.zeros(sqmap.shape, dtype=np.int64)
+        qbin[owned] = q_of_bin[sqmap[owned].astype(np.int64) - 1] + 1
+        return (
+            np.asarray(maps["r_pixel"], dtype=float),
+            np.mod(np.asarray(maps["phi"], dtype=float), 360.0),
+            qbin,
+            qlist,
+            np.asarray(self.mask),
         )
 
-        # Convert results to expected format
-        return [(result.x_values, result.roi_data) for result in results]
+    @staticmethod
+    def _binned_mean(index, values, nbins, chunk=None):
+        """Mean of ``values`` per 1-based bin of ``index`` (0 = excluded).
+
+        Bins that received no pixel are NaN. ``chunk`` accumulates the
+        histograms in slices of that many pixels; the result is identical.
+        """
+        total = np.zeros(nbins)
+        count = np.zeros(nbins)
+        step = max(1, index.size if chunk is None else int(chunk))
+        for start in range(0, index.size, step):
+            idx = index[start : start + step]
+            total += np.bincount(idx, values[start : start + step], nbins + 1)[1:]
+            count += np.bincount(idx, minlength=nbins + 1)[1:]
+        return np.divide(total, count, out=np.full(nbins, np.nan), where=count > 0)
+
+    def _roi_profile(self, roi_parameter, phi_num, chunk=None):
+        """Pie or Ring ROI profile ``(x, y)``; None for other ROI types."""
+        sl_type = roi_parameter["sl_type"]
+        if sl_type not in ("Pie", "Ring"):
+            return None
+        r_pixel, phi, qbin, qlist, mask = self._roi_geometry()
+        saxs = np.asarray(self.saxs_2d).ravel()
+
+        if sl_type == "Pie":
+            # `angle_range` [degree] is in the frame of PieROI.get_parameter:
+            # the direction (column, row) of the pixel from the beam centre,
+            # theta = atan2(row, column), measured from 6 o'clock, theta - 90.
+            # QMap phi = -theta, so that angle is (-phi - 90) mod 360.
+            phi = np.mod(-phi - 90.0, 360.0)
+            pmin, pmax = roi_parameter["angle_range"]
+            if pmax < pmin:  # the wedge crosses 0 degree
+                pmax += 360.0
+                phi = np.where(phi < pmin, phi + 360.0, phi)
+            inside = (phi >= pmin) & (phi < pmax) & (mask > 0)
+            y = self._binned_mean(
+                np.where(inside, qbin, 0).ravel(), saxs, len(qlist), chunk
+            )
+            # `dist` is the wedge radius in pixels. A pixel `dist` from the beam
+            # centre scatters by alpha = arctan(dist * pixel_size / det_dist)
+            # (pixel_size and det_dist in the same length unit), and
+            # q = k0 sin(alpha) with k0 = 2 pi / wavelength [1/Angstrom]; this
+            # is the relation QMap.compute_qmap uses for the q map itself.
+            qmax = self.qmap.k0 * np.sin(
+                np.arctan(roi_parameter["dist"] * self.pixel_size / self.det_dist)
+            )
+            return qlist, np.where((qlist >= qmax) | (y <= 0), np.nan, y)
+
+        rmin, rmax = sorted(roi_parameter["radius"])  # pixels
+        annulus = (r_pixel >= rmin) & (r_pixel < rmax) & (mask > 0)
+        if not annulus.any():
+            logger.warning(f"Ring ROI radius {(rmin, rmax)} contains no pixels")
+            return np.empty(0), np.empty(0)
+        phi_min, phi_max = phi[annulus].min(), phi[annulus].max()
+        if phi_min == phi_max:
+            # zero angular span: a single angle bin holding the mean intensity
+            return np.array([phi_min]), np.array([np.mean(saxs[annulus.ravel()])])
+        index = ((phi - phi_min) / ((phi_max - phi_min) / phi_num)).astype(np.int64)
+        index = np.where(annulus, np.clip(index, 0, phi_num - 1) + 1, 0).ravel()
+        x = np.linspace(phi_min, phi_max, phi_num)  # degree
+        return x, self._binned_mean(index, saxs, phi_num, chunk)
 
     def get_roi_data(self, roi_parameter, phi_num=180):
-        # Monitor memory usage for ROI calculations
+        """Profile of a Pie ROI (I vs q [1/Angstrom]) or Ring ROI (I vs phi [degree]).
+
+        ``roi_parameter`` is a ROI descriptor from ``ImageViewDev.get_roi_list``:
+        Pie ``{"sl_type", "angle_range" [degree], "dist" [pixel]}`` and Ring
+        ``{"sl_type", "radius" [pixel]}``. Returns None for other ROI types.
+        """
         memory_before_mb, _ = MemoryMonitor.get_memory_usage()
 
         # Check if we should use streaming for very large datasets
@@ -2699,261 +2716,43 @@ class XpcsFile:
             streamed = self._get_roi_data_streaming(roi_parameter, phi_num)
             if streamed is not None:
                 return streamed
-            # the streaming path does not implement every ROI type (e.g. "Ring")
             logger.info(f"No streaming ROI for {roi_parameter['sl_type']}; using eager")
 
-        # Access qmap data directly from attributes
-        qmap = self.sqmap  # q map
-        pmap = self.spmap  # phi map (angle map)
-        rmap = np.sqrt(
-            (np.arange(self.mask.shape[1]) - self.bcx) ** 2
-            + (np.arange(self.mask.shape[0])[:, np.newaxis] - self.bcy) ** 2
-        )  # radius map
-
-        if roi_parameter["sl_type"] == "Pie":
-            pmin, pmax = roi_parameter["angle_range"]
-
-            # Vectorized angle wrapping - avoid in-place modification
-            pmap_work = pmap.copy() if pmax < pmin else pmap
-            if pmax < pmin:
-                pmax += 360.0
-                pmap_work = np.where(pmap_work < pmin, pmap_work + 360.0, pmap_work)
-
-            # Vectorized ROI selection using boolean operations
-            proi = (pmap_work >= pmin) & (pmap_work < pmax) & (self.mask > 0)
-
-            # Vectorized q-bin assignment using searchsorted for better performance
-            qsize = len(self.sqspan) - 1
-            qmap_idx = np.searchsorted(self.sqspan[1:], qmap, side="right")
-            qmap_idx = np.clip(qmap_idx, 0, qsize - 1) + 1  # 1-based indexing
-
-            # Apply ROI mask and flatten in one operation
-            qmap_idx_masked = np.where(proi, qmap_idx, 0).ravel()
-            saxs_data_flat = self.saxs_2d.ravel()
-
-            # Combined bincount operations with pre-allocated minlength
-            saxs_roi = np.bincount(qmap_idx_masked, saxs_data_flat, minlength=qsize + 1)
-            saxs_nor = np.bincount(qmap_idx_masked, minlength=qsize + 1)
-
-            # Vectorized normalization - avoid division by zero
-            saxs_nor = np.where(saxs_nor == 0, 1.0, saxs_nor)
-            saxs_roi = saxs_roi / saxs_nor
-
-            # Remove the 0th term
-            saxs_roi = saxs_roi[1:]
-
-            # Vectorized qmax cutoff calculation and application
-            dist = roi_parameter["dist"]
-            wlength = 12.398 / self.X_energy
-            # pixel_size and det_dist are both metres on the qmap
-            qmax = dist * self.pixel_size / self.det_dist * 2 * np.pi / wlength
-
-            # Vectorized masking instead of separate assignments
-            saxs_roi = np.where(
-                (self.sqlist >= qmax) | (saxs_roi <= 0), np.nan, saxs_roi
-            )
-            return self.sqlist, saxs_roi
-
-        if roi_parameter["sl_type"] == "Ring":
-            rmin, rmax = roi_parameter["radius"]
-            if rmin > rmax:
-                rmin, rmax = rmax, rmin
-
-            # Vectorized ring ROI selection
-            rroi = (rmap >= rmin) & (rmap < rmax) & (self.mask > 0)
-
-            # Get phi range more efficiently using masked operations
-            pmap_roi = pmap[rroi]
-            if pmap_roi.size == 0:
-                logger.warning(f"Ring ROI radius {(rmin, rmax)} contains no pixels")
-                return np.empty(0), np.empty(0)
-            phi_min, phi_max = np.min(pmap_roi), np.max(pmap_roi)
-            if phi_min == phi_max:
-                # zero angular span: a single angle bin holding the mean intensity
-                return np.array([phi_min]), np.array([np.mean(self.saxs_2d[rroi])])
-            x = np.linspace(phi_min, phi_max, phi_num)
-            delta = (phi_max - phi_min) / phi_num
-
-            # Vectorized index calculation with bounds checking
-            index = ((pmap - phi_min) / delta).astype(np.int64)
-            index = np.clip(index, 0, phi_num - 1) + 1
-
-            # Apply ROI mask and flatten in one operation
-            index_masked = np.where(rroi, index, 0).ravel()
-            saxs_data_flat = self.saxs_2d.ravel()
-
-            # Combined bincount operations with pre-allocated minlength
-            saxs_roi = np.bincount(index_masked, saxs_data_flat, minlength=phi_num + 1)
-            saxs_nor = np.bincount(index_masked, minlength=phi_num + 1)
-
-            # Vectorized normalization - avoid division by zero
-            saxs_nor = np.where(saxs_nor == 0, 1.0, saxs_nor)
-            saxs_roi = saxs_roi / saxs_nor
-
-            # Remove the 0th term
-            saxs_roi = saxs_roi[1:]
-
-            # Log memory usage for ROI operations
-            memory_after_mb, _ = MemoryMonitor.get_memory_usage()
-            memory_used = memory_after_mb - memory_before_mb
-            if memory_used > 5:  # Log if ROI calculation used significant memory
-                logger.debug(
-                    f"ROI calculation completed: {memory_used:.1f}MB memory used"
-                )
-
-            return x, saxs_roi
-        return None
+        result = self._roi_profile(roi_parameter, phi_num)
+        memory_used = MemoryMonitor.get_memory_usage()[0] - memory_before_mb
+        if memory_used > 5:  # Log if ROI calculation used significant memory
+            logger.debug(f"ROI calculation completed: {memory_used:.1f}MB memory used")
+        return result
 
     def _get_roi_data_streaming(self, roi_parameter, phi_num=180):
-        """
-        Memory-efficient streaming ROI calculation for large datasets.
+        """``get_roi_data`` with chunked histograms for very large SAXS images.
 
-        Uses streaming processing to calculate ROI data with reduced memory footprint.
+        Same result as the eager path; None for ROI types it does not cover.
         """
         logger.info("Starting streaming ROI calculation")
-
-        # Create ROI mask using existing vectorized approach
-        qmap = self.sqmap
-        pmap = self.spmap
-        rmap = np.sqrt(
-            (np.arange(self.mask.shape[1]) - self.bcx) ** 2
-            + (np.arange(self.mask.shape[0])[:, np.newaxis] - self.bcy) ** 2
-        )
-
-        if roi_parameter["sl_type"] == "Pie":
-            # Create the ROI mask (this doesn't use much memory)
-            pmin, pmax = roi_parameter["angle_range"]
-            pmap_work = pmap.copy() if pmax < pmin else pmap
-            if pmax < pmin:
-                pmax += 360.0
-                pmap_work = np.where(pmap_work < pmin, pmap_work + 360.0, pmap_work)
-
-            roi_mask = (pmap_work >= pmin) & (pmap_work < pmax) & (self.mask > 0)
-
-            # Use streaming processor for ROI calculation
-            from .utils.streaming_processor import process_roi_streaming
-
-            # For SAXS 2D data, we need to add a time dimension for the streaming processor
-            saxs_with_time = self.saxs_2d[np.newaxis, ...]  # Add time dimension
-
-            process_roi_streaming(
-                data=saxs_with_time,
-                roi_mask=roi_mask,
-                chunk_size_mb=100.0,  # Conservative chunk size for ROI processing
-            )
-
-            # Process results to match expected output format
-            qsize = len(self.sqspan) - 1
-            qmap_idx = np.searchsorted(self.sqspan[1:], qmap, side="right")
-            qmap_idx = np.clip(qmap_idx, 0, qsize - 1) + 1
-
-            # Create binned ROI data using streaming results
-            roi_mask_indexed = np.where(roi_mask, qmap_idx, 0)
-
-            # Use streaming approach for binning if dataset is very large
-            saxs_roi = np.zeros(qsize)
-            saxs_nor = np.zeros(qsize)
-
-            # Process in chunks to avoid memory issues
-            chunk_size = max(1, min(1000000, self.saxs_2d.size // 10))  # Adaptive
-            flat_saxs = self.saxs_2d.ravel()
-            flat_mask = roi_mask_indexed.ravel()
-
-            for start_idx in range(0, len(flat_saxs), chunk_size):
-                end_idx = min(start_idx + chunk_size, len(flat_saxs))
-
-                chunk_saxs = flat_saxs[start_idx:end_idx]
-                chunk_mask = flat_mask[start_idx:end_idx]
-
-                # Accumulate bincount results
-                chunk_roi = np.bincount(chunk_mask, chunk_saxs, minlength=qsize + 1)
-                chunk_nor = np.bincount(chunk_mask, minlength=qsize + 1)
-
-                saxs_roi += chunk_roi[1:]  # Remove 0th term
-                saxs_nor += chunk_nor[1:]
-
-            # Vectorized normalization
-            saxs_nor = np.where(saxs_nor == 0, 1.0, saxs_nor)
-            saxs_roi = saxs_roi / saxs_nor
-
-            # Apply qmax cutoff
-            dist = roi_parameter["dist"]
-            wlength = 12.398 / self.X_energy
-            # pixel_size and det_dist are both metres on the qmap
-            qmax = dist * self.pixel_size / self.det_dist * 2 * np.pi / wlength
-
-            # Same output contract as the eager path: q axis is sqlist and
-            # cut-off / non-positive bins are NaN.
-            saxs_roi = np.where(
-                (self.sqlist >= qmax) | (saxs_roi <= 0), np.nan, saxs_roi
-            )
-            logger.info("Streaming ROI calculation completed")
-            return self.sqlist, saxs_roi
-
-        if roi_parameter["sl_type"] == "Phi_ring":
-            # Similar streaming approach for phi_ring ROI
-            rmin, rmax = roi_parameter["r_range"]
-            roi_mask = (rmap >= rmin) & (rmap < rmax) & (self.mask > 0)
-
-            # Streaming processing for phi_ring
-            phi_center = np.degrees(
-                np.arctan2(
-                    np.arange(self.mask.shape[0])[:, np.newaxis] - self.bcy,
-                    np.arange(self.mask.shape[1]) - self.bcx,
-                )
-            )
-            phi_center = np.where(phi_center < 0, phi_center + 360, phi_center)
-
-            phi_step = 360.0 / phi_num
-            phi_index = np.floor(phi_center / phi_step).astype(int)
-            phi_index = np.clip(phi_index, 0, phi_num - 1) + 1
-
-            # Streaming bincount for phi_ring
-            saxs_roi = np.zeros(phi_num)
-            saxs_nor = np.zeros(phi_num)
-
-            chunk_size = min(1000000, self.saxs_2d.size // 10)
-            flat_saxs = self.saxs_2d.ravel()
-            flat_phi_idx = np.where(roi_mask, phi_index, 0).ravel()
-
-            for start_idx in range(0, len(flat_saxs), chunk_size):
-                end_idx = min(start_idx + chunk_size, len(flat_saxs))
-
-                chunk_saxs = flat_saxs[start_idx:end_idx]
-                chunk_phi = flat_phi_idx[start_idx:end_idx]
-
-                chunk_roi = np.bincount(chunk_phi, chunk_saxs, minlength=phi_num + 1)
-                chunk_nor = np.bincount(chunk_phi, minlength=phi_num + 1)
-
-                saxs_roi += chunk_roi[1:]
-                saxs_nor += chunk_nor[1:]
-
-            saxs_nor = np.where(saxs_nor == 0, 1.0, saxs_nor)
-            saxs_roi = saxs_roi / saxs_nor
-
-            x = np.arange(phi_num) * phi_step + phi_step / 2
-            logger.info("Streaming phi_ring ROI calculation completed")
-            return x, saxs_roi
-
-        return None
+        chunk = max(1, min(1_000_000, np.asarray(self.saxs_2d).size // 10))
+        return self._roi_profile(roi_parameter, phi_num, chunk)
 
     def export_saxs1d(self, roi_list, folder):
         # export ROI
         for idx, roi in enumerate(roi_list):
+            profile = self.get_roi_data(roi)
+            if profile is None:
+                logger.warning(f"ROI type {roi['sl_type']} cannot be exported; skipped")
+                continue
             fname = os.path.join(
                 folder, self.label + "_" + roi["sl_type"] + f"_{idx:03d}.txt"
             )
-            x, y = self.get_roi_data(roi)
             if roi["sl_type"] == "Ring":
                 header = "phi(degree) Intensity"
             else:
-                header = "q(1/Angstron) Intensity"
-            np.savetxt(fname, np.vstack([x, y]).T, header=header)
+                header = "q(1/Angstrom) Intensity"
+            np.savetxt(fname, np.vstack(profile).T, header=header)
 
         # export all saxs1d
         fname = os.path.join(folder, self.label + "_" + "saxs1d.txt")
         Iq, q = self.saxs_1d["Iq"], self.saxs_1d["q"]
-        header = "q(1/Angstron) Intensity"
+        header = "q(1/Angstrom) Intensity"
         for n in range(Iq.shape[0] - 1):
             header += f" Intensity_phi{n + 1:03d}"
         np.savetxt(fname, np.vstack([q, Iq]).T, header=header)
