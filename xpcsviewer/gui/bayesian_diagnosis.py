@@ -655,15 +655,45 @@ class BayesianDiagnosisWindow(QMainWindow):
             return
         if not self._claim(self._new_guard(), path, "traces"):
             return
+        # One rule with the All-Q writer (fitting.viz.export_bayesian_diagnostics):
+        # a file carries ``bin_status`` (and the bin's identity). The All-Q export
+        # leaves non-converged posteriors out; this window exists to DIAGNOSE one,
+        # so it writes it, but only marked ``not_converged``, and says so.
+        from xpcsviewer.fitting.viz import _tagged
+
+        converged = bool(self._result.diagnostics.converged)
+        attrs: dict[str, Any] = {"bin_status": "ok" if converged else "not_converged"}
+        ident = self._identity
+        if ident is not None and ident.bin_id is not None:
+            try:
+                attrs["bin_id"] = int(ident.bin_id)  # type: ignore[call-overload]
+            except (TypeError, ValueError):
+                pass
+        if self._q_value is not None:
+            attrs["q_value"] = float(self._q_value)
+        data = _tagged(self._result.arviz_data, attrs)
+        if getattr(data, "attrs", {}).get("bin_status") != attrs["bin_status"]:
+            # the posterior could not be tagged: never write an unmarked file
+            logger.error("Export Traces refused: the posterior cannot be tagged")
+            self.statusBar().showMessage(
+                "Export refused: the traces cannot be marked with their status", 10000
+            )
+            return
         try:
-            self._result.arviz_data.to_netcdf(path)
+            data.to_netcdf(path)
         except ValueError as e:  # xarray: no netCDF backend installed
             logger.warning("netCDF export needs netCDF4 or h5netcdf: %s", e)
             self.setWindowTitle(
                 f"{self.windowTitle()} — netCDF export needs netCDF4 or h5netcdf"
             )
             return
-        logger.info("Exported ArviZ traces to %s", path)
+        logger.info("Exported ArviZ traces to %s (%s)", path, attrs["bin_status"])
+        if not converged:
+            self.statusBar().showMessage(
+                "Traces exported and marked bin_status=not_converged: "
+                "not a measurement (diagnosis only)",
+                10000,
+            )
 
     def closeEvent(self, event: Any) -> None:
         """Clean up matplotlib figures to avoid memory leaks."""

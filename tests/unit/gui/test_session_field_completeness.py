@@ -22,6 +22,12 @@ _NO_WIDGET_FIELDS = frozenset(
         "diffusion_model",
         "twotime_symmetric",
         "qmap_show_rings",
+        # legacy flags never read from a widget; the SAXS scale choices are
+        # saved as saxs2d_type / saxs1d_type (mapped). g2_q_index: no widget.
+        "saxs2d_log_scale",
+        "saxs1d_log_x",
+        "saxs1d_log_y",
+        "g2_q_index",
     }
 )
 
@@ -59,6 +65,10 @@ def _get_collect_state_keywords() -> set[str]:
                 if kw.arg is not None:
                     keywords.add(kw.arg)
 
+    # Round 6: collect and restore share ONE table of (field, widget, ...) rows
+    from xpcsviewer.xpcs_viewer import _SESSION_CONTROLS
+
+    keywords |= {row[0] for row in _SESSION_CONTROLS}
     return keywords
 
 

@@ -147,7 +147,8 @@ def compute_center_from_ring(
 
     Args:
         image: 2D detector image with diffraction ring
-        mask: Optional boolean mask (True = valid pixels)
+        mask: Optional boolean mask (True = valid pixels); non-finite image
+            pixels are always ignored
         intensity_threshold: Threshold for detecting ring pixels.
             If None, uses mean + 2*std.
         initial_center: Initial guess. If None, uses image center.
@@ -158,15 +159,20 @@ def compute_center_from_ring(
     Raises:
         ValueError: If no ring pixels detected or insufficient points.
     """
-    # Apply mask
+    # Only finite, unmasked samples take part: one inf would set the threshold
+    # (mean + 2 std) to inf/nan and itself be a ring candidate.
+    usable = np.isfinite(image)
     if mask is not None:
-        valid_image = np.where(mask, image, np.nan)
-    else:
-        valid_image = image.copy()
+        usable &= np.asarray(mask, dtype=bool)
+    valid_image = np.where(usable, image, np.nan)
 
     # Determine threshold
     if intensity_threshold is None:
-        valid_values = valid_image[~np.isnan(valid_image)]
+        valid_values = valid_image[usable]
+        if valid_values.size == 0:
+            raise ValueError(
+                "Insufficient ring pixels detected (0). No finite unmasked pixels."
+            )
         intensity_threshold = float(np.mean(valid_values) + 2 * np.std(valid_values))
 
     # Find ring pixels

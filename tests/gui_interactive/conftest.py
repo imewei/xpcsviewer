@@ -318,71 +318,54 @@ def temp_hdf5_files(tmp_path):
 @pytest.fixture
 def mock_viewer_kernel(mock_xpcs_file):
     """Create a mock ViewerKernel instance."""
-    with patch("xpcsviewer.viewer_kernel.ViewerKernel.__init__", return_value=None):
-        mock_kernel = ViewerKernel.__new__(ViewerKernel)
-        mock_kernel.flist = [mock_xpcs_file]
-        mock_kernel.current_file = mock_xpcs_file  # This will allow tests to patch it
-        mock_kernel.path = str(Path(mock_xpcs_file.fname).parent)
-        # Import ListDataModel for proper Qt model compatibility
-        from xpcsviewer.helper.listmodel import ListDataModel
+    # A properly initialised kernel: __init__ builds the locator state (cache,
+    # revisions, lock, qmap manager) and the kernel's own state, so a later
+    # change to either cannot leave this fixture behind.
+    mock_kernel = ViewerKernel(str(Path(mock_xpcs_file.fname).parent))
+    mock_kernel.flist = [mock_xpcs_file]
+    mock_kernel.current_file = mock_xpcs_file  # This will allow tests to patch it
+    # Import ListDataModel for proper Qt model compatibility
+    from xpcsviewer.helper.listmodel import ListDataModel
 
-        # Create proper Qt models instead of Python lists
-        mock_kernel.target = ListDataModel([mock_xpcs_file])
-        mock_kernel.source = ListDataModel([])
-        mock_kernel.source_search = ListDataModel([])  # Add missing attribute
-        mock_kernel.cache = {}  # Add cache attribute for FileLocator compatibility
-        # Add qmap_manager/_cache_lock for FileLocator compatibility (needed by
-        # add_target(), which _restore_session() calls whenever a persisted
-        # session exists).
-        mock_kernel.qmap_manager = QMapManager()
-        mock_kernel._cache_lock = threading.Lock()
-        mock_kernel.timestamp = "test_timestamp_123"  # Add missing timestamp attribute
-        mock_kernel._current_dset_cache = {}  # Add missing current dataset cache
-        mock_kernel._dset_cache_lock = threading.Lock()  # Add missing dset cache lock
-        mock_kernel.statusbar = None  # Add missing ViewerKernel.__init__ attribute
-        mock_kernel.avg_worker_active = {}  # Add missing ViewerKernel.__init__ attribute
-        mock_kernel._plot_kwargs_record = {}  # Add missing ViewerKernel.__init__ attribute
-        mock_kernel._memory_cleanup_threshold = (
-            0.8  # Add missing ViewerKernel.__init__ attribute
+    mock_kernel.target = ListDataModel([mock_xpcs_file])
+    mock_kernel.timestamp = "test_timestamp_123"
+    mock_kernel.meta = {"saxs1d_bkg_xf": None}
+
+    # Mock common methods
+    mock_kernel.update_file_list = Mock()
+    mock_kernel.load_file = Mock()
+    mock_kernel.load_files = Mock()  # Add missing method for multiple file loading
+    mock_kernel.set_current_file = Mock()
+    mock_kernel.build = Mock()  # Add build method to prevent FileNotFoundError
+    mock_kernel.get_xf_list = Mock(
+        return_value=[mock_xpcs_file]
+    )  # Return non-empty list
+    mock_kernel._get_cached_dataset = Mock(
+        return_value=mock_xpcs_file
+    )  # Add missing cache method
+
+    # Mock all plotting operations to prevent timeouts during tab switching
+    # Return proper data structure: (qd, tel) where tel is list of time arrays
+    mock_kernel.plot_g2 = Mock(
+        return_value=(
+            np.array([1, 2, 3]),  # qd - q values
+            [
+                np.logspace(-6, 2, 50),
+                np.logspace(-6, 2, 50),
+            ],  # tel - list of time arrays
         )
-        mock_kernel.avg_worker = None
-        mock_kernel.meta = {"saxs1d_bkg_xf": None}  # Add missing meta attribute
+    )
+    mock_kernel.plot_saxs2d = Mock()
+    mock_kernel.plot_saxs1d = Mock()
+    mock_kernel.plot_qmap = Mock()
+    mock_kernel.plot_tauq = Mock()
+    mock_kernel.plot_tauq_pre = Mock()
+    mock_kernel.plot_twotime = Mock(return_value=["label1", "label2"])
+    mock_kernel.plot_intt = Mock()
+    mock_kernel.plot_stability = Mock()
+    mock_kernel.plot_diffusion = Mock()
 
-        # Mock common methods
-        mock_kernel.update_file_list = Mock()
-        mock_kernel.load_file = Mock()
-        mock_kernel.load_files = Mock()  # Add missing method for multiple file loading
-        mock_kernel.set_current_file = Mock()
-        mock_kernel.build = Mock()  # Add build method to prevent FileNotFoundError
-        mock_kernel.get_xf_list = Mock(
-            return_value=[mock_xpcs_file]
-        )  # Return non-empty list
-        mock_kernel._get_cached_dataset = Mock(
-            return_value=mock_xpcs_file
-        )  # Add missing cache method
-
-        # Mock all plotting operations to prevent timeouts during tab switching
-        # Return proper data structure: (qd, tel) where tel is list of time arrays
-        mock_kernel.plot_g2 = Mock(
-            return_value=(
-                np.array([1, 2, 3]),  # qd - q values
-                [
-                    np.logspace(-6, 2, 50),
-                    np.logspace(-6, 2, 50),
-                ],  # tel - list of time arrays
-            )
-        )
-        mock_kernel.plot_saxs2d = Mock()
-        mock_kernel.plot_saxs1d = Mock()
-        mock_kernel.plot_qmap = Mock()
-        mock_kernel.plot_tauq = Mock()
-        mock_kernel.plot_tauq_pre = Mock()
-        mock_kernel.plot_twotime = Mock(return_value=["label1", "label2"])
-        mock_kernel.plot_intt = Mock()
-        mock_kernel.plot_stability = Mock()
-        mock_kernel.plot_diffusion = Mock()
-
-        return mock_kernel
+    return mock_kernel
 
 
 # ============================================================================

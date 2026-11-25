@@ -5,6 +5,7 @@ with XPCS Viewer.
 """
 
 import logging
+import os
 from pathlib import Path
 from typing import Any, Literal
 from uuid import uuid4
@@ -55,6 +56,7 @@ from xpcsviewer.simplemask.raw_file_worker import (
 from xpcsviewer.simplemask.reader.formats import HDF5_SUFFIXES
 from xpcsviewer.simplemask.simplemask_kernel import SimpleMaskKernel
 from xpcsviewer.simplemask.ui.simplemask_ui import setup_ui
+from xpcsviewer.utils.export_guard import ExportCollisionError, ExportGuard
 
 logger = logging.getLogger(__name__)
 
@@ -375,11 +377,14 @@ class SimpleMaskWindow(QMainWindow):
             self.mark_unsaved()
 
         if action == "reset":
-            # After reset, mask returns to initial (all-True) state;
-            # disable overlay since there's nothing to visualize
-            self._show_mask_overlay = False
-            self.action_toggle_mask.setChecked(False)
-            self.action_toggle_mask.setText("Show Mask")
+            if self.kernel.mask is not None and not self.kernel.mask.all():
+                # The initial state is the file's own mask: keep showing it.
+                self._ensure_mask_overlay_visible()
+            else:
+                # All-True initial state: nothing to visualize
+                self._show_mask_overlay = False
+                self.action_toggle_mask.setChecked(False)
+                self.action_toggle_mask.setText("Show Mask")
             self._refresh_mask_display()
             self.status_bar.showMessage("Mask reset to initial state")
             logger.info("Mask reset to initial state")
@@ -415,15 +420,57 @@ class SimpleMaskWindow(QMainWindow):
         if not file_path:
             return
 
-        # Ensure .h5 extension
+        # Resolve the final name first: the checks below are about this file,
+        # not about the name the dialog confirmed.
+        confirmed = file_path
         if not file_path.endswith((".h5", ".hdf5")):
             file_path += ".h5"
 
-        self.kernel.save_mask(file_path)
+        inputs = self._protected_paths()
+        try:
+            ExportGuard(inputs).claim(file_path, "mask")
+        except ExportCollisionError as exc:
+            self._report_failed_save("mask", file_path, exc)
+            return
+
+        if file_path != confirmed and Path(file_path).exists():
+            # The file dialog only asked about the name without the extension.
+            reply = QMessageBox.question(
+                self,
+                "Overwrite File",
+                f"{Path(file_path).name} already exists.\n\nReplace it?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                self.status_bar.showMessage("Mask not saved")
+                return
+
+        try:
+            self.kernel.save_mask(file_path, input_paths=inputs)
+        except (OSError, ExportCollisionError) as exc:
+            self._report_failed_save("mask", file_path, exc)
+            return
+
         self._last_save_path = file_path
         self.mark_saved()
         self.status_bar.showMessage(f"Mask saved to {Path(file_path).name}")
         logger.info(f"Saved mask to {file_path}")
+
+    def _protected_paths(self) -> list[str]:
+        """Files the editor or the viewer has open: no export may write to them."""
+        paths = [self._raw_source_path] if self._raw_source_path else []
+        vk = getattr(self.parent_viewer, "vk", None)
+        if vk is not None:
+            paths += [os.path.join(vk.path, name) for name in vk.target.copy()]
+            paths += list(vk.cache)
+        return paths
+
+    def _report_failed_save(self, what: str, destination: str, exc: Exception) -> None:
+        """Say which destination failed; the edits stay unsaved."""
+        reason = getattr(exc, "strerror", None) or str(exc)
+        logger.error(f"Failed to save {what} to {destination}: {exc}")
+        self.status_bar.showMessage(f"Could not save {what} to {destination}: {reason}")
 
     def _on_load_mask(self) -> None:
         """Handle load mask action with file dialog and validation."""
@@ -1330,6 +1377,10 @@ class SimpleMaskWindow(QMainWindow):
 
             # Display the image
             self._display_image(detector_image)
+            if self.kernel.mask is not None and not self.kernel.mask.all():
+                # Seeded with the file's own exclusions: show them from the start.
+                self._ensure_mask_overlay_visible()
+                self._refresh_mask_display()
 
             # Update info label
             shape = detector_image.shape

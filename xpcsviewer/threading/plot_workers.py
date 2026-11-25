@@ -219,6 +219,8 @@ class G2PlotWorker(BaseAsyncWorker):
         if not bounds or not fit_flag or not any(fit_flag):
             return None
 
+        from ..module import g2mod
+
         fit_results: list = []
         total_files = len(xf_list)
 
@@ -227,8 +229,12 @@ class G2PlotWorker(BaseAsyncWorker):
             self.emit_status(f"Fitting file {i + 1}/{total_files}: {xf.label}")
 
             try:
+                # q_range is in the first file's unit (g2mod.get_data's rule)
+                own_range = g2mod.q_range_in_file_unit(
+                    xf, q_range, g2mod._shared_q_axis(xf_list)
+                )
                 fit_results.append(
-                    xf.fit_g2(q_range, t_range, bounds, fit_flag, fit_func)
+                    xf.fit_g2(own_range, t_range, bounds, fit_flag, fit_func)
                 )
             except Exception as e:
                 logger.warning(f"G2 fitting failed for {xf.label}: {e}")

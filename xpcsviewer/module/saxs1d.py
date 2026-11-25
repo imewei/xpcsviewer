@@ -16,6 +16,7 @@ import numpy as np
 import pyqtgraph as pg
 
 from xpcsviewer.backends._conversions import ensure_numpy
+from xpcsviewer.fileIO.qmap_utils import convert_q
 from xpcsviewer.utils.logging_config import get_logger
 
 from ..plothandler.plot_constants import get_color_marker
@@ -361,19 +362,41 @@ def pg_plot(
 
     plot_id = 0
     xlabel, ylabel = None, None
+    # One axis for every curve: the (name, unit) of the first plotted file. The
+    # q range, the plotted q and the q^2 / q^4 weighting are all in that unit.
+    display = None
 
     # Batch data extraction for parallel processing potential
     plot_data = []
     for n, fi in enumerate(xf_list):
         try:
+            axis = fi._static_axis() if hasattr(fi, "_static_axis") else None
+            scale, q_range = 1.0, (qmin, qmax)
+            if display is not None and axis is not None and axis[1] != display[1]:
+                try:
+                    scale = float(convert_q(1.0, axis[1], display[1]))
+                    q_range = tuple(convert_q(q_range, display[1], axis[1]))
+                except ValueError:
+                    logger.warning(
+                        f"SAXS 1D: skipping {fi.label}: its q axis is {axis[0]} in "
+                        f"{axis[1]}, which cannot be shown on the {display[0]} in "
+                        f"{display[1]} axis of the first plotted file"
+                    )
+                    continue
             q, Iq, xlabel, ylabel = fi.get_saxs1d_data(
                 bkg_xf=bkg_file,
                 bkg_weight=weight,
-                qrange=(qmin, qmax),
+                qrange=q_range,
                 sampling=sampling,
                 norm_method=norm_method,
                 use_absolute_crosssection=absolute_crosssection,
             )
+            if display is None:
+                display = axis
+            if scale != 1.0:
+                # q is stored in the file's unit; Iq*q^k was weighted with it too
+                q = q * scale
+                Iq = Iq * scale ** {"q2": 2, "q4": 4}.get(norm_method, 0)
 
             # Vectorized intensity offset application
             if plot_offset > 0:
@@ -421,7 +444,9 @@ def pg_plot(
             else "Intensity (photon/pixel/frame)"
         )
 
-    # Set labels efficiently
+    # Set labels efficiently; the axis is the first plotted file's, never the last's
+    if display is not None:
+        xlabel = f"{display[0]} ({display[1]})"
     if xlabel:
         plot_item.setLabel("bottom", xlabel)
     if ylabel:

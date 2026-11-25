@@ -12,6 +12,7 @@ Scientific testing approach:
 from unittest.mock import MagicMock
 
 import numpy as np
+import pyqtgraph as pg
 import pytest
 
 # Tests that require Qt GUI - marked for conditional execution
@@ -30,6 +31,7 @@ class TestRectangleScaleHandles:
         kernel.hdl = MagicMock()
         kernel.hdl.add_item = MagicMock(return_value="roi_0")
         kernel.hdl.roi_items = {}
+        kernel.hdl.imageItem = pg.ImageItem()  # the real item maps pixel indices
         kernel.hdl.scene = MagicMock()
         kernel.hdl.scene.itemsBoundingRect = MagicMock(return_value=MagicMock())
         kernel.shape = (512, 512)
@@ -125,6 +127,7 @@ class TestEllipseScaleHandles:
         kernel.hdl = MagicMock()
         kernel.hdl.add_item = MagicMock(return_value="roi_0")
         kernel.hdl.roi_items = {}
+        kernel.hdl.imageItem = pg.ImageItem()  # the real item maps pixel indices
         kernel.hdl.scene = MagicMock()
         kernel.shape = (512, 512)
         kernel.metadata = {"bcx": 256, "bcy": 256}
@@ -205,6 +208,7 @@ class TestCircleScaleHandles:
         kernel.hdl = MagicMock()
         kernel.hdl.add_item = MagicMock(return_value="roi_0")
         kernel.hdl.roi_items = {}
+        kernel.hdl.imageItem = pg.ImageItem()  # the real item maps pixel indices
         kernel.hdl.scene = MagicMock()
         kernel.shape = (512, 512)
         kernel.metadata = {"bcx": 256, "bcy": 256}
@@ -296,6 +300,7 @@ class TestHandleScalingBehavior:
         kernel.hdl = MagicMock()
         kernel.hdl.add_item = MagicMock(return_value="roi_0")
         kernel.hdl.roi_items = {}
+        kernel.hdl.imageItem = pg.ImageItem()  # the real item maps pixel indices
         kernel.hdl.scene = MagicMock()
         kernel.shape = (512, 512)
         kernel.metadata = {"bcx": 256, "bcy": 256}

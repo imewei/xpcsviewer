@@ -55,7 +55,6 @@ from .fileIO.hdf_reader import (
 from .fileIO.hdf_reader_enhanced import get_enhanced_hdf5_reader
 from .fileIO.qmap_utils import Q_UNIT_DISPLAY, get_qmap
 from .module.twotime_utils import get_c2_stream, get_single_c2_from_hdf
-from .utils.exceptions import XPCSFileError, convert_exception
 from .utils.export_guard import ExportGuard
 from .utils.lazy_loader import LazyHDF5Array, get_lazy_loader
 from .utils.log_utils import log_timing
@@ -121,6 +120,34 @@ def _get_cached_singletons():
         _cached_lazy_loader,
         _cached_enhanced_hdf5_reader,
     )
+
+
+# Scalar metadata that real NeXus files store both as scalars and as one-element
+# arrays; load_data() collapses them so timing arithmetic and formatting see scalars.
+_SCALAR_FIELDS = (
+    "t0",
+    "t1",
+    "start_time",
+    "stride_frame",
+    "avg_frame",
+    "c2_stride_frame",
+    "c2_avg_frame",
+)
+_METADATA_ARRAY_LIMIT = 4096
+
+
+def _format_metadata_value(val):
+    """Value shown in the Dataset Details tree: scalars for one-element arrays and
+    bytes, a shape/dtype summary for arrays too large to display."""
+    if isinstance(val, np.ndarray) and val.size == 1:
+        val = val.item()  # any rank; keeps the stored type
+    if isinstance(val, np.generic):
+        val = val.item()
+    if isinstance(val, bytes):
+        return val.decode(errors="replace")
+    if isinstance(val, np.ndarray) and val.size > _METADATA_ARRAY_LIMIT:
+        return f"data size is too large: shape {val.shape}, dtype {val.dtype}"
+    return val
 
 
 def _tauq_failure() -> dict:
@@ -531,61 +558,16 @@ class XpcsFile:
         # avoid duplicated keys
         fields = list(set(fields))
 
-        # Use enhanced HDF5 reader for optimized batch reading
-        # Reuse the cached singleton set in __init__ to avoid repeated sys.modules lookups.
-        try:
-            enhanced_reader = self._hdf5_reader
-            if enhanced_reader is None:
-                raise AttributeError("No enhanced HDF5 reader available")
-            batch_cache_key = f"{self._cache_prefix}_batch_metadata"
+        # One batch read through the standard pooled API: it maps field aliases to
+        # NeXus paths, decodes bytes and raises on a missing field. (The enhanced
+        # reader's batch call takes raw dataset paths only and skips missing ones.)
+        ret = batch_read_fields(
+            self.fname, fields, "alias", ftype="nexus", use_pool=True
+        )
 
-            logger.debug(
-                f"Loading metadata fields using enhanced HDF5 reader: {fields}"
-            )
-            ret = enhanced_reader.read_multiple_datasets(
-                self.fname,
-                fields,
-                cache_key=batch_cache_key,
-                access_pattern="sequential",
-                use_aliases=True,
-            )
-
-        except (ImportError, ModuleNotFoundError, AttributeError) as e:
-            # Expected - enhanced reader not available, use fallback
-            logger.debug(
-                f"Enhanced HDF5 reader not available, using standard method: {e}"
-            )
-            ret = batch_read_fields(
-                self.fname, fields, "alias", ftype="nexus", use_pool=True
-            )
-        except (OSError, PermissionError) as e:
-            # File access issues - convert to XPCSFileError
-            raise XPCSFileError(
-                f"Failed to read metadata from HDF5 file: {e}", file_path=self.fname
-            ).add_recovery_suggestion("Check file permissions and disk space") from e
-        except Exception as enhanced_error:
-            # Unexpected enhanced reader errors - log and fallback
-            xpcs_error = convert_exception(
-                enhanced_error, "Enhanced HDF5 reader failed for metadata loading"
-            )
-            logger.warning(
-                f"Enhanced reader error: {xpcs_error}, falling back to standard method"
-            )
-            try:
-                ret = batch_read_fields(
-                    self.fname, fields, "alias", ftype="nexus", use_pool=True
-                )
-            except Exception as fallback_error:
-                # Both methods failed - this is critical
-                raise (
-                    XPCSFileError(
-                        "Both enhanced and standard HDF5 readers failed",
-                        file_path=self.fname,
-                    )
-                    .add_context("enhanced_error", str(enhanced_error))
-                    .add_context("fallback_error", str(fallback_error))
-                    .add_recovery_suggestion("Verify HDF5 file integrity")
-                ) from fallback_error
+        for name in _SCALAR_FIELDS:
+            if isinstance(ret.get(name), np.ndarray) and ret[name].size == 1:
+                ret[name] = _format_metadata_value(ret[name])
 
         if "Twotime" in self.atype:
             stride_frame = ret.pop("c2_stride_frame")
@@ -2975,12 +2957,7 @@ class XpcsFile:
     def get_pg_tree(self):
         data = self.load_data()
         for key, val in data.items():
-            if isinstance(val, np.ndarray):
-                if val.size > 4096:
-                    data[key] = "data size is too large"
-                # suqeeze one-element array
-                if val.size == 1:
-                    data[key] = float(val)
+            data[key] = _format_metadata_value(val)
         data["analysis_type"] = self.atype
         data["label"] = self.label
         tree = pg.DataTreeWidget(data=data)
@@ -3128,19 +3105,17 @@ class XpcsFile:
             if len(intensity_data) == 0:
                 return np.array([]), np.array([])
 
-            # Compute FFT
-            fft_values = np.fft.fft(intensity_data)
-            fft_magnitudes = np.abs(fft_values)
+            # f_k = k / (N * dt) in Hz, dt = t0 seconds per frame: the same interval
+            # intt.plot multiplies the frame index by for its time axis.
+            dt = float(np.asarray(self.t0).item())
+            if not np.isfinite(dt) or dt <= 0:
+                raise ValueError(f"frame time t0={dt} is not a positive number")
+            fft_magnitudes = np.abs(np.fft.rfft(intensity_data))
+            frequencies = np.fft.rfftfreq(len(intensity_data), d=dt)
 
-            # Create frequency array
-            n_samples = len(intensity_data)
-            sample_rate = 1.0  # Assuming 1 Hz sample rate, adjust if needed
-            frequencies = np.fft.fftfreq(n_samples, 1.0 / sample_rate)
-
-            # Take only positive frequencies
-            positive_freq_mask = frequencies > 0
-            frequencies = frequencies[positive_freq_mask]
-            fft_magnitudes = fft_magnitudes[positive_freq_mask]
+            # Drop the DC bin; rfft already holds only non-negative frequencies
+            frequencies = frequencies[1:]
+            fft_magnitudes = fft_magnitudes[1:]
 
             result = (frequencies, fft_magnitudes)
 

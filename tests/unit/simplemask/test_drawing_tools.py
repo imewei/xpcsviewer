@@ -147,9 +147,10 @@ class TestEraserTool:
         """Eraser tool should use Rectangle type."""
         assert ERASER_TOOL.tool_type == "Rectangle"
 
-    def test_eraser_inclusive_mode(self):
-        """Eraser tool should use inclusive mode."""
-        assert ERASER_TOOL.default_mode == "inclusive"
+    def test_eraser_erase_mode(self):
+        """Eraser removes from the drawn exclusions; "inclusive" would keep only
+        its region and mask the rest of the detector (R6-03)."""
+        assert ERASER_TOOL.default_mode == "erase"
 
     def test_eraser_has_shortcut(self):
         """Eraser tool should have keyboard shortcut."""

@@ -18,7 +18,9 @@ import pytest
 
 pytestmark = pytest.mark.unit
 
-T_EL = np.array([1e-3, 1e-2])
+# four delays: a single-exponential Bayesian fit needs >= 3 observations (R6-13)
+# and a test masks two of them in one bin
+T_EL = np.array([1e-3, 1e-2, 1e-1, 1.0])
 
 
 class _Stub(SimpleNamespace):
@@ -73,7 +75,13 @@ class FakeXf:
         self.fname = fname
         self.qmap = FakeQmap(q, phi)
         self.t_el = T_EL
-        self.g2 = np.array([[1.0, 1.4, 1.8], [0.9, 1.1, 1.6]]) if g2 is None else g2
+        self.g2 = (
+            np.array(
+                [[1.0, 1.4, 1.8], [0.9, 1.1, 1.6], [0.8, 1.05, 1.4], [0.7, 1.0, 1.3]]
+            )
+            if g2 is None
+            else g2
+        )
         self.g2_err = np.full_like(self.g2, 0.1)
 
     def get_g2_data(self, qrange=None, trange=None):
@@ -169,7 +177,7 @@ def test_r3_14_narrowed_q_range_does_not_alias_other_azimuth():
     bundle = st._update_g2_diagnosis.call_args[0][0]
     assert bundle.result is fit_result
     assert bundle.bin_id == 1
-    np.testing.assert_array_equal(bundle.y, [1.4, 1.1])
+    np.testing.assert_array_equal(bundle.y, [1.4, 1.1, 1.05, 1.0])
 
 
 def test_r3_14_store_is_keyed_by_file_and_absolute_bin():
@@ -187,7 +195,7 @@ def test_r3_14_diagnosis_shows_stored_observations_not_current_data():
     xf.g2 = xf.g2 + 5.0  # data of the same file/bin changed after the fit
     st._show_g2_diagnosis()
     bundle = st._update_g2_diagnosis.call_args[0][0]
-    np.testing.assert_array_equal(bundle.y, [1.4, 1.1])
+    np.testing.assert_array_equal(bundle.y, [1.4, 1.1, 1.05, 1.0])
     np.testing.assert_array_equal(bundle.x, T_EL)
 
 
@@ -197,7 +205,7 @@ def test_r3_14_bundle_observations_are_private_read_only_copies():
     _fit_current_bin(st)
     bundle = st._g2_bayesian_store[("A.h5", None, 1)]
     xf.g2[:, 1] = 0.0
-    np.testing.assert_array_equal(bundle.y, [1.4, 1.1])
+    np.testing.assert_array_equal(bundle.y, [1.4, 1.1, 1.05, 1.0])
     assert not bundle.y.flags.writeable
 
 
@@ -590,7 +598,7 @@ def test_r3_30_batch_results_commit_to_store_by_absolute_bin(qapp):
     assert sorted(st._g2_bayesian_store) == [("A.h5", None, 1), ("A.h5", None, 2)]
     assert "phi=90" in st._g2_bayesian_store[("A.h5", None, 2)].label
     np.testing.assert_array_equal(
-        st._g2_bayesian_store[("A.h5", None, 1)].y, [1.4, 1.1]
+        st._g2_bayesian_store[("A.h5", None, 1)].y, [1.4, 1.1, 1.05, 1.0]
     )
 
 
@@ -637,7 +645,7 @@ def test_r3_30_stored_observations_are_exactly_the_fitted_points(qapp):
         assert np.all(np.isfinite(fig.axes[0].get_xlim()))
         assert np.all(np.isfinite(fig.axes[0].get_ylim()))
         drawn = fig.axes[0].collections[0].get_offsets()
-        assert np.isfinite(drawn[:, 1]).sum() == 4  # 6 points, 2 not fitted
+        assert np.isfinite(drawn[:, 1]).sum() == 10  # 12 points, 2 not fitted
     finally:
         import matplotlib.pyplot as plt
 

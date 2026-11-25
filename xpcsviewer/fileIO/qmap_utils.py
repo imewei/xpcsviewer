@@ -76,6 +76,54 @@ def _decode_unit(raw: bytes) -> str:
     return _normalize_unit(decoded)
 
 
+# Reciprocal-length units a Q value can be converted between, as "how many of
+# this unit make one inverse Angstrom". 1 nm = 10 A, so 1 A^-1 = 1 / (0.1 nm)
+# = 10 nm^-1: a Q of 0.1 A^-1 is 1.0 nm^-1.
+_Q_UNITS_PER_INVERSE_ANGSTROM: dict[str, float] = {Q_UNIT_DISPLAY: 1.0, "nm⁻¹": 10.0}
+
+
+def convert_q(values, from_unit: str, to_unit: str):
+    """``values`` (a Q-like number or array) expressed in ``to_unit``.
+
+    Two spellings of the same unit are returned unchanged (as float), so a unit
+    that is not a reciprocal length (``px``, ``deg``, ...) converts only to
+    itself. Raises ``ValueError`` when the units differ and are not both
+    reciprocal lengths (Angstrom^-1 / nm^-1): there is no conversion between,
+    say, detector pixels and a scattering vector.
+    """
+    src, dst = _normalize_unit(str(from_unit)), _normalize_unit(str(to_unit))
+    arr = np.asarray(values, dtype=np.float64)
+    if src == dst:
+        return arr
+    a = _Q_UNITS_PER_INVERSE_ANGSTROM.get(src)
+    b = _Q_UNITS_PER_INVERSE_ANGSTROM.get(dst)
+    if a is None or b is None:
+        raise ValueError(
+            f"cannot convert {from_unit!r} to {to_unit!r}: not both reciprocal lengths"
+        )
+    return arr * b / a
+
+
+def map_axis(qmap, index: int = 0) -> tuple[str, str]:
+    """``(name, unit)`` of axis ``index`` of the file's Q map.
+
+    The file stores ONE ``map_names`` / ``map_units`` pair; it describes both
+    the static (SAXS) and the dynamic (G2, two-time) partition, so the static
+    and the dynamic axis of a file share a name and a unit. Falls back to ``q`` /
+    inverse Angstrom, axis 1 to ``phi`` / degree, only when the map carries none.
+    """
+    names = getattr(qmap, "map_names", None)
+    units = getattr(qmap, "map_units", None)
+    if not isinstance(names, (list, tuple, np.ndarray)):
+        names = None  # anything else carries no axis names
+    if not isinstance(units, (list, tuple, np.ndarray)):
+        units = None
+    default = (("q", Q_UNIT_DISPLAY), ("phi", "degree"))[min(index, 1)]
+    name = str(names[index]) if names is not None and len(names) > index else default[0]
+    unit = str(units[index]) if units is not None and len(units) > index else default[1]
+    return name, unit
+
+
 # Detector and beam constants
 DEFAULT_DETECTOR_SIZE = 1024
 DEFAULT_BEAM_CENTER = DEFAULT_DETECTOR_SIZE // 2  # 512
@@ -102,6 +150,8 @@ _QMAP_FILE_KEYS = (
     "map_names",
     "map_units",
 )
+# Scalar calibration fields a file may store as a one-element array.
+_SCALAR_CALIBRATION = ("bcx", "bcy", "pixel_size", "det_dist", "X_energy")
 # Detector-sized datasets: too large to read just to build a key. Their shape and
 # dtype are keyed; their content is covered by the stored partition hash.
 _QMAP_BULK_KEYS = frozenset({"mask", "dqmap", "sqmap"})
@@ -171,6 +221,10 @@ class QMapManager:
 
 
 class QMap:
+    #: True when the map is a substituted placeholder (the file's own map was
+    #: missing or could not be loaded), so its q / phi values are not the file's.
+    is_default = False
+
     def __init__(self, fname=None, root_key="/xpcs/qmap"):
         self.root_key = root_key
         self.fname = fname
@@ -225,6 +279,14 @@ class QMap:
                         )
                         info[key] = self._get_default_value(key)
 
+            # A scalar stored as a one-element array (any rank) is that scalar; a
+            # longer array raises here and is reported by the fallback below. The
+            # NumPy scalar (not .item()'s Python float) keeps the dtype semantics
+            # of a file that stores the same value as a scalar.
+            for key in _SCALAR_CALIBRATION:
+                if key in info and np.ndim(info[key]) > 0:
+                    info[key] = np.asarray(info[key]).reshape(())[()]
+
             # Post-process data after reading all at once
             # Handle division by zero for X_energy
             if info["X_energy"] != 0:
@@ -263,7 +325,11 @@ class QMap:
             return info
 
         except Exception as e:
-            logger.error(f"Failed to load qmap from {self.fname}: {e}")
+            logger.error(
+                f"Failed to load qmap from {self.fname}: {e!r}; substituting a "
+                "DEFAULT calibration and partition: its q / phi values are NOT "
+                "this file's (QMap.is_default)"
+            )
             return self._create_default_qmap()
 
     def _normalize_num_pts(self, num_pts, corresponding_list):
@@ -331,7 +397,11 @@ class QMap:
 
     def _create_default_qmap(self):
         """Create a minimal default qmap when file doesn't have qmap data."""
-        logger.info(f"Creating default qmap for {self.fname}")
+        logger.warning(
+            f"Using a DEFAULT qmap for {self.fname}: its calibration and q / phi "
+            "values are placeholders, not this file's"
+        )
+        self.is_default = True
 
         info = {}
         for key in [
@@ -402,7 +472,11 @@ class QMap:
         self.map_names = ["q", "phi"]
         self.map_units = [Q_UNIT_DISPLAY, "degree"]
         self.is_loaded = False
-        logger.warning(f"Created minimal fallback qmap for {self.fname}")
+        self.is_default = True
+        logger.error(
+            f"Created a minimal FALLBACK qmap for {self.fname}: a 10x10 detector "
+            "with placeholder calibration; its q / phi values are NOT this file's"
+        )
 
     def reshape_phi_analysis(self, compressed_data_raw, label="data", mode="saxs_1d"):
         """

@@ -18,6 +18,7 @@ import pyqtgraph as pg
 from numpy.typing import ArrayLike
 
 from xpcsviewer.backends._conversions import ensure_numpy
+from xpcsviewer.fileIO.qmap_utils import convert_q, map_axis
 from xpcsviewer.plothandler.plot_constants import MATPLOTLIB_COLORS_RGB as colors
 
 # Local imports
@@ -57,15 +58,47 @@ def get_positive_delay_extent(
     return (lower, upper) if lower <= upper else None
 
 
+def _shared_q_axis(xf_list) -> tuple[str, str]:
+    """``(name, unit)`` of the Q axis every G2 file is shown on: the first file's."""
+    return map_axis(getattr(xf_list[0], "qmap", None), 0)
+
+
+def q_range_in_file_unit(xf, q_range, shared):
+    """``q_range`` (given in the ``shared`` axis unit) in ``xf``'s own Q unit.
+
+    ``None`` stays ``None`` and a file already on the shared unit gets the very
+    same range back. Raises ``ValueError`` for a file whose dynamic axis has
+    another name or is not a reciprocal length convertible to ``shared``.
+    """
+    name, unit = map_axis(getattr(xf, "qmap", None), 0)
+    if name != shared[0]:
+        raise ValueError(f"its dynamic axis is {name!r}, not {shared[0]!r}")
+    convert_q(1.0, shared[1], unit)  # ValueError when the units are not compatible
+    if q_range is None or unit == shared[1]:
+        return q_range
+    lo, hi = convert_q(q_range, shared[1], unit)
+    return (float(lo), float(hi))
+
+
 def get_data(xf_list, q_range=None, t_range=None):
     """Extract G2 correlation data from a list of XpcsFile objects.
 
     Reads G2 correlation values, errors, delay times, and Q-values from
     each file, optionally filtered by Q-range and time-range.
 
+    All files are shown on ONE Q axis, the first file's (name and unit, e.g.
+    ``q`` in inverse Angstrom). ``q_range`` is read in that unit: it is
+    converted into each file's own unit before the file is queried, and the Q
+    values returned for the file are converted back. A file whose axis cannot
+    be converted (another axis name, or not a reciprocal length) is left out
+    with a warning that names it; to keep every list aligned with ``xf_list``
+    its entry is empty (no Q bins), which every renderer already draws as
+    "nothing".
+
     Args:
         xf_list: List of XpcsFile objects with correlation analysis data.
-        q_range: Optional (min, max) Q-value filter in inverse Angstroms.
+        q_range: Optional (min, max) Q-value filter in the first file's Q unit
+            (inverse Angstroms for APS files).
         t_range: Optional (min, max) delay time filter in seconds.
 
     Returns:
@@ -99,9 +132,35 @@ def get_data(xf_list, q_range=None, t_range=None):
     g2_err = [None] * num_files
     labels = [None] * num_files
 
+    shared = _shared_q_axis(xf_list) if num_files else None
+
     # Process all files - can potentially be parallelized
     for i, fc in enumerate(xf_list):
-        _q, _tel, _g2, _g2_err, _labels = fc.get_g2_data(qrange=q_range, trange=t_range)
+        try:
+            file_q_range = q_range_in_file_unit(fc, q_range, shared)
+        except ValueError as exc:
+            logger.warning(
+                "G2: left out %s: %s (the plot is on %s [%s] of %s)",
+                getattr(fc, "label", fc),
+                exc,
+                shared[0],
+                shared[1],
+                getattr(xf_list[0], "label", xf_list[0]),
+            )
+            q[i], tel[i], g2[i], g2_err[i], labels[i] = (
+                np.empty(0),
+                np.empty(0),
+                np.empty((0, 0)),
+                np.empty((0, 0)),
+                [],
+            )
+            continue
+        _q, _tel, _g2, _g2_err, _labels = fc.get_g2_data(
+            qrange=file_q_range, trange=t_range
+        )
+        own_unit = map_axis(getattr(fc, "qmap", None), 0)[1]
+        if own_unit != shared[1]:  # the file's own unit: back to the shared one
+            _q = convert_q(_q, own_unit, shared[1])
         q[i] = _q
         tel[i] = _tel
         g2[i] = _g2
@@ -539,11 +598,15 @@ def pg_plot(
         if show_fit:
             # Extract force_refit parameter from kwargs
             force_refit = kwargs.get("force_refit", False)
+            # the range is in the first file's unit: each file fits in its own
+            file_q_range = q_range_in_file_unit(
+                xf_list[m], q_range, _shared_q_axis(xf_list)
+            )
 
             if robust_fitting:
                 # Use robust fitting with diagnostics
                 fit_summary = xf_list[m].fit_g2_robust(
-                    q_range,
+                    file_q_range,
                     t_range,
                     bounds,
                     fit_flag,
@@ -555,7 +618,7 @@ def pg_plot(
             else:
                 # Use traditional fitting
                 fit_summary = xf_list[m].fit_g2(
-                    q_range,
+                    file_q_range,
                     t_range,
                     bounds,
                     fit_flag,

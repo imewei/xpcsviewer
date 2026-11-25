@@ -161,6 +161,7 @@ def _twotime_stub(qapp, resolved):
         checkBox_twotime_autolevel=MagicMock(),
         mp_2t_hdls={"tt": object()},
         _twotime_qbin_memory=OrderedDict(),
+        _twotime_qbin_bins=OrderedDict(),
         _twotime_last_fname="A.h5",
         _current_twotime_fname=lambda: "A.h5",
         get_selected_rows=lambda: [0],

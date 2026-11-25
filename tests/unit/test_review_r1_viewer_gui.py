@@ -293,7 +293,8 @@ def test_r1_17_simplemask_metadata_is_in_millimetres():
         X_energy=10.0,
     )
     stub = SimpleNamespace(
-        vk=SimpleNamespace(target=[0], get_xf_list=lambda: [xf]),
+        vk=SimpleNamespace(target=[0], get_xf_list=lambda rows=None: [xf]),
+        get_selected_rows=lambda: [0],  # the editor opens the highlighted target
     )
     _, meta = XpcsViewer._get_simplemask_data(stub)
     assert meta["det_dist"] == pytest.approx(5000.0)

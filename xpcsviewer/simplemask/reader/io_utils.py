@@ -22,16 +22,38 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
-def _cast_to_signed(arr: np.ndarray) -> np.ndarray:
-    """View an unsigned integer array as its signed counterpart.
+def decode_counts(arr: np.ndarray) -> np.ndarray:
+    """Decode raw detector counts without changing any ordinary count.
 
-    Preserves bit patterns so detector overflow values (e.g. 65535 for
-    uint16) become negative rather than staying as large positive counts.
+    Unsigned data is widened to ``int64`` (``float64`` for ``uint64``), which
+    holds every count of the source dtype, so a count such as 40000 in a
+    ``uint16`` frame stays 40000. Only the two reserved top codes of each
+    unsigned dtype (2^N-1 and 2^N-2, e.g. 65535 and 65534 for ``uint16``) are
+    the detector's bad-pixel / gap flags (ADEiger "Signed and unsigned data");
+    they are decoded to -1 and -2, which the display and the thresholds treat
+    as "no counts". Signed and floating-point data pass through unchanged.
     """
-    if arr.dtype.kind == "u":
-        signed_dtype = np.dtype(f"int{arr.dtype.itemsize * 8}")
-        return arr.view(signed_dtype.newbyteorder(arr.dtype.byteorder))
-    return arr
+    if arr.dtype.kind != "u":
+        return arr
+    top = int(np.iinfo(arr.dtype).max)
+    wide = arr.astype(np.float64 if arr.dtype.itemsize >= 8 else np.int64)
+    wide[arr >= top - 1] -= top + 1
+    return wide
+
+
+def sum_counts(frames: np.ndarray) -> np.ndarray:
+    """Per-pixel float64 sum over axis 0 of ``decode_counts(frames)``.
+
+    Equal to ``decode_counts(frames).sum(axis=0, dtype=np.float64)`` without
+    materialising a widened copy of the whole chunk: unsigned frames are summed
+    as they are in float64 and each reserved top code (2^N-1, 2^N-2) is
+    corrected to its decoded value (-1, -2), i.e. lowered by 2^N.
+    """
+    total = frames.sum(axis=0, dtype=np.float64)
+    if frames.dtype.kind == "u":
+        top = int(np.iinfo(frames.dtype).max)
+        total -= (top + 1.0) * np.count_nonzero(frames >= top - 1, axis=0)
+    return cast(np.ndarray, total)
 
 
 def process_chunk(
@@ -39,8 +61,7 @@ def process_chunk(
 ) -> np.ndarray:
     """Return the per-pixel float64 sum over ``[start_idx, end_idx)`` of a dataset."""
     with h5py.File(file_path, "r") as f:
-        chunk = _cast_to_signed(f[dataset_name][start_idx:end_idx])
-        return cast(np.ndarray, np.sum(chunk, axis=0, dtype=np.float64))
+        return sum_counts(f[dataset_name][start_idx:end_idx])
 
 
 def resolve_frame_range(
@@ -109,9 +130,7 @@ def average_frames_parallel(
             for start in range(start_frame, stop, chunk_size):
                 if check_cancelled is not None:
                     check_cancelled()
-                total += _cast_to_signed(
-                    dataset[start : min(start + chunk_size, stop)]
-                ).sum(axis=0, dtype=np.float64)
+                total += sum_counts(dataset[start : min(start + chunk_size, stop)])
             total /= num_frames
             return total.astype(np.float32)
 

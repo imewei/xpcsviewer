@@ -366,6 +366,7 @@ class MaskAssemble:
         saxs_lin: np.ndarray | None = None,
         qmap: dict[str, np.ndarray] | None = None,
         max_history: int = 50,
+        initial_mask: np.ndarray | None = None,
     ) -> None:
         """Initialize mask assembly with detector shape and optional data.
 
@@ -376,6 +377,8 @@ class MaskAssemble:
             max_history: Maximum number of undo steps to retain. Older entries are
                 dropped when the limit is reached to prevent unbounded memory growth
                 (a 2048×2048 boolean mask costs ~4 MB per step).
+            initial_mask: Boolean array of ``shape`` (True = valid) that is the
+                base state: undo and reset stop here, not at an all-valid mask.
         """
         self.workers: dict[str, Any] = {
             "mask_blemish": MaskFile(shape),
@@ -392,13 +395,14 @@ class MaskAssemble:
         self.max_history = max_history
 
         # Initialize mask history for undo/redo
-        initial_mask = (
-            np.ones_like(saxs_lin, dtype=bool)
-            if saxs_lin is not None
-            else np.ones(shape, dtype=bool)
-        )
-        self.mask_record: list[np.ndarray] = [initial_mask]
-        self.layer_record: list[dict[str, np.ndarray]] = [{"accumulated": initial_mask}]
+        if initial_mask is not None:
+            base = np.array(initial_mask, dtype=bool)
+        elif saxs_lin is not None:
+            base = np.ones_like(saxs_lin, dtype=bool)
+        else:
+            base = np.ones(shape, dtype=bool)
+        self.mask_record: list[np.ndarray] = [base]
+        self.layer_record: list[dict[str, np.ndarray]] = [{"accumulated": base}]
         self.mask_ptr = 0
         # 0: no mask; 1: apply the default mask
         self.mask_ptr_min = 0
@@ -523,6 +527,10 @@ class MaskAssemble:
         if ptr < len(self.layer_record):
             return self.layer_record[ptr]
         return {"accumulated": self.mask_record[ptr]}
+
+    def current_layer(self, name: str) -> np.ndarray | None:
+        """The layer ``name`` of the current history state (None if never applied)."""
+        return self._layers_at(self.mask_ptr).get(name)
 
     def get_one_mask(self, target: str) -> np.ndarray:
         """Get mask from a single worker.

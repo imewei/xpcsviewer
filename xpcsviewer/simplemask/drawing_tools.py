@@ -21,7 +21,7 @@ class DrawingTool:
         icon: Icon name (for future icon support)
         shortcut: Keyboard shortcut
         tooltip: Tooltip text
-        default_mode: Default mask mode (exclusive/inclusive)
+        default_mode: Default mask mode (exclusive/inclusive/erase)
     """
 
     name: str
@@ -29,7 +29,7 @@ class DrawingTool:
     icon: str
     shortcut: str | None
     tooltip: str
-    default_mode: Literal["exclusive", "inclusive"] = "exclusive"
+    default_mode: Literal["exclusive", "inclusive", "erase"] = "exclusive"
     cursor: Qt.CursorShape = Qt.CursorShape.CrossCursor
 
 
@@ -78,21 +78,22 @@ DRAWING_TOOLS = {
 }
 
 
-# Eraser tool (uses inclusive mode to remove from mask)
+# Eraser tool ("erase" mode: removes its region from the drawn exclusions)
 ERASER_TOOL = DrawingTool(
     name="Eraser",
     tool_type="Rectangle",
     icon="eraser",
     shortcut="X",
-    tooltip="Erase mask region (X) - removes pixels from mask",
-    default_mode="inclusive",
+    tooltip="Erase mask region (X) - removes pixels from the drawn mask",
+    default_mode="erase",
 )
 
 
 # Drawing tool colors by mode
 TOOL_COLORS = {
     "exclusive": "r",  # Red for exclusion (masking)
-    "inclusive": "g",  # Green for inclusion (erasing)
+    "inclusive": "g",  # Green for inclusion
+    "erase": "g",  # Green for erasing
 }
 
 
@@ -109,7 +110,7 @@ def get_tool_color(mode: str) -> str:
     """Get the pen color for a mask mode.
 
     Args:
-        mode: "exclusive" or "inclusive"
+        mode: "exclusive", "inclusive" or "erase"
 
     Returns:
         Color string for pen

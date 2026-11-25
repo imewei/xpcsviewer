@@ -44,10 +44,12 @@ class AnalysisParameters:
     saxs2d_colormap: str = "viridis"
     saxs2d_auto_level: bool = True
     saxs2d_log_scale: bool = False
+    saxs2d_type: str = ""  # cb_saxs2D_type text ("log" / "linear")
 
     # Tab 1: SAXS 1D
     saxs1d_log_x: bool = False
     saxs1d_log_y: bool = True
+    saxs1d_type: str = ""  # cb_saxs_type text ("I - q", ...)
 
     # Tab 2: Stability
     stability_metric: str = "mean"
@@ -91,6 +93,10 @@ class SessionState:
 
     # Analysis state
     analysis_params: AnalysisParameters = field(default_factory=AnalysisParameters)
+    # Names of the analysis fields the loaded file actually held (None: all of
+    # them, as for a state collected in-process). A restore must not apply the
+    # defaults of fields an older session file never saved.
+    saved_params: frozenset[str] | None = field(default=None, compare=False)
 
 
 def get_session_path() -> Path:
@@ -218,6 +224,8 @@ class SessionManager:
                 saxs2d_colormap=params_data.get("saxs2d_colormap", "viridis"),
                 saxs2d_auto_level=params_data.get("saxs2d_auto_level", True),
                 saxs2d_log_scale=params_data.get("saxs2d_log_scale", False),
+                saxs2d_type=params_data.get("saxs2d_type", ""),
+                saxs1d_type=params_data.get("saxs1d_type", ""),
                 saxs1d_log_x=params_data.get("saxs1d_log_x", False),
                 saxs1d_log_y=params_data.get("saxs1d_log_y", True),
                 stability_metric=params_data.get("stability_metric", "mean"),
@@ -241,6 +249,7 @@ class SessionManager:
                 active_tab = 0
 
             session = SessionState(
+                saved_params=frozenset(params_data) & frozenset(asdict(params)),
                 version=version,
                 timestamp=data.get("timestamp", ""),
                 data_path=data.get("data_path"),

@@ -4,6 +4,7 @@ import contextlib
 import gc
 import math
 import os
+import re
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -12,6 +13,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from xpcsviewer.fileIO.hdf_reader import clear_connection_pool
+from xpcsviewer.fileIO.qmap_utils import map_axis
 from xpcsviewer.utils.export_guard import ExportCollisionError, ExportGuard
 from xpcsviewer.utils.logging_config import get_logger
 from xpcsviewer.xpcs_file import XpcsFile
@@ -62,7 +64,9 @@ def _bin_coords(qmap, absolute: int) -> tuple[float | None, float | None]:
     Mirrors ``QMap.create_qbin_labels``: axis 0 is ``dqlist``; with a second
     axis the bins form a ``dqlist`` x ``dplist`` grid, axis 0 major. An axis
     contributes only when it is named ``q`` / ``phi``; a radial-only map (one
-    point on axis 1) has no phi.
+    point on axis 1) has no phi. A map with neither name (e.g. Cartesian ``x`` /
+    ``y``) returns its first and second axis values positionally: they are named
+    by ``_plain_axes`` / ``map_axis``, not by these variable names.
     """
     if absolute < 0:
         raise IndexError(absolute)
@@ -74,8 +78,28 @@ def _bin_coords(qmap, absolute: int) -> tuple[float | None, float | None]:
         dp = np.asarray(qmap.dplist, dtype=np.float64)
         i0, i1 = divmod(absolute, len(dp))
         coords = {names[0]: dq[i0], names[1]: dp[i1]}
+    if not {"q", "phi"} & set(names[:2]):
+        first, second = [*coords.values(), None][:2]
+        return float(first), None if second is None else float(second)
     q, phi = coords.get("q"), coords.get("phi")
     return (None if q is None else float(q)), (None if phi is None else float(phi))
+
+
+def _plain_axes(qmap) -> bool:
+    """True for a ``q`` / ``(q, phi)`` map, whose bins keep the q / phi wording."""
+    names = {str(n) for n in list(getattr(qmap, "map_names", ["q", "phi"]))[:2]}
+    return bool({"q", "phi"} & names)
+
+
+def _axis_names(qmap) -> tuple[str, str | None] | None:
+    """File-name words of a map that is not (q, phi): its two axis names.
+
+    ``None`` for a plain map; the second name is ``None`` for a one-axis map.
+    """
+    if _plain_axes(qmap):
+        return None
+    second = int(qmap.dynamic_num_pts[1]) != 1
+    return map_axis(qmap, 0)[0], map_axis(qmap, 1)[0] if second else None
 
 
 def _collect_valid_qbins(
@@ -112,7 +136,18 @@ def _collect_valid_qbins(
 
 
 def _qbins_with_phi(xfile: XpcsFile) -> list[tuple[int, str, float, float]]:
-    """Qbins that have both q and phi (the angle-based modes need phi)."""
+    """Qbins that have both q and phi (the angle-based modes need phi).
+
+    A map whose second axis is not an angle (Cartesian ``y`` in pixels) has none:
+    matching it on the circle would pair unrelated pixel rows.
+    """
+    qmap = xfile.qmap
+    if int(qmap.dynamic_num_pts[1]) != 1 and map_axis(qmap, 1)[0] != "phi":
+        logger.warning(
+            "Angle selection needs a phi axis; this file's map is "
+            f"{map_axis(qmap, 0)[0]} / {map_axis(qmap, 1)[0]}"
+        )
+        return []
     return [
         (i, label, q, phi)
         for i, label, q, phi in _collect_valid_qbins(xfile)
@@ -347,6 +382,7 @@ def generate_output_filename(
     output_format: str = "png",
     qbin_index: int | None = None,
     root: str | None = None,
+    axes: tuple[str, str | None] | None = None,
 ) -> str:
     """
     Generate the output path of one image, relative to the output directory.
@@ -364,12 +400,24 @@ def generate_output_filename(
         output_format: Image format
         qbin_index: Q-bin index within the file; part of the name when given
         root: Batch root directory; the input path is made relative to it
+        axes: Names of the two axes of a map that is not (q, phi) (``_axis_names``);
+            the bin is then named by BOTH coordinates, ``_x40.0000_y120.0000``,
+            instead of ``_q..._phi...`` (``q_value`` / ``phi_value`` are then the
+            first- and second-axis values)
 
     Returns:
         Output path relative to the output directory
     """
     rel = os.path.relpath(input_path, root) if root else Path(input_path).name
     qbin = f"_bin{qbin_index:04d}" if qbin_index is not None else ""
+    if axes is not None:
+        words = [re.sub(r"\W", "", str(n)) or "axis" for n in axes if n is not None]
+        coords = "".join(
+            f"_{w}{v:.4f}"
+            for w, v in zip(words, (q_value, phi_value), strict=False)
+            if v is not None
+        )
+        return f"{rel}{qbin}{coords}.{output_format}"
     phi = f"_phi{phi_value:.1f}" if phi_value is not None else ""
     return f"{rel}{qbin}_q{q_value:.4f}{phi}.{output_format}"
 
@@ -486,6 +534,7 @@ def process_single_file(
                         args.format,
                         qbin_index=qbin_index,
                         root=args.input if os.path.isdir(args.input) else None,
+                        axes=_axis_names(xfile.qmap),
                     )
                     output_path = os.path.join(args.output, output_filename)
                     out_dir = os.path.dirname(output_path)

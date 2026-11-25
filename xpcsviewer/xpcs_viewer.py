@@ -34,7 +34,7 @@ from .backends._conversions import ensure_numpy
 from .constants import MIN_AVERAGING_FILES
 from .fileIO.g2_regroup import G2RegroupResult
 from .fileIO.hdf_reader import _file_identity
-from .fileIO.qmap_utils import Q_UNIT_DISPLAY
+from .fileIO.qmap_utils import Q_UNIT_DISPLAY, convert_q, map_axis
 from .gui.g2_regroup_dialog import G2RegroupDialog, G2RegroupExportWorker
 from .gui.layout_helpers import apply_all_layout_improvements
 from .gui.shortcuts.shortcut_manager import ShortcutManager
@@ -80,6 +80,128 @@ def _remember_twotime_qbin(memory, fname, index):
     memory.move_to_end(fname)
     if len(memory) > _TWOTIME_QBIN_MEMORY_MAX:
         memory.popitem(last=False)
+
+
+def _resolve_twotime_selection(xf, ordinal, remembered_bins):
+    """Resolve a remembered two-time bin ordinal against the loaded revision.
+
+    The ordinal is a position in ``xf.c2_processed_bins``, so it only means
+    something for the revision it was chosen on. ``remembered_bins`` is that
+    revision's processed-bin tuple (None when unknown). Returns
+    ``(ordinal, bins)``: the bin ID the ordinal named is followed into the
+    loaded revision; if it is gone, or the ordinal is out of range, the first
+    bin is used. ``ordinal`` is None when the file has no processed bins at
+    all; ``bins`` is None when ``xf`` does not expose them (nothing to check).
+    """
+    processed = getattr(xf, "c2_processed_bins", None)
+    if processed is None:
+        return ordinal, None
+    bins = tuple(np.ravel(processed).tolist())
+    if not bins:
+        return None, bins
+    if remembered_bins is not None and remembered_bins != bins:
+        ident = (
+            remembered_bins[ordinal] if 0 <= ordinal < len(remembered_bins) else None
+        )
+        ordinal = bins.index(ident) if ident in bins else 0
+    elif not 0 <= ordinal < len(bins):
+        ordinal = 0
+    return ordinal, bins
+
+
+# --- Session persistence: ONE table of (AnalysisParameters field, widget
+# attribute, getter, setter, sync). _collect_session_state reads every row and
+# _restore_session writes every row, so the two cannot drift. Fields without a
+# widget in the window (intensity_t_normalize, g2_q_index, diffusion_model,
+# twotime_symmetric, qmap_show_rings) and the legacy saxs2d_log_scale /
+# saxs1d_log_* flags (never read from a widget; superseded by saxs2d_type /
+# saxs1d_type) are not in the table and keep their dataclass defaults.
+# One name per entry of the stability plot-type combo (4 entries); the first three
+# are the names older session files hold, the fourth keeps the last entry lossless.
+_STAB_METRICS = ("mean", "sigma", "contrast", "log-log")
+
+
+def _get_text(widget):
+    return widget.currentText()
+
+
+def _set_text(_viewer, widget, value):
+    index = widget.findText(str(value))
+    if index >= 0:
+        widget.setCurrentIndex(index)
+
+
+def _get_checked(widget):
+    return widget.isChecked()
+
+
+def _set_checked(_viewer, widget, value):
+    widget.setChecked(bool(value))
+
+
+def _get_stability_metric(widget):
+    index = widget.currentIndex()
+    return _STAB_METRICS[index] if 0 <= index < len(_STAB_METRICS) else "mean"
+
+
+def _set_stability_metric(_viewer, widget, value):
+    if value in _STAB_METRICS:
+        widget.setCurrentIndex(_STAB_METRICS.index(value))
+
+
+def _get_index(widget):
+    return widget.currentIndex()
+
+
+def _set_twotime_q(viewer, widget, value):
+    """The saved Q-bin position belongs to the file shown then: remember it for
+    the current two-time file (plot_twotime resolves it against the loaded
+    revision) and show it if the combo already lists that many bins."""
+    if not isinstance(value, int) or value < 0:
+        return
+    fname = viewer._current_twotime_fname()
+    if fname is not None:
+        _remember_twotime_qbin(viewer._twotime_qbin_memory, fname, value)
+    if value < widget.count():
+        widget.setCurrentIndex(value)
+
+
+_SESSION_CONTROLS = (
+    ("saxs2d_colormap", "cb_saxs2D_cmap", _get_text, _set_text, None),
+    ("saxs2d_type", "cb_saxs2D_type", _get_text, _set_text, None),
+    ("saxs1d_type", "cb_saxs_type", _get_text, _set_text, None),
+    (
+        "saxs2d_auto_level",
+        "saxs2d_autolevel",
+        _get_checked,
+        _set_checked,
+        lambda viewer: viewer.update_saxs2d_level(viewer.saxs2d_autolevel.isChecked()),
+    ),
+    (
+        "stability_metric",
+        "cb_stab_type",
+        _get_stability_metric,
+        _set_stability_metric,
+        None,
+    ),
+    (
+        "g2_fit_function",
+        "g2_fitting_function",
+        _get_text,
+        _set_text,
+        lambda viewer: viewer.update_g2_fitting_function(),
+    ),
+    ("g2_show_fit", "g2_show_fit", _get_checked, _set_checked, None),
+    (
+        "twotime_selected_q",
+        "comboBox_twotime_selection",
+        _get_index,
+        _set_twotime_q,
+        None,
+    ),
+    ("twotime_colormap", "cb_twotime_cmap", _get_text, _set_text, None),
+    ("qmap_colormap", "cb_qmap_cmap", _get_text, _set_text, None),
+)
 
 
 # Setup exception logging
@@ -147,6 +269,35 @@ def _split_by_detector_shape(xf_list, arrays):
         else:
             accepted.append(xf)
     return accepted, skipped
+
+
+# Free parameters of the Bayesian G2 models (fitting/models.py): single =
+# tau, baseline, contrast; double = tau1, tau2_factor, baseline, contrast1,
+# contrast2. A test counts the sample sites of the real models against this.
+_G2_BAYES_FREE_PARAMS = {"single": 3, "double": 5}
+
+
+def _g2_bayesian_observations(x, y, yerr, model_name):
+    """Observations a Bayesian G2 fit may use: ``(valid mask, refusal or None)``.
+
+    Same rule as the deterministic fit (``xpcs_file._positive_delay_fit_data``,
+    plus finite positive errors): only finite, strictly positive delays with
+    finite positive errors count, because the delay-0 likelihood does not depend
+    on tau and NUTS would then "converge" on the prior. The selection must offer
+    at least as many such observations as the model has free parameters;
+    otherwise ``refusal`` says why. ONE rule for the single-Q and the all-Q launch.
+    """
+    x, y, yerr = (np.asarray(a, dtype=float) for a in (x, y, yerr))
+    valid = np.isfinite(x) & (x > 0) & np.isfinite(y) & np.isfinite(yerr) & (yerr > 0)
+    need = _G2_BAYES_FREE_PARAMS["single" if model_name == "single" else "double"]
+    n = int(np.count_nonzero(valid))
+    if n >= need:
+        return valid, None
+    return valid, (
+        f"only {n} observation(s) with a finite positive delay and a positive "
+        f"error for {need} free parameters ({model_name} exponential): the "
+        "selection cannot identify them"
+    )
 
 
 def _skipped_text(skipped) -> str:
@@ -402,6 +553,8 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         # fname -> last selected qbin index; bounded LRU so a long session
         # analyzing many files doesn't grow this without limit.
         self._twotime_qbin_memory: OrderedDict[str, int] = OrderedDict()
+        # the processed-bin tuple each remembered ordinal refers to (R6-11)
+        self._twotime_qbin_bins: OrderedDict[str, tuple] = OrderedDict()
         self._twotime_last_fname = None
         self._init_twotime_tab()
         self.init_twotime_plot_handler()
@@ -573,10 +726,9 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
 
         self.pg_saxs.getView().scene().sigMouseMoved.connect(self.saxs2d_mouseMoved)
 
-        # Connect progress manager to show/hide progress dialog
-        # Add keyboard shortcut to show progress dialog
+        # Connect progress manager to show/hide progress dialog (the Ctrl+Shift+P
+        # shortcut is the View > Show Progress action, registered once there)
         self.setup_async_connections()
-        self.setup_progress_shortcut()
 
         # Apply layout improvements AFTER all dynamic widgets are created
         # (e.g. btn_g2_bayesian_all at line ~322 must exist before rearrangement)
@@ -1294,48 +1446,15 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             maximized=self.isMaximized(),
         )
 
-        # Helper to safely get checkbox state
-        def get_checkbox_state(attr_name: str, default: bool = True) -> bool:
-            widget = getattr(self, attr_name, None)
-            if widget is not None and hasattr(widget, "isChecked"):
-                return widget.isChecked()
-            return default
-
-        # Helper to safely get combobox text
-        def get_combobox_text(attr_name: str, default: str = "") -> str:
-            widget = getattr(self, attr_name, None)
-            if widget is not None and hasattr(widget, "currentText"):
-                return widget.currentText()
-            return default
-
-        # Helper to safely get combobox index
-        def get_combobox_index(attr_name: str, default: int = 0) -> int:
-            widget = getattr(self, attr_name, None)
-            if widget is not None and hasattr(widget, "currentIndex"):
-                return widget.currentIndex()
-            return default
-
-        # Map stability combobox index to metric name
-        _stab_metric_map = {0: "mean", 1: "sigma", 2: "contrast"}
-        stab_idx = get_combobox_index("cb_stab_type", 0)
-
-        # Collect analysis parameters from UI widgets — extract VALUES, not widgets.
-        # Fields without widget mappings (intensity_t_normalize, diffusion_model,
-        # twotime_symmetric, qmap_show_rings) keep their dataclass defaults.
-        analysis_params = AnalysisParameters(
-            saxs2d_colormap=get_combobox_text("cb_saxs2D_cmap", "viridis"),
-            saxs2d_auto_level=get_checkbox_state("saxs2d_autolevel", True),
-            saxs2d_log_scale=get_checkbox_state("saxs2d_log_scale", False),
-            saxs1d_log_x=get_checkbox_state("saxs1d_log_x", False),
-            saxs1d_log_y=get_checkbox_state("saxs1d_log_y", True),
-            stability_metric=_stab_metric_map.get(stab_idx, "mean"),
-            g2_fit_function=get_combobox_text("g2_fitting_function", "single_exp"),
-            g2_q_index=get_combobox_index("g2_q_selection", 0),
-            g2_show_fit=get_checkbox_state("g2_show_fit", True),
-            twotime_selected_q=get_combobox_index("comboBox_twotime_selection", 0),
-            twotime_colormap=get_combobox_text("cb_twotime_cmap", "viridis"),
-            qmap_colormap=get_combobox_text("cb_qmap_cmap", "viridis"),
-        )
+        # Collect analysis parameters from UI widgets -- VALUES, not widgets --
+        # from the one table the restore also uses. A control the window does
+        # not have keeps its dataclass default.
+        param_values = {}
+        for fld, attr, getter, _setter, _sync in _SESSION_CONTROLS:
+            widget = getattr(self, attr, None)
+            if widget is not None:
+                param_values[fld] = getter(widget)
+        analysis_params = AnalysisParameters(**param_values)
 
         return SessionState(
             data_path=(
@@ -1420,14 +1539,31 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             self.tabWidget.setCurrentIndex(session.active_tab)
             self.tabWidget.blockSignals(False)
 
-        # Restore analysis parameters
+        # Restore analysis parameters from the same table the save used: signals
+        # blocked while setting, a field the (older) session file does not hold
+        # is left alone, then ONE redraw of the active tab.
         params = session.analysis_params
-        if hasattr(self, "saxs2d_autolevel"):
-            self.saxs2d_autolevel.setChecked(params.saxs2d_auto_level)
-        if hasattr(self, "g2_fitting_function"):
-            idx = self.g2_fitting_function.findText(params.g2_fit_function)
-            if idx >= 0:
-                self.g2_fitting_function.setCurrentIndex(idx)
+        saved = getattr(session, "saved_params", None)  # None: every field is saved
+        restored = []
+        for fld, attr, _getter, setter, sync in _SESSION_CONTROLS:
+            widget = getattr(self, attr, None)
+            value = getattr(params, fld, None)
+            if (
+                widget is None
+                or value is None
+                or (saved is not None and fld not in saved)
+            ):
+                continue
+            widget.blockSignals(True)
+            try:
+                setter(self, widget, value)
+            finally:
+                widget.blockSignals(False)
+            if sync is not None:
+                sync(self)
+            restored.append(fld)
+        if restored and self.vk is not None and self.vk.target:
+            self.update_plot()
 
         logger.info("Session restored successfully")
 
@@ -1533,14 +1669,6 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             button_layout.insertWidget(1, open_selected_btn)
 
         dialog.exec()
-
-    def setup_progress_shortcut(self):
-        """Set up keyboard shortcut to show progress dialog."""
-        from xpcsviewer.gui.qt_compat import QKeySequence, QShortcut
-
-        # Ctrl+Shift+P to show progress dialog (Ctrl+P is command palette)
-        shortcut = QShortcut(QKeySequence("Ctrl+Shift+P"), self)
-        shortcut.activated.connect(self.show_progress_dialog)
 
     def show_progress_dialog(self):
         """Show the progress dialog."""
@@ -2940,11 +3068,14 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             return None, None
 
         try:
-            xf_list = self.vk.get_xf_list()
+            # The highlighted target (the first highlighted row; with nothing
+            # highlighted get_selected_rows() is every row, so the first valid
+            # target). Rows are compared as lists, never by truthiness: 0 is a row.
+            xf_list = self.vk.get_xf_list(self.get_selected_rows())
             if not xf_list:
                 return None, None
 
-            xf = xf_list[0]  # Use first file
+            xf = xf_list[0]
 
             # Get detector image (SAXS 2D)
             detector_image = xf.saxs_2d
@@ -2969,6 +3100,17 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
                 "energy": getattr(xf, "X_energy", None),
                 "shape": detector_image.shape if detector_image is not None else None,
             }
+            # The EFFECTIVE mask the viewer applies to this file right now (an
+            # imported mask, else the file's own): the editor starts from it, so
+            # an untouched "Apply to Viewer" changes nothing. 2-D, image shape,
+            # nonzero = valid pixel.
+            effective = getattr(xf, "mask", None)
+            if (
+                effective is not None
+                and detector_image is not None
+                and np.shape(effective) == detector_image.shape
+            ):
+                metadata["mask"] = np.asarray(effective) != 0
 
             logger.debug(
                 f"SimpleMask data: shape={metadata.get('shape')}, "
@@ -3016,9 +3158,20 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
                 )
                 return
 
-            # Apply mask to the matching loaded XpcsFile objects (BUG-001 fix)
+            # Apply mask to the matching loaded XpcsFile objects (BUG-001 fix).
+            # Rule: a target never gets a pixel re-enabled that ITS OWN canonical
+            # detector mask (xf.qmap.mask) excludes, so the mask assigned is
+            # (editor mask AND the file's canonical mask), per target.
             for xf in accepted:
-                xf.mask = mask
+                canonical = getattr(getattr(xf, "qmap", None), "mask", None)
+                combined = np.asarray(mask) != 0
+                if canonical is not None and np.shape(canonical) == combined.shape:
+                    narrowed = combined & (np.asarray(canonical) != 0)
+                    # nothing re-enabled: the editor's own array is kept as is
+                    combined = mask if np.array_equal(narrowed, combined) else narrowed
+                else:
+                    combined = mask
+                xf.mask = combined
 
             logger.info(
                 f"Mask exported from SimpleMask: shape {mask.shape}, "
@@ -3267,6 +3420,45 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             # New file: use its remembered qbin (default 0), not the old
             # combobox index left over from the previous file.
             current_selection = self._twotime_qbin_memory.get(fname, 0)
+
+        # Resolve the remembered bin against the LOADED revision before any
+        # panel is drawn: after a replaced file is reloaded the ordinal may name
+        # another bin or none. Every panel is then drawn from this one bin.
+        no_c2_bins = False
+        xf_two = None
+        if fname is not None and self.vk is not None:
+            xf_two = next(
+                iter(
+                    self.vk.get_xf_list(
+                        self.get_selected_rows(), filter_atype="Twotime"
+                    )
+                ),
+                None,
+            )
+        if xf_two is not None:
+            bins_memory = self._twotime_qbin_bins
+            resolved_sel, bins = _resolve_twotime_selection(
+                xf_two, current_selection, bins_memory.get(fname)
+            )
+            if bins is not None:
+                _remember_twotime_qbin(bins_memory, fname, bins)
+            no_c2_bins = resolved_sel is None
+            if resolved_sel is not None and resolved_sel != current_selection:
+                current_selection = resolved_sel
+                _remember_twotime_qbin(
+                    self._twotime_qbin_memory, fname, current_selection
+                )
+                combo = self.comboBox_twotime_selection
+                slider = self.horizontalSlider_twotime_selection
+                if 0 <= current_selection < combo.count():
+                    combo.blockSignals(True)
+                    slider.blockSignals(True)
+                    try:
+                        combo.setCurrentIndex(current_selection)
+                        slider.setValue(current_selection)
+                    finally:
+                        combo.blockSignals(False)
+                        slider.blockSignals(False)
         logger.debug(
             f"plot_twotime called: dryrun={dryrun}, ComboBox currentIndex={current_selection}, count={self.comboBox_twotime_selection.count()}"
         )
@@ -3293,6 +3485,10 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         if not self.mp_2t_hdls:
             self.init_twotime_plot_handler()
         new_labels = self.vk.plot_twotime(self.mp_2t_hdls, **kwargs)
+        if no_c2_bins:
+            self.statusbar.showMessage(
+                "This two-time file has no processed Q bins: no C2 to show"
+            )
         if highlight_xy is not None:
             # The renderer plotted the bin under the click; make the controls and
             # the remembered selection show that bin, not the previous one.
@@ -4941,15 +5137,16 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         y = np.asarray(g2[0][:, q_idx])
         yerr = np.asarray(g2_err[0][:, q_idx])
 
-        # Filter invalid points
-        valid = np.isfinite(y) & np.isfinite(yerr) & (yerr > 0)
-        if not np.any(valid):
-            self.statusbar.showMessage("No valid G2 data for this Q-index", 2000)
+        _, _, fit_func_name = self.check_g2_fitting_number()
+        # Filter invalid points; refuse a selection that cannot identify the model
+        valid, refusal = _g2_bayesian_observations(x, y, yerr, fit_func_name)
+        if refusal is not None:
+            logger.warning("Bayesian fit refused for Q-index %d: %s", q_idx, refusal)
+            self.statusbar.showMessage(f"Bayesian fit not started: {refusal}", 8000)
             return None
 
         from .fitting.bayesian_assembly import BayesianBundle
 
-        _, _, fit_func_name = self.check_g2_fitting_number()
         bundle = BayesianBundle.create(
             xf_list[0].fname,
             bin_id,
@@ -5308,7 +5505,11 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             return None
 
         from .fitting import fit_double_exp, fit_single_exp
-        from .fitting.bayesian_assembly import BayesianBundle, resolve_bin_phi
+        from .fitting.bayesian_assembly import (
+            BayesianBundle,
+            resolve_bin_axes,
+            resolve_bin_phi,
+        )
 
         fit_func = fit_single_exp if fit_func_name == "single" else fit_double_exp
 
@@ -5320,13 +5521,16 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
 
         fname = xf_list[0].fname
         specs: list[dict] = []
+        # Bins that are not sampled at all, with the reason (they stay failed)
+        unidentifiable: dict[int, str] = {}
         # Exactly the points that enter the fits (NaN elsewhere), for plotting.
         fitted_g2 = np.full(np.shape(g2[0]), np.nan)
         for q_idx in range(len(q_arr)):
             y = np.asarray(g2[0][:, q_idx])
             yerr = np.asarray(g2_err[0][:, q_idx])
-            valid = np.isfinite(y) & np.isfinite(yerr) & (yerr > 0)
-            if not np.any(valid):
+            valid, refusal = _g2_bayesian_observations(x, y, yerr, fit_func_name)
+            if refusal is not None:
+                unidentifiable[q_idx] = refusal
                 continue
             fitted_g2[valid, q_idx] = y[valid]
             bin_id, _, label = bins[q_idx]
@@ -5353,17 +5557,28 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
                 }
             )
 
+        if unidentifiable:
+            logger.warning(
+                "Bayesian batch: %d Q-bin(s) not sampled: %s",
+                len(unidentifiable),
+                unidentifiable,
+            )
         if not specs:
-            self.statusbar.showMessage("No valid Q-bins for Bayesian fitting", 2000)
+            reason = next(iter(unidentifiable.values()), "no valid observations")
+            self.statusbar.showMessage(
+                f"No Q-bin can be fitted by the Bayesian model: {reason}", 8000
+            )
             return None
 
         return {
+            "unidentifiable": unidentifiable,
             "specs": specs,
             "q_arr": q_arr,
             "t_el": x,
             "g2": fitted_g2,
             "bin_ids": [b[0] for b in bins],
             "bin_phi": resolve_bin_phi(xf_list[0], [b[0] for b in bins]),
+            "bin_axes": resolve_bin_axes(xf_list[0], [b[0] for b in bins]),
             "fit_func_name": fit_func_name,
             "fname": fname,
             "revision": _revision_of(fname),
@@ -5429,6 +5644,13 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         )
 
         coordinator.start()
+        skipped = extracted["unidentifiable"]
+        if skipped:
+            self.statusbar.showMessage(
+                f"{len(skipped)} Q-bin(s) not sampled (marked failed): "
+                f"{next(iter(skipped.values()))}",
+                8000,
+            )
 
     def _on_g2_batch_progress(self, completed, total, msg):
         """Update progress during batch Bayesian fitting."""
@@ -5510,6 +5732,7 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
                 fname=launch["fname"],
                 bin_ids=launch["bin_ids"],
                 bin_phi=launch.get("bin_phi"),
+                bin_axes=launch.get("bin_axes"),
                 fit_q_range=launch["q_range"],
                 fit_t_range=launch["t_range"],
                 obs_g2=launch["g2"],
@@ -5536,6 +5759,12 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         # Complete progress with timing summary
         timing_str = f" ({sum(timings):.0f}s)" if timings else ""
         message = f"Bayesian fit: {succeeded}/{total} Q-bins converged{timing_str}"
+        not_sampled = launch.get("unidentifiable") or {}
+        if not_sampled:
+            message += (
+                f"; {len(not_sampled)} Q-bin(s) not sampled (failed): "
+                f"{next(iter(not_sampled.values()))}"
+            )
         if stale:
             message = "Bayesian fit discarded: its data file changed on disk"
         self.progress_manager.complete_operation(
@@ -5713,6 +5942,7 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
                 nonconverged_mask=bfs.get("nonconverged_mask"),
                 bin_ids=bfs.get("bin_ids"),
                 bin_phi=bfs.get("bin_phi"),
+                bin_axes=bfs.get("bin_axes"),
                 guard=guard,
             )
         except ExportCollisionError as exc:
@@ -5753,6 +5983,7 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
                     bin_ids=bfs.get("bin_ids"),
                     q_val=bfs.get("q_val"),
                     bin_phi=bfs.get("bin_phi"),
+                    bin_axes=bfs.get("bin_axes"),
                     source=snapshot.fname,
                     guard=guard,
                 )
@@ -5892,7 +6123,17 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         except (ValueError, AttributeError):
             self.statusbar.showMessage("Invalid Q range for the diffusion fit", 3000)
             return None
-        q, tau, tau_err = _tauq_rows(xf.fit_summary, q_range)
+        # the Q-range boxes and D are in inverse angstrom, like the NLSQ tau-q fit
+        try:
+            q_val = convert_q(
+                xf.fit_summary["q_val"],
+                map_axis(getattr(xf, "qmap", None), 0)[1],
+                Q_UNIT_DISPLAY,
+            )
+        except ValueError as exc:
+            self.statusbar.showMessage(f"Bayesian diffusion refused: {exc}", 6000)
+            return None
+        q, tau, tau_err = _tauq_rows({**xf.fit_summary, "q_val": q_val}, q_range)
 
         if q.size == 0:
             self.statusbar.showMessage("No valid diffusion data in Q-range", 2000)

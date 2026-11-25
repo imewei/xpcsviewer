@@ -114,27 +114,79 @@ def resolve_g2_bins(xf: Any, q_range: Any) -> list[tuple[int, float, str]]:
     ]
 
 
-def resolve_bin_phi(xf: Any, bin_ids: Any) -> NDArray:
-    """Numeric azimuth of each absolute dynamic bin (NaN where the map has none).
+def _second_axis_values(xf: Any, bin_ids: Any) -> NDArray:
+    """Value on the map's second axis of each dynamic bin (NaN where unknown).
 
-    Absolute bin ``a`` of a ``(q, phi)`` map with ``dynamic_num_pts = (nq, nphi)``
-    sits at ``(a // nphi, a % nphi)``; the value is ``dplist[a % nphi]`` in the
-    map's own angle unit (degrees for APS files).
+    Dynamic bin ``b`` is the file's G2 column; its absolute position on the map
+    is ``dynamic_index_mapping[b]`` and, for ``dynamic_num_pts = (n0, n1)``, it
+    sits at ``(a // n1, a % n1)`` with the value ``dplist[a % n1]``. A file
+    without a mapping is read as the identity.
     """
     out = np.full(len(bin_ids), np.nan)
     try:
         qmap = xf.qmap
-        if list(qmap.map_names)[:2] != ["q", "phi"]:
-            return out
-        nphi = int(qmap.dynamic_num_pts[1])
-        phi = np.asarray(qmap.dplist, dtype=float).ravel()
+        n1 = int(qmap.dynamic_num_pts[1])
+        values = np.asarray(qmap.dplist, dtype=float).ravel()
+        mapping = getattr(qmap, "dynamic_index_mapping", None)
+        mapping = None if mapping is None else np.asarray(mapping).ravel()
     except (AttributeError, IndexError, TypeError, ValueError):
         return out
-    for k, b in enumerate(bin_ids):
-        j = int(b) % nphi if nphi > 0 else -1
-        if 0 <= j < phi.size:
-            out[k] = phi[j]
+    for k, bin_id in enumerate(bin_ids):
+        absolute = int(bin_id)
+        if mapping is not None:
+            if not 0 <= absolute < mapping.size:
+                continue
+            absolute = int(mapping[absolute])
+        j = absolute % n1 if n1 > 0 else -1
+        if 0 <= j < values.size:
+            out[k] = values[j]
     return out
+
+
+def resolve_bin_phi(xf: Any, bin_ids: Any) -> NDArray:
+    """Numeric azimuth of each dynamic bin (NaN where the map has none).
+
+    Only a ``(q, phi)`` map has an azimuth; for any other map (e.g. Cartesian
+    ``x`` / ``y``) the result is NaN and :func:`resolve_bin_axes` carries the
+    second axis. The value is ``dplist[a % nphi]`` for the bin's absolute map
+    position ``a`` (``dynamic_index_mapping``), in the map's own angle unit
+    (degrees for APS files).
+    """
+    try:
+        if list(xf.qmap.map_names)[:2] != ["q", "phi"]:
+            return np.full(len(bin_ids), np.nan)
+    except (AttributeError, TypeError):
+        return np.full(len(bin_ids), np.nan)
+    return _second_axis_values(xf, bin_ids)
+
+
+def resolve_bin_axes(xf: Any, bin_ids: Any) -> dict[str, Any] | None:
+    """Names, units and second-axis values of the dynamic bins of ``xf``.
+
+    ``{"names": (n0[, n1]), "units": (u0[, u1]), "axis1": values}``: the file's own
+    axis names and units (``map_axis``) and, per bin, the value on the second
+    axis (the first axis is the ``q_value`` the writers already carry). A map
+    with one axis (one point on axis 1) has one name and unit and NaN values.
+    ``None`` for a stand-in without a Q map.
+    """
+    from xpcsviewer.fileIO.qmap_utils import map_axis
+
+    qmap = getattr(xf, "qmap", None)
+    if qmap is None:
+        return None
+    try:
+        two_axes = int(qmap.dynamic_num_pts[1]) != 1
+    except (AttributeError, IndexError, TypeError, ValueError):
+        two_axes = False
+    axes = [map_axis(qmap, i) for i in range(2 if two_axes else 1)]
+    values = (
+        _second_axis_values(xf, bin_ids) if two_axes else np.full(len(bin_ids), np.nan)
+    )
+    return {
+        "names": tuple(a[0] for a in axes),
+        "units": tuple(a[1] for a in axes),
+        "axis1": values,
+    }
 
 
 # Legacy parameter order for single_exp_all(x, a, b, c, d):
@@ -244,6 +296,7 @@ def assemble_fit_summary(
     obs_g2: Any = None,
     obs_t_el: Any = None,
     bin_phi: Any = None,
+    bin_axes: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Convert per-Q Bayesian results into NLSQ-compatible fit_summary.
 
@@ -261,6 +314,10 @@ def assemble_fit_summary(
         Bayesian model function (``single_exp_func`` or ``double_exp_func``).
     q_range, t_range, bounds, fit_flag, label : optional
         Metadata fields matching the NLSQ fit_summary format.
+    bin_axes : dict or None
+        ``resolve_bin_axes`` of the file: its two axis names, units and the
+        second-axis value of every column. Stored as ``bin_axes`` so the
+        writers can name the coordinates of a map that is not ``(q, phi)``.
     fname, bin_ids, bin_phi, fit_q_range, fit_t_range, obs_g2, obs_t_el : optional
         Provenance that makes the summary self-contained: the file, the
         absolute bin ID and numeric azimuth of every column, the Q/delay
@@ -288,6 +345,10 @@ def assemble_fit_summary(
         raise ValueError(f"bin_ids has {len(bin_ids)} entries for {num_q} Q-bins")
     if bin_phi is not None and len(bin_phi) != num_q:
         raise ValueError(f"bin_phi has {len(bin_phi)} entries for {num_q} Q-bins")
+    if bin_axes is not None and len(bin_axes["axis1"]) != num_q:
+        raise ValueError(
+            f"bin_axes has {len(bin_axes['axis1'])} values for {num_q} Q-bins"
+        )
     if obs_g2 is not None and np.shape(obs_g2)[1:2] != (num_q,):
         raise ValueError("obs_g2 columns do not match the Q-bins of the summary")
     nparams = _SINGLE_EXP_NPARAMS if fit_func_name == "single" else _DOUBLE_EXP_NPARAMS
@@ -388,6 +449,7 @@ def assemble_fit_summary(
         "fname": fname,
         "bin_ids": None if bin_ids is None else np.asarray(bin_ids),
         "bin_phi": None if bin_phi is None else np.asarray(bin_phi, dtype=float),
+        "bin_axes": bin_axes,
         "fit_q_range": fit_q_range,
         "fit_t_range": fit_t_range,
         "obs_g2": None if obs_g2 is None else _frozen(obs_g2),

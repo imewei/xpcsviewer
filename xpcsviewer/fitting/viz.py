@@ -153,6 +153,9 @@ def plot_bayesian_all_q(
     return fig
 
 
+_AXIS_COLUMNS = ("axis0_name", "axis0_unit", "axis1_name", "axis1_value", "axis1_unit")
+
+
 def export_bayesian_csv(
     path: Path | str,
     fit_val: NDArray,
@@ -163,6 +166,7 @@ def export_bayesian_csv(
     nonconverged_mask: NDArray | None = None,
     bin_ids: Any = None,
     bin_phi: Any = None,
+    bin_axes: dict[str, Any] | None = None,
     guard: ExportGuard | None = None,
 ) -> None:
     """Export Bayesian fit parameters to CSV.
@@ -189,6 +193,13 @@ def export_bayesian_csv(
         row. Two bins can share a radial Q, so they are appended as
         ``bin_id`` / ``phi`` columns after the existing ones (an empty
         ``phi`` cell: the map has no azimuth for that bin).
+    bin_axes : dict or None
+        ``bayesian_assembly.resolve_bin_axes`` of the file. Appends, after every
+        other column, ``axis0_name, axis0_unit, axis1_name, axis1_value,
+        axis1_unit``: the file's own axis names and units and the value on its
+        second axis. ``q_value`` is the value on the FIRST axis, whatever that
+        axis is (``x`` in px for a Cartesian map); ``phi`` stays the azimuth of
+        a (q, phi) map only.
     guard : ExportGuard or None
         The export action's write gate; ``path`` is claimed through it before
         anything is written (raises ``ExportCollisionError``).
@@ -208,6 +219,8 @@ def export_bayesian_csv(
             header.append("bin_id")
         if bin_phi is not None:
             header.append("phi")
+        if bin_axes is not None:
+            header.extend(_AXIS_COLUMNS)
         writer.writerow(header)
 
         for qi in range(len(q_val)):
@@ -227,6 +240,19 @@ def export_bayesian_csv(
             if bin_phi is not None:
                 phi = float(bin_phi[qi])
                 row.append(f"{phi:.6g}" if np.isfinite(phi) else "")
+            if bin_axes is not None:
+                names, units = bin_axes["names"], bin_axes["units"]
+                v1 = float(bin_axes["axis1"][qi])
+                two = len(names) > 1
+                row.extend(
+                    [
+                        names[0],
+                        units[0],
+                        names[1] if two else "",
+                        f"{v1:.6g}" if two and np.isfinite(v1) else "",
+                        units[1] if two else "",
+                    ]
+                )
             writer.writerow(row)
 
     logger.info("Exported Bayesian parameters to %s", path)
@@ -265,6 +291,7 @@ def export_bayesian_diagnostics(
     bin_ids: Any = None,
     q_val: Any = None,
     bin_phi: Any = None,
+    bin_axes: dict[str, Any] | None = None,
     source: str | None = None,
     guard: ExportGuard | None = None,
 ) -> list[Path]:
@@ -287,10 +314,12 @@ def export_bayesian_diagnostics(
         (or that lie beyond it) are not written: failed and non-converged
         posteriors stay available in the diagnosis views only. Without a mask a
         result whose own diagnostics did not converge is skipped the same way.
-    bin_ids, q_val, bin_phi, source : optional
+    bin_ids, q_val, bin_phi, bin_axes, source : optional
         Identity of each written bin, recorded as root attributes of its file
         together with ``bin_status`` (``ok``; ``unassessed`` without a mask)
-        and ``q_index``.
+        and ``q_index``. ``bin_axes`` (``resolve_bin_axes``) adds the file's own
+        ``axis0_name`` / ``axis0_unit`` and, for a two-axis map, ``axis1_name`` /
+        ``axis1_unit`` / ``axis1_value`` (``q_value`` is the first-axis value).
     guard : ExportGuard or None
         The export action's write gate; every file is claimed before the
         first is written.
@@ -353,6 +382,14 @@ def export_bayesian_diagnostics(
             attrs["q_value"] = float(q_val[q_idx])
         if bin_phi is not None and q_idx < len(bin_phi) and np.isfinite(bin_phi[q_idx]):
             attrs["phi"] = float(bin_phi[q_idx])
+        if bin_axes is not None and q_idx < len(bin_axes["axis1"]):
+            names, units = bin_axes["names"], bin_axes["units"]
+            attrs["axis0_name"], attrs["axis0_unit"] = names[0], units[0]
+            if len(names) > 1:
+                attrs["axis1_name"], attrs["axis1_unit"] = names[1], units[1]
+                v1 = float(bin_axes["axis1"][q_idx])
+                if np.isfinite(v1):
+                    attrs["axis1_value"] = v1
         if source:
             attrs["source_file"] = str(source)
         plan.append((q_path, _tagged(idata, attrs)))

@@ -7,25 +7,25 @@ import numpy as np
 import pytest
 
 from xpcsviewer.simplemask.reader.io_utils import (
-    _cast_to_signed,
     average_frames_parallel,
+    decode_counts,
     resolve_frame_range,
 )
 
 
-class TestCastToSigned:
+class TestDecodeCounts:
     def test_uint16_overflow_value_becomes_negative(self):
-        # 65535 is the max uint16 value (detector saturation/overflow marker
-        # upstream) -- bit-pattern-preserving cast to int16 must turn it
-        # negative (-1), not clip or wrap to something else.
+        # 65535 is the max uint16 value (the detector's reserved invalid-pixel
+        # code) and decodes to -1; the array is widened (R6-02), not viewed as
+        # int16, so ordinary counts above 32767 are kept.
         arr = np.array([65535, 0, 100], dtype=np.uint16)
-        result = _cast_to_signed(arr)
-        assert result.dtype == np.int16
+        result = decode_counts(arr)
+        assert result.dtype.kind == "i" and result.dtype.itemsize > 2
         np.testing.assert_array_equal(result, [-1, 0, 100])
 
     def test_signed_array_passthrough(self):
         arr = np.array([1, -2, 3], dtype=np.int32)
-        result = _cast_to_signed(arr)
+        result = decode_counts(arr)
         assert result is arr
 
 

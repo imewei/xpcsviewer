@@ -228,6 +228,14 @@ def plot_twotime(
             f"High memory pressure detected before loading c2 data for {xfile.label}"
         )
 
+    processed = getattr(xfile, "c2_processed_bins", None)
+    if processed is not None and np.size(processed) == 0:
+        # no processed bin: show no C2 rather than the previous file's image
+        logger.warning(f"{xfile.label} has no processed two-time bins")
+        hdl["tt"].clear()
+        hdl["c2g2"].clear()
+        return
+
     c2_result = xfile.get_twotime_c2(selection=selection, correct_diag=correct_diag)
     if c2_result is None:
         return

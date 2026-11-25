@@ -18,6 +18,7 @@ from .backends import ensure_numpy
 from .constants import MEMORY_CLEANUP_TIMEOUT_S
 from .file_locator import FileLocator
 from .fileIO.hdf_reader import _file_identity
+from .fileIO.qmap_utils import Q_UNIT_DISPLAY, convert_q, map_axis
 from .utils.export_guard import ExportCollisionError, ExportGuard
 from .utils.log_utils import log_timing
 from .utils.logging_config import get_logger
@@ -88,19 +89,20 @@ def _g2_bin_identities(xf, n_columns: int) -> list[tuple] | None:
     Column ``j`` of ``xf.get_g2_data()`` is bin ``result[j]``: the dynamic bin ID
     is the bin's own G2 column in the file, ``map_index`` its absolute position
     on the file's q x phi map (``dynamic_index_mapping``), and ``q`` / ``phi`` the
-    numbers in the file's own arrays at full precision (``phi`` is None when the
-    map has no azimuth axis). Mirrors ``cli.twotime_batch._bin_coords``, which
-    cannot be imported here (it selects the matplotlib backend on import).
-    ``None`` when the file's map cannot be resolved, so the export falls back to
-    the plain Q labels.
+    numbers in the file's own arrays at full precision. ``q`` is the value on
+    the map's first axis and ``phi`` the one on its second axis (None when the
+    map has a single axis); the axes' real names and units are
+    ``_dynamic_axes`` (``q`` / ``phi`` only for a plain (q, phi) map). Mirrors
+    ``cli.twotime_batch._bin_coords``, which cannot be imported here (it selects
+    the matplotlib backend on import). ``None`` when the file's map cannot be
+    resolved, so the export falls back to the plain Q labels.
     """
     from .fitting.bayesian_assembly import resolve_g2_bins
 
     try:
         qmap = xf.qmap
         mapping = np.asarray(qmap.dynamic_index_mapping)
-        names = list(qmap.map_names)
-        has_phi = int(qmap.dynamic_num_pts[1]) != 1 and names[1] == "phi"
+        has_phi = int(qmap.dynamic_num_pts[1]) != 1
         dp = np.asarray(qmap.dplist, dtype=np.float64)
         rows = []
         for bin_id, q, _label in resolve_g2_bins(xf, None):
@@ -151,22 +153,118 @@ def _phi_text(phi) -> str:
     return "NA" if phi is None else repr(float(phi))
 
 
-def _bin_tag(ident: tuple | None) -> str:
-    """Suffix of a column name: the bin's absolute identity (empty if unknown)."""
+def _dynamic_axes(xf) -> tuple[tuple[str, str], ...]:
+    """``(name, unit)`` of each axis of the file's dynamic map (one or two).
+
+    Empty for a stand-in without a map. The unit is the file's own, so a Q in
+    ``nm^-1`` is exported as such.
+    """
+    qmap = getattr(xf, "qmap", None)
+    if qmap is None:
+        return ()
+    try:
+        n_axes = 2 if int(qmap.dynamic_num_pts[1]) != 1 else 1
+    except (AttributeError, IndexError, TypeError, ValueError):
+        n_axes = 1
+    return tuple(map_axis(qmap, i) for i in range(n_axes))
+
+
+def _g2_axes(xf) -> tuple[tuple[str, str], ...] | None:
+    """The dynamic map's axes when it is NOT a plain (q[, phi]) map, else None.
+
+    A plain map keeps the ``q=..,phi=..`` wording; any other (e.g. Cartesian
+    ``x`` / ``y`` in pixels) is written with its own axis names and units.
+    """
+    axes = _dynamic_axes(xf)
+    names = [name for name, _unit in axes]
+    return None if not axes or names in (["q"], ["q", "phi"]) else axes
+
+
+def _axes_comment(xf) -> str:
+    """One ``axes: name [unit], ...`` line stating the units of the exported bins."""
+    axes = _dynamic_axes(xf)
+    return "axes: " + ", ".join(f"{n} [{u}]" for n, u in axes) if axes else ""
+
+
+def _bin_tag(ident: tuple | None, axes=None) -> str:
+    """Suffix of a column name: the bin's absolute identity (empty if unknown).
+
+    ``axes`` (``_g2_axes``) names the two coordinates of a map that is not
+    (q, phi); without it the legacy ``q`` / ``phi`` wording is used.
+    """
     if ident is None:
         return ""
-    bin_id, absolute, q, phi = ident
-    return f"[bin={bin_id},map={absolute},q={float(q)!r},phi={_phi_text(phi)}]"
+    bin_id, absolute, v0, v1 = ident
+    if axes is None:
+        return f"[bin={bin_id},map={absolute},q={float(v0)!r},phi={_phi_text(v1)}]"
+    coords = [f"{axes[0][0]}={float(v0)!r}{axes[0][1]}"]
+    if len(axes) > 1 and v1 is not None:
+        coords.append(f"{axes[1][0]}={float(v1)!r}{axes[1][1]}")
+    return f"[bin={bin_id},map={absolute},{','.join(coords)}]"
 
 
-def _bin_row_comment(row: int, ident: tuple | None) -> str:
+def _bin_row_comment(row: int, ident: tuple | None, axes=None) -> str:
     if ident is None:
         return f"# row {row}: bin identity unavailable\n"
-    bin_id, absolute, q, phi = ident
-    return (
-        f"# row {row}: dynamic_bin_id={bin_id} map_index={absolute} "
-        f"q={float(q)!r} phi={_phi_text(phi)}\n"
-    )
+    bin_id, absolute, v0, v1 = ident
+    if axes is None:
+        coords = f"q={float(v0)!r} phi={_phi_text(v1)}"
+    else:
+        coords = f"{axes[0][0]}={float(v0)!r}{axes[0][1]}"
+        if len(axes) > 1 and v1 is not None:
+            coords += f" {axes[1][0]}={float(v1)!r}{axes[1][1]}"
+    return f"# row {row}: dynamic_bin_id={bin_id} map_index={absolute} {coords}\n"
+
+
+def _diffusion_axis_problem(xf) -> str | None:
+    """Why ``xf``'s dynamic Q axis cannot be shown as tau(q) in inverse Angstrom.
+
+    Diffusion works in ONE unit, inverse Angstrom (D keeps its conventional
+    units). The dynamic axis is the first axis of the file's map; a file whose
+    axis is not a reciprocal length (e.g. Cartesian pixels) is refused.
+    """
+    name, unit = map_axis(getattr(xf, "qmap", None), 0)
+    try:
+        convert_q(1.0, unit, Q_UNIT_DISPLAY)
+    except ValueError:
+        return (
+            f"{xf.label}: its dynamic axis is {name} in {unit}, which is not a "
+            f"reciprocal length; tau-q needs q in {Q_UNIT_DISPLAY}"
+        )
+    return None
+
+
+def _diffusion_usable(xf_list) -> tuple[list, dict[str, str]]:
+    """``(files on a reciprocal-length axis, {label: reason} of the refused)``."""
+    usable, refused = [], {}
+    for xf in xf_list:
+        problem = _diffusion_axis_problem(xf)
+        if problem is None:
+            usable.append(xf)
+        else:
+            logger.warning("tau-q: skipping %s", problem)
+            refused[xf.label] = problem
+    return usable, refused
+
+
+def _in_diffusion_unit(xf, summary: dict | None) -> dict | None:
+    """``summary`` with its Q values in inverse Angstrom, tagged with that unit.
+
+    A file already in inverse Angstrom is shown as is (the stamp is written into
+    the summary itself); any other reciprocal-length file gets a copy whose
+    ``q_val`` is converted, so the Q range, the tau-q fit and the plot all see
+    one unit. ``tauq_q_unit`` travels with the tau-q results into the export.
+    """
+    if summary is None:
+        return None
+    _, unit = map_axis(getattr(xf, "qmap", None), 0)
+    if "q_val" not in summary:
+        return summary
+    if convert_q(1.0, unit, Q_UNIT_DISPLAY) == 1.0:  # already inverse Angstrom
+        summary["tauq_q_unit"] = Q_UNIT_DISPLAY
+        return summary
+    q_val = convert_q(summary["q_val"], unit, Q_UNIT_DISPLAY)
+    return {**summary, "q_val": q_val, "tauq_q_unit": Q_UNIT_DISPLAY}
 
 
 @contextlib.contextmanager
@@ -174,15 +272,23 @@ def _diffusion_fits_shown(xf_list):
     """Show each file's ``_diffusion_fit`` as ``xf.fit_summary`` (restored on exit).
 
     ``fit_tauq`` and the tau-q plot read ``xf.fit_summary``; the tau-q results
-    are written into the shown summary, which is the one the export reads.
+    are written into the shown summary, which is the one the export reads. A
+    file on another reciprocal-length unit is shown through a converted copy
+    (``_in_diffusion_unit``); its tau-q results are copied back to the fit they
+    belong to on exit, stamped with their unit.
     """
     original = {id(xf): xf.fit_summary for xf in xf_list}
+    source: dict[int, dict | None] = {}
     try:
         for xf in xf_list:
-            xf.fit_summary = _diffusion_fit(xf)[0]
+            source[id(xf)] = _diffusion_fit(xf)[0]
+            xf.fit_summary = _in_diffusion_unit(xf, source[id(xf)])
         yield
     finally:
         for xf in xf_list:
+            shown, own = xf.fit_summary, source.get(id(xf))
+            if own is not None and shown is not None and shown is not own:
+                own.update({k: v for k, v in shown.items() if k.startswith("tauq_")})
             xf.fit_summary = original[id(xf)]
 
 
@@ -537,6 +643,8 @@ class ViewerKernel(FileLocator):
         delegates actual plotting to the g2mod module while providing
         data preprocessing and validation.
         """
+        # g2mod.get_data puts every file on the first file's Q axis (it converts a
+        # compatible unit and leaves out an incompatible file with a warning)
         xf_list = self.get_xf_list(rows=rows, filter_atype="Multitau")
         if xf_list:
             g2_module = self.get_module("g2mod")
@@ -722,7 +830,7 @@ class ViewerKernel(FileLocator):
         for xf in xf_list:
             if any(atype in xf.atype for atype in ["Multitau", "Twotime"]):
                 g2_compatible_list.append(xf)
-        xf_list = g2_compatible_list
+        xf_list, _refused = _diffusion_usable(g2_compatible_list)
         logger.debug(f"Filtered to {len(xf_list)} G2-compatible files")
 
         # For tau-q, prefer Bayesian results when available (_diffusion_fit)
@@ -794,9 +902,13 @@ class ViewerKernel(FileLocator):
             for xf in self.get_xf_list(rows=rows, filter_atype="Multitau")
             if _diffusion_fit(xf)[0] is not None
         ]
+        # every file is fitted and drawn in inverse Angstrom, the Q range included
+        xf_list, refused = _diffusion_usable(xf_list)
 
         # For tau-q, prefer Bayesian results when available (_diffusion_fit)
-        result = {}
+        result = {
+            label: f"tauq fitting refused: {why}" for label, why in refused.items()
+        }
         with _diffusion_fits_shown(xf_list):
             for x in xf_list:
                 x.fit_tauq(q_range, bounds, fit_flag, force_refit=force_refit)
@@ -806,7 +918,7 @@ class ViewerKernel(FileLocator):
                     logger.error("tau-q fit failed for %s", x.label)
                     result[x.label] = "tauq fitting failed"
 
-            if len(result) > 0:
+            if xf_list:
                 _get_module("tauq").plot(
                     xf_list,
                     hdl=hdl,
@@ -1171,9 +1283,14 @@ class ViewerKernel(FileLocator):
         worker.setup(*args, **kwargs)
         self.avg_worker = worker
         logger.info("create average job, ID = %s", worker.jid)
-        self.target.clear()
+        # the worker copied the names; the loaded files of the emptied target
+        # list go with it (cache entries and their recorded revisions)
+        self.clear_target()
 
     def remove_job(self):
+        # the job is gone from the list: its progress record goes with it
+        if self.avg_worker is not None:
+            self.avg_worker_active.pop(self.avg_worker.jid, None)
         self.avg_worker = None
 
     def update_avg_info(self):
@@ -1311,13 +1428,22 @@ class ViewerKernel(FileLocator):
 
                 # Absolute identity of each G2 column (None for stand-in files)
                 columns = _g2_bin_identities(xf, len(q_val))
+                # the file's own axis names and units (R6-17): a map that is not
+                # (q, phi) is never written as q / phi
+                axes = _g2_axes(xf)
+                axis0 = axes[0][0] if axes else "q"
+                axes_line = _axes_comment(xf)
 
                 # Create header: the plain Q labels stay, the bin's full identity
-                # (dynamic bin, map position, numeric q and phi) is appended
+                # (dynamic bin, map position, both axis values) is appended
                 header = "tau(s)"
                 for i, q in enumerate(q_val):
-                    tag = _bin_tag(columns[i] if columns else None)
-                    header += f"\tG2_q{i:03d}(q={q:.6f}){tag}\tG2_err_q{i:03d}{tag}"
+                    tag = _bin_tag(columns[i] if columns else None, axes)
+                    header += (
+                        f"\tG2_q{i:03d}({axis0}={q:.6f}){tag}\tG2_err_q{i:03d}{tag}"
+                    )
+                if axes_line:  # states the unit of every number in the labels
+                    header += f"\n{axes_line}"
 
                 # Prepare data array
                 data_array = [t_el]
@@ -1336,6 +1462,8 @@ class ViewerKernel(FileLocator):
 
                     with open(fit_filename, "w") as f:
                         f.write(f"# G2 Fitting Results for {xf.label}\n")
+                        if axes_line:
+                            f.write(f"# {axes_line}\n")
                         f.write(f"# Fitting function: {xf.fit_summary['fit_func']}\n")
                         f.write(f"# Q-range: {xf.fit_summary['q_range']}\n")
                         f.write(f"# Time-range: {xf.fit_summary['t_range']}\n")
@@ -1345,7 +1473,7 @@ class ViewerKernel(FileLocator):
                         # bin identity (a radial Q alone is ambiguous) follows here.
                         if fit_ids is not None:
                             for i, ident in enumerate(fit_ids):
-                                f.write(_bin_row_comment(i, ident))
+                                f.write(_bin_row_comment(i, ident, axes))
                         f.write("\n")
 
                         # Parameter names
@@ -1402,11 +1530,13 @@ class ViewerKernel(FileLocator):
                         n_curves = min(len(fit_q), fit_line.shape[0])
                         header = "tau(s)"
                         for i in range(n_curves):
-                            header += f"\tG2_fit_q{i:03d}(q={fit_q[i]:.6f})"
+                            header += f"\tG2_fit_q{i:03d}({axis0}={fit_q[i]:.6f})"
                             if fit_ids is not None:
-                                header += _bin_tag(fit_ids[i])
+                                header += _bin_tag(fit_ids[i], axes)
                             if not fit_ok[i]:
                                 header += "[failed]"
+                        if axes_line:
+                            header += f"\n{axes_line}"
 
                         curve_data = [fit_x]
                         curve_data.extend(
@@ -1485,6 +1615,10 @@ class ViewerKernel(FileLocator):
 
         if not xf_list:
             raise ValueError("No files with tau-q fitting results found")
+        # tau-q is in inverse Angstrom; a file on another axis has no valid result
+        xf_list, refused = _diffusion_usable(xf_list)
+        if not xf_list:
+            raise ValueError("; ".join(refused.values()))
 
         # tauq_success is the single truth: a failed fit has no valid parameters
         valid_xf_list = []
@@ -1514,7 +1648,7 @@ class ViewerKernel(FileLocator):
             )
 
         successful_exports = 0
-        total_files = len(valid_xf_list) + n_failed
+        total_files = len(valid_xf_list) + n_failed + len(refused)
         written = []  # files whose individual result was written (summary rows)
         # One guard for the whole export (inputs: every selected file): no
         # destination may be (a link to) an input or an earlier output of this run.
@@ -1537,6 +1671,12 @@ class ViewerKernel(FileLocator):
                     f.write(f"# Power Law Fitting Results for {xf.label}\n")
                     f.write("# Model: tau = a * q^b\n")
                     f.write(f"# File: {xf.fname}\n")
+                    axis_name, axis_unit = map_axis(getattr(xf, "qmap", None), 0)
+                    f.write(
+                        f"# Q unit: {fs.get('tauq_q_unit', 'not recorded')} "
+                        f"(Q-range and a, b refer to this unit; the file's own Q "
+                        f"axis is {axis_name} in {axis_unit})\n"
+                    )
                     f.write(f"# Fit method: {method}\n")
                     for line in _DIFFUSION_PROVENANCE[method]:
                         f.write(f"# {line}\n")
@@ -1598,7 +1738,7 @@ class ViewerKernel(FileLocator):
 
                 f.write(
                     "file_label\tfit_method\ta_value\ta_error\tb_value\tb_error\t"
-                    "file_name\n"
+                    "file_name\tq_unit\n"
                 )
 
                 logger.info(f"Creating summary table for {len(written)} files")
@@ -1607,7 +1747,7 @@ class ViewerKernel(FileLocator):
                     if "tauq_fit_val" in fs:
                         tauq_data = fs["tauq_fit_val"]
                         f.write(
-                            f"{xf.label}\t{method}\t{tauq_data[0, 0]:.6e}\t{tauq_data[1, 0]:.6e}\t{tauq_data[0, 1]:.6f}\t{tauq_data[1, 1]:.6f}\t{xf.fname}\n"
+                            f"{xf.label}\t{method}\t{tauq_data[0, 0]:.6e}\t{tauq_data[1, 0]:.6e}\t{tauq_data[0, 1]:.6f}\t{tauq_data[1, 1]:.6f}\t{xf.fname}\t{fs.get('tauq_q_unit', 'not recorded')}\n"
                         )
                         logger.info(f"Added summary data for {xf.label}")
                     else:

@@ -10,7 +10,7 @@ import h5py
 import hdf5plugin  # noqa: F401  # registers HDF5 compression plugins
 import numpy as np
 
-from ..io_utils import _cast_to_signed, average_frames_parallel
+from ..io_utils import average_frames_parallel, decode_counts
 from .base import ScatteringDataset
 
 logger = logging.getLogger(__name__)
@@ -60,7 +60,7 @@ class HdfDataset(ScatteringDataset):
                 if check_cancelled is not None:
                     check_cancelled()
                 data = cast(np.ndarray, f[self.data_path][()])
-            data = _cast_to_signed(data)
+            data = decode_counts(data)
             return data.astype(np.float32)
         return average_frames_parallel(
             self.fname,

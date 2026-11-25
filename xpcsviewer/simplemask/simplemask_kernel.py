@@ -7,6 +7,7 @@ Adapted from pySimpleMask for integration with XPCS Viewer.
 """
 
 import logging
+from collections.abc import Iterable
 from typing import Any, Literal
 
 import h5py
@@ -21,7 +22,11 @@ from xpcsviewer.simplemask.area_mask import MaskAssemble
 from xpcsviewer.simplemask.calibration import compute_center_from_ring
 from xpcsviewer.simplemask.pyqtgraph_mod import ImageViewROI, LineROI
 from xpcsviewer.simplemask.qmap import compute_qmap
-from xpcsviewer.simplemask.roi_geometry import roi_to_polygon
+from xpcsviewer.simplemask.roi_geometry import (
+    pixel_centre,
+    pixel_index_at,
+    roi_to_polygon,
+)
 from xpcsviewer.simplemask.utils import (
     check_consistency,
     combine_partitions,
@@ -29,6 +34,7 @@ from xpcsviewer.simplemask.utils import (
     hash_numpy_dict,
     optimize_integer_array,
 )
+from xpcsviewer.utils.export_guard import ExportGuard
 
 pg.setConfigOptions(imageAxisOrder="row-major")
 
@@ -127,6 +133,9 @@ class SimpleMaskKernel:
                 - pix_dim: Pixel size (mm)
                 - energy: X-ray energy (keV)
                 - shape: Detector shape (height, width)
+                - mask: optional 2-D array of ``shape`` (nonzero = valid pixel),
+                  the file's own mask; it is the editor's base layer. A missing
+                  key or a different shape starts with every pixel accepted.
             qmap_result: Precomputed Q-map and units for the supplied geometry.
 
         Returns:
@@ -136,6 +145,18 @@ class SimpleMaskKernel:
         shape = image.shape
         metadata = metadata.copy()
         metadata["shape"] = shape
+        # An array in the metadata would break dict comparisons (update_parameters).
+        seed = metadata.pop("mask", None)
+        base_mask = None
+        if seed is not None:
+            seed = np.asarray(seed)
+            if seed.shape == shape:
+                base_mask = seed != 0
+            else:
+                logger.warning(
+                    f"Ignoring the file's mask: its shape {seed.shape} differs "
+                    f"from the detector image shape {shape}"
+                )
 
         # Fill in defaults for missing geometry parameters so Q-map
         # computation can proceed even when HDF5 metadata is incomplete.
@@ -155,8 +176,8 @@ class SimpleMaskKernel:
                 )
                 metadata[key] = default
 
-        mask = np.ones(shape, dtype=bool)
-        mask_kernel = MaskAssemble(shape, image)
+        mask_kernel = MaskAssemble(shape, image, initial_mask=base_mask)
+        mask = mask_kernel.get_mask()
         self.clear_data()
         self.detector_image, self.shape, self.metadata = image, shape, metadata
         self.mask = mask
@@ -224,16 +245,40 @@ class SimpleMaskKernel:
         self.mask = mask
         return self.mask
 
-    def save_mask(self, save_name: str) -> None:
+    def _claim_output(
+        self, path: str, what: str, input_paths: Iterable[str] = ()
+    ) -> str:
+        """The write gate: refuse a destination that is a file in use as input.
+
+        The loaded detector's own source file is always protected, besides the
+        ``input_paths`` the caller knows about (raw file, files of the viewer).
+
+        Raises:
+            ExportCollisionError: ``path`` resolves to one of those files.
+        """
+        source = self.metadata.get("source_file")
+        inputs = [
+            *input_paths,
+            *([source] if isinstance(source, str) and source else []),
+        ]
+        return ExportGuard(inputs).claim(path, what)
+
+    def save_mask(self, save_name: str, input_paths: Iterable[str] = ()) -> None:
         """Save mask to HDF5 file.
 
         Args:
             save_name: Output file path (.h5/.hdf5)
+            input_paths: Files that must never be overwritten (see `_claim_output`)
+
+        Raises:
+            ExportCollisionError: ``save_name`` is one of the input files.
+            OSError: the file cannot be written.
         """
         if self.mask is None:
             logger.warning("No mask to save")
             return
 
+        save_name = self._claim_output(save_name, "mask", input_paths)
         mask = self.mask.astype(np.uint8)
 
         try:
@@ -265,16 +310,27 @@ class SimpleMaskKernel:
         self.mask_apply("mask_file")
         return True
 
-    def save_partition(self, save_fname: str, root: str = "/qmap") -> None:
+    def save_partition(
+        self,
+        save_fname: str,
+        root: str = "/qmap",
+        input_paths: Iterable[str] = (),
+    ) -> None:
         """Save partition to HDF5 file.
 
         Args:
             save_fname: Output file path (.h5/.hdf5)
             root: HDF5 group path for partition data
+            input_paths: Files that must never be overwritten (see `_claim_output`)
+
+        Raises:
+            ExportCollisionError: ``save_fname`` is one of the input files.
         """
         if self.new_partition is None:
             logger.warning("No partition to save")
             return
+
+        save_fname = self._claim_output(save_fname, "partition", input_paths)
 
         # Optimize integer arrays
         for key, val in self.new_partition.items():
@@ -319,8 +375,7 @@ class SimpleMaskKernel:
             return
 
         mouse_point = self.hdl.getView().mapSceneToView(pos)
-        col = int(mouse_point.x())
-        row = int(mouse_point.y())
+        col, row = pixel_index_at(self.hdl.imageItem, mouse_point.x(), mouse_point.y())
 
         if 0 <= row < self.shape[0] and 0 <= col < self.shape[1]:
             msg = f"x={col}, y={row}"
@@ -364,9 +419,10 @@ class SimpleMaskKernel:
         self.hdl.adjust_viewbox()
         self.hdl.set_colormap(cmap)
 
-        if plot_center and center[0] is not None:
+        if plot_center and center[0] is not None and center[1] is not None:
             t = pg.ScatterPlotItem()
-            t.addPoints(x=[center[0]], y=[center[1]], symbol="+", size=15)
+            x, y = pixel_centre(self.hdl.imageItem, center[0], center[1])
+            t.addPoints(x=[x], y=[y], symbol="+", size=15)
             self.hdl.add_item(t, label="center")
 
     def drawable_masks(self) -> list[tuple[str, np.ndarray]]:
@@ -398,7 +454,13 @@ class SimpleMaskKernel:
     def apply_drawing(
         self, drawn: list[tuple[str, np.ndarray]] | None = None
     ) -> np.ndarray:
-        """Combine the pending drawing ROIs into a keep-mask and remove them.
+        """Combine the pending drawing ROIs into the draw layer and remove them.
+
+        The draw layer is replaced on every Apply, so the new layer starts from
+        the drawn exclusions already in the current history state: exclusive
+        shapes add to them, "erase" shapes subtract from them (and from nothing
+        else: other mask layers are separate), and "inclusive" shapes keep only
+        their own region.
 
         Args:
             drawn: result of `drawable_masks` from the same Apply, so the
@@ -415,13 +477,22 @@ class SimpleMaskKernel:
         # Same rule as rasterize.rasterize, on the already filled polygons.
         exclusive = np.zeros(self.shape, dtype=bool)
         inclusive = np.zeros(self.shape, dtype=bool)
+        erase = np.zeros(self.shape, dtype=bool)
         has_inclusive = False
         for mode, filled in drawn:
             if mode == "inclusive":
                 has_inclusive = True
                 inclusive |= filled
+            elif mode == "erase":
+                erase |= filled
             else:
                 exclusive |= filled
+        previous = (
+            self.mask_kernel.current_layer("mask_draw") if self.mask_kernel else None
+        )
+        if previous is not None:
+            exclusive |= ~previous
+        exclusive &= ~erase
         keep_inclusive = inclusive if has_inclusive else np.ones(self.shape, bool)
         keep = np.logical_and(~exclusive, keep_inclusive)
         self.hdl.remove_rois(filter_str="roi_")
@@ -432,7 +503,7 @@ class SimpleMaskKernel:
         sl_type: Literal[
             "Rectangle", "Circle", "Ellipse", "Polygon", "Line"
         ] = "Polygon",
-        sl_mode: Literal["exclusive", "inclusive"] = "exclusive",
+        sl_mode: Literal["exclusive", "inclusive", "erase"] = "exclusive",
         num_edges: int | None = None,
         radius: float = 60,
         color: str = "r",
@@ -445,12 +516,14 @@ class SimpleMaskKernel:
 
         Args:
             sl_type: Shape type - Rectangle, Circle, Ellipse, Polygon, or Line
-            sl_mode: "exclusive" masks pixels, "inclusive" preserves pixels
+            sl_mode: "exclusive" masks pixels, "inclusive" keeps only its region,
+                "erase" removes its region from the drawn exclusions
             num_edges: Number of edges for Polygon (random 6-10 if None)
-            radius: Default radius for Circle
+            radius: Default radius for Polygon; default length for Line
             color: Pen color
-            width: Pen width
-            second_point: End point for Line ROI
+            width: Pen width; also the width in pixels of a Line strip
+            second_point: Circle edge point or Line end point, in the pixel-index
+                frame of the beam centre (the Line default is horizontal)
             label: ROI label (auto-generated if None)
             movable: Whether ROI can be moved
 
@@ -463,16 +536,20 @@ class SimpleMaskKernel:
         if label is not None and label in self.hdl.roi_items:
             self.hdl.remove_item(label)
 
-        cen = self.get_center()
-        if cen[0] is None or cen[1] is None or cen[0] < 0 or cen[1] < 0:
-            cen = (self.shape[1] // 2, self.shape[0] // 2)
-        elif cen[0] > self.shape[1] or cen[1] > self.shape[0]:
+        bcx, bcy = self.get_center()
+        if bcx is None or bcy is None or bcx < 0 or bcy < 0:
+            cx, cy = float(self.shape[1] // 2), float(self.shape[0] // 2)
+        elif bcx > self.shape[1] or bcy > self.shape[0]:
             logger.warning("Beam center out of range, using image center")
-            cen_x: float = float(self.shape[1] // 2)
-            cen_y: float = float(self.shape[0] // 2)
-            cen = (cen_x, cen_y)
+            cx, cy = float(self.shape[1] // 2), float(self.shape[0] // 2)
+        else:
+            cx, cy = float(bcx), float(bcy)
 
-        if sl_mode == "inclusive":
+        # Pixel-index frame -> the frame ROIs are drawn in, through the image item.
+        item = self.hdl.imageItem
+        ox, oy = pixel_centre(item, cx, cy)
+
+        if sl_mode in ("inclusive", "erase"):
             pen = pg.mkPen(color=color, width=width, style=QtCore.Qt.DotLine)
         else:
             pen = pg.mkPen(color=color, width=width)
@@ -490,7 +567,7 @@ class SimpleMaskKernel:
         new_roi: pg.ROI | None = None
 
         if sl_type == "Ellipse":
-            new_roi = pg.EllipseROI(cen, [60, 80], **kwargs)
+            new_roi = pg.EllipseROI((ox, oy), [60, 80], **kwargs)
             # Midpoint handles (4)
             new_roi.addScaleHandle([0.5, 0], [0.5, 1])
             new_roi.addScaleHandle([0.5, 1], [0.5, 0])
@@ -503,35 +580,29 @@ class SimpleMaskKernel:
             new_roi.addScaleHandle([0.8536, 0.8536], [0, 0])
 
         elif sl_type == "Circle":
-            cx, cy = cen
             radius = 10.0
-            if second_point is not None and cx is not None and cy is not None:
-                radius = np.sqrt(
-                    (second_point[1] - cy) ** 2 + (second_point[0] - cx) ** 2
-                )
-
-            if cx is not None and cy is not None:
-                new_roi = pg.CircleROI(
-                    pos=[cx - radius, cy - radius], radius=radius, **kwargs
-                )
-                # Add 2 opposite-side handles for uniform scaling
-                new_roi.addScaleHandle([0.5, 0], [0.5, 0.5])
-                new_roi.addScaleHandle([0.5, 1], [0.5, 0.5])
-            else:
-                return None
+            if second_point is not None:
+                sx, sy = pixel_centre(item, second_point[0], second_point[1])
+                radius = float(np.hypot(sx - ox, sy - oy))
+            new_roi = pg.CircleROI(
+                pos=[ox - radius, oy - radius], radius=radius, **kwargs
+            )
+            # Add 2 opposite-side handles for uniform scaling
+            new_roi.addScaleHandle([0.5, 0], [0.5, 0.5])
+            new_roi.addScaleHandle([0.5, 1], [0.5, 0.5])
 
         elif sl_type == "Polygon":
             if num_edges is None:
                 num_edges = np.random.randint(6, 11)
             offset = np.random.randint(0, 360)
             theta = np.linspace(0, np.pi * 2, num_edges + 1) + np.deg2rad(offset)
-            x = radius * np.cos(theta) + (cen[0] if cen[0] is not None else 0)
-            y = radius * np.sin(theta) + (cen[1] if cen[1] is not None else 0)
+            x = radius * np.cos(theta) + ox
+            y = radius * np.sin(theta) + oy
             pts = np.vstack([x, y]).T
             new_roi = pg.PolyLineROI(pts, closed=True, **kwargs)
 
         elif sl_type == "Rectangle":
-            new_roi = pg.RectROI(cen, [200, 150], **kwargs)
+            new_roi = pg.RectROI((ox, oy), [200, 150], **kwargs)
             # Corner handles (4)
             new_roi.addScaleHandle([0, 0], [1, 1])  # bottom-left
             new_roi.addScaleHandle([0, 1], [1, 0])  # top-left
@@ -544,12 +615,16 @@ class SimpleMaskKernel:
             new_roi.addScaleHandle([0.5, 1], [0.5, 0])  # top-mid
 
         elif sl_type == "Line":
-            if second_point is None or cen[0] is None or cen[1] is None:
-                return None
-            line_width = kwargs.pop("width", 1) if "width" in kwargs else 1
-            # cast to float tuple for LineROI
-            cen_f = (float(cen[0]), float(cen[1]))
-            new_roi = LineROI(cen_f, second_point, line_width, **kwargs)
+            if second_point is None:
+                # A movable default: horizontal, towards the side with room.
+                length = float(max(1, min(radius, min(self.shape) // 2)))
+                reach = cx + length
+                second_point = (
+                    reach if reach <= self.shape[1] - 1 else cx - length,
+                    cy,
+                )
+            end = pixel_centre(item, second_point[0], second_point[1])
+            new_roi = LineROI((ox, oy), end, float(width), **kwargs)
 
         else:
             raise TypeError(f"ROI type not implemented: {sl_type}")
