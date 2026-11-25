@@ -7,15 +7,17 @@ All notable changes to this project will be documented in this file.
 ### Added
 
 - Mask Editor: ROI vertex rasteriser ported from pySimpleMask (Apache-2.0); the wheel now ships `NOTICE` and `LICENSE-APACHE-2.0`
-- Q-map: transmission geometry accepts horizontal and vertical detector swing angles (degrees, read from optional metadata keys); zero swing leaves TTH, phi, qx, qy, x and y unchanged
+- Q-map: transmission geometry accepts horizontal and vertical detector swing angles (degrees, from the optional `swing_angle_horizontal`/`swing_angle_vertical` metadata keys; the APS 8-ID-I reader supplies them, other readers do not); zero swing leaves TTH, phi, qx, qy, x and y unchanged
 
 ### Changed
 
 - Add `scikit-image>=0.26.0` dependency (used by the ROI rasteriser)
+- Mask Editor: a custom frame range outside a single 2-D HDF5 image (start other than 0, or more than one frame) is now an error instead of being ignored
 - Q-map: `q` is now the momentum-transfer magnitude `2*k0*sin(alpha/2)` instead of `k0*sin(alpha)`; `qx`/`qy` keep the `k0*sin(alpha)` projection. Saved zero-swing transmission Q-maps and q-based partitions shift slightly, by about `alpha^2/8` relative (more at wide angle). The interactive viewer's hover q readout (`fileIO/qmap_utils.py`, used via `xpcs_file`) still uses `k0*sin(alpha)` like upstream pyXpcsViewer, so at wide angle (about 1.5% at 20 deg) it no longer equals the SimpleMask partition q; aligning the viewer is a separate decision
 
 ### Fixed
 
+- Mask Editor: APS 8-ID-I raw scans now carry their detector swing angles (`flightpath_swing`, `flightpath_swing_vertical`) into the Q-map; a swung scan previously opened with an unswung Q-map
 - Version: `xpcsviewer.__version__` previously fell back to a hard-coded `0.1.10` (and the log banner to `unknown`); it is now looked up from the `xpcsviewer-gui` distribution, so installed wheels report their real version, with `0+unknown` only when package metadata is absent
 - Fitting: in the G2 fit panel an unchecked parameter is still held at the midpoint of its min/max bounds (the geometric mean when the tau bounds are positive). Scripts calling `fit_with_fixed*` directly must now pass an explicit, finite `p0` whenever a parameter is fixed (`ValueError` otherwise) instead of getting a silent bounds-midpoint fallback; failed-fit placeholders keep the explicit fixed values
 - Fitting: `fit_with_fixed*` treat integer `fit_flag` values such as `[1, 1, 0]` as booleans; integer flags previously gave wrong parameters
