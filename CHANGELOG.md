@@ -17,7 +17,7 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
-- Mask Editor: APS 8-ID-I raw scans now carry their detector swing angles (`flightpath_swing`, `flightpath_swing_vertical`) into the Q-map; a swung scan previously opened with an unswung Q-map
+- Mask Editor: APS 8-ID-I raw scans now carry their detector swing angles (`flightpath_swing`, `flightpath_swing_vertical`) into the Q-map; a swung scan previously opened with an unswung Q-map; a saved partition records the swing-shifted beam centre (centre plus `D*tan(swing)/pixel`) as pySimpleMask does, unchanged for unswung scans
 - Version: `xpcsviewer.__version__` previously fell back to a hard-coded `0.1.10` (and the log banner to `unknown`); it is now looked up from the `xpcsviewer-gui` distribution, so installed wheels report their real version, with `0+unknown` only when package metadata is absent
 - Fitting: in the G2 fit panel an unchecked parameter is still held at the midpoint of its min/max bounds (the geometric mean when the tau bounds are positive). Scripts calling `fit_with_fixed*` directly must now pass an explicit, finite `p0` whenever a parameter is fixed (`ValueError` otherwise) instead of getting a silent bounds-midpoint fallback; failed-fit placeholders keep the explicit fixed values
 - Fitting: `fit_with_fixed*` treat integer `fit_flag` values such as `[1, 1, 0]` as booleans; integer flags previously gave wrong parameters

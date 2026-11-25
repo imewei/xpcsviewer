@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from ..base_reader import FileReader
 from ..formats import HdfDataset, get_format_loader
 from ..metadata import read_nexus_metadata
+
+logger = logging.getLogger(__name__)
 
 # Metadata key -> NeXus HDF5 path.
 METADATA_KEYMAPS: dict[str, str] = {
@@ -49,6 +52,7 @@ def get_nexus_metadata(fname: str, metadata_fname: str | None = None) -> dict[st
 
     for key in OPTIONAL_FIELDS:
         if meta.get(key) is None:
+            logger.info("%s not found in metadata, set to 0.0 degree", key)
             meta[key] = 0.0
 
     # Beam center = recorded center + detector translation in pixels.
