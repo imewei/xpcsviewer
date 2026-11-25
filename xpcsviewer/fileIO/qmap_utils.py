@@ -552,6 +552,13 @@ class QMap:
         return combined_list
 
     def get_qbin_label(self, qbin: int, append_qbin=False):
+        if (
+            isinstance(qbin, bool)
+            or not isinstance(qbin, (int, float, np.integer, np.floating))
+            or not float(qbin).is_integer()  # rejects 1.5, nan and inf
+        ):
+            return "invalid qbin"
+        qbin = int(qbin)
         if not 1 <= qbin <= len(self.dynamic_index_mapping):
             return "invalid qbin"
         qbin_absolute = self.dynamic_index_mapping[qbin - 1]

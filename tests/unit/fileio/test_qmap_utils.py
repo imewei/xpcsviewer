@@ -674,3 +674,20 @@ def test_qmap_manager_cache_behavior(manager_cache_size, expected_behavior):
         assert len(manager.db) == 1
     elif expected_behavior == "multiple_entries":
         assert len(manager.db) == 10
+
+
+def _qmap_with_two_bins() -> QMap:
+    qmap = QMap.__new__(QMap)
+    qmap.dynamic_index_mapping = np.array([1, 0], dtype=int)
+    qmap.qbin_labels = ["a", "b"]
+    return qmap
+
+
+@pytest.mark.parametrize("qbin", [True, False, 1.5, "1", None])
+def test_qbin_label_rejects_non_integral_or_non_numeric_ids(qbin):
+    assert _qmap_with_two_bins().get_qbin_label(qbin) == "invalid qbin"
+
+
+@pytest.mark.parametrize("qbin", [1.0, np.int64(1), np.float64(1.0)])
+def test_qbin_label_accepts_integral_floats_and_numpy_integers(qbin):
+    assert _qmap_with_two_bins().get_qbin_label(qbin) == "b"
