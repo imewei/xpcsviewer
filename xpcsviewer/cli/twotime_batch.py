@@ -1,6 +1,7 @@
 """Batch processing module for twotime correlation data."""
 
 import gc
+import math
 import os
 import re
 from pathlib import Path
@@ -40,6 +41,8 @@ def parse_q_phi_pair(q_phi_str: str) -> tuple[float, float]:
 
         q_value = float(parts[0].strip())
         phi_value = float(parts[1].strip())
+        if not (math.isfinite(q_value) and math.isfinite(phi_value)):
+            raise ValueError("q and phi must be finite")
 
         return q_value, phi_value
     except ValueError as e:
@@ -72,9 +75,27 @@ def extract_q_phi_from_label(label: str) -> tuple[float | None, float | None]:
     return q_value, phi_value
 
 
+def _collect_valid_qbins(
+    xfile: XpcsFile, require_phi: bool = True
+) -> list[tuple[int, str, float, float | None]]:
+    """Return (index, label, q, phi) for qbins whose label carries a q value.
+
+    phi is None for a radial-only map (no angle in the label); such bins are
+    kept only when ``require_phi`` is False.
+    """
+    valid_qbins = []
+    for i, label in enumerate(xfile.get_twotime_qbin_labels()):
+        q_value, phi_value = extract_q_phi_from_label(label)
+        if q_value is not None and (phi_value is not None or not require_phi):
+            valid_qbins.append((i, label, q_value, phi_value))
+        else:
+            logger.warning(f"Could not extract q/phi from qbin {i}: {label}")
+    return valid_qbins
+
+
 def find_qbins_for_q(
     xfile: XpcsFile, target_q: float
-) -> list[tuple[int, str, float, float]]:
+) -> list[tuple[int, str, float, float | None]]:
     """
     Find all qbins with the closest q-value(s) across all phi angles.
 
@@ -86,16 +107,8 @@ def find_qbins_for_q(
         List of tuples (qbin_index, label, q_value, phi_value) for closest
         matching qbins
     """
-    qbin_labels = xfile.get_twotime_qbin_labels()
-    valid_qbins = []
-
-    # First pass: collect all valid qbins with their q/phi values
-    for i, label in enumerate(qbin_labels):
-        q_value, phi_value = extract_q_phi_from_label(label)
-        if q_value is not None and phi_value is not None:
-            valid_qbins.append((i, label, q_value, phi_value))
-        else:
-            logger.warning(f"Could not extract q/phi from qbin {i}: {label}")
+    # phi is optional here: a radial-only map has no angle in its labels
+    valid_qbins = _collect_valid_qbins(xfile, require_phi=False)
 
     if not valid_qbins:
         logger.warning("No valid qbins found for q selection")
@@ -124,7 +137,7 @@ def find_qbins_for_q(
     )
 
     # Log the phi angles found
-    phi_angles = sorted([phi_val for _, _, _, phi_val in matching_qbins])
+    phi_angles = sorted(p for _, _, _, p in matching_qbins if p is not None)
     logger.info(f"Phi angles found: {phi_angles}")
 
     return matching_qbins
@@ -144,16 +157,7 @@ def find_qbins_for_phi(
         List of tuples (qbin_index, label, q_value, phi_value) for closest
         matching qbins
     """
-    qbin_labels = xfile.get_twotime_qbin_labels()
-    valid_qbins = []
-
-    # First pass: collect all valid qbins with their q/phi values
-    for i, label in enumerate(qbin_labels):
-        q_value, phi_value = extract_q_phi_from_label(label)
-        if q_value is not None and phi_value is not None:
-            valid_qbins.append((i, label, q_value, phi_value))
-        else:
-            logger.warning(f"Could not extract q/phi from qbin {i}: {label}")
+    valid_qbins = _collect_valid_qbins(xfile)
 
     if not valid_qbins:
         logger.warning("No valid qbins found for phi selection")
@@ -204,16 +208,7 @@ def find_qbin_for_qphi(
     Returns:
         Tuple (qbin_index, label, q_value, phi_value) for closest matching qbin or None
     """
-    qbin_labels = xfile.get_twotime_qbin_labels()
-    valid_qbins = []
-
-    # First pass: collect all valid qbins with their q/phi values
-    for i, label in enumerate(qbin_labels):
-        q_value, phi_value = extract_q_phi_from_label(label)
-        if q_value is not None and phi_value is not None:
-            valid_qbins.append((i, label, q_value, phi_value))
-        else:
-            logger.warning(f"Could not extract q/phi from qbin {i}: {label}")
+    valid_qbins = _collect_valid_qbins(xfile)
 
     if not valid_qbins:
         logger.warning("No valid qbins found for q-phi selection")
@@ -321,48 +316,54 @@ def create_twotime_plot_matplotlib(
 def generate_output_filename(
     input_path: str,
     q_value: float,
-    phi_value: float,
+    phi_value: float | None,
     output_format: str = "png",
     qbin_index: int | None = None,
     root: str | None = None,
 ) -> str:
     """
-    Generate standardized output filename.
+    Generate the output path of one image, relative to the output directory.
 
-    The name is unique per input file (path relative to ``root``, including its
-    extension) and per Q-bin (``qbin_index``), because the rounded q/phi values
-    alone can coincide for different files or bins.
+    The input file's directory (relative to ``root``) is kept as real
+    subdirectories and the input file's full name, including its extension, is
+    kept unmodified, so distinct input files can never share an output path.
+    The Q-bin index is part of the name because the rounded q/phi values alone
+    can coincide for different bins.
 
     Args:
         input_path: Input HDF file path
         q_value: Q-value
-        phi_value: Phi-value
+        phi_value: Phi-value, or None for a radial-only map (omitted from the name)
         output_format: Image format
         qbin_index: Q-bin index within the file; part of the name when given
         root: Batch root directory; the input path is made relative to it
 
     Returns:
-        Generated filename
+        Output path relative to the output directory
     """
     rel = os.path.relpath(input_path, root) if root else Path(input_path).name
-    basename = rel.replace(os.sep, "__").replace(".", "_")
     qbin = f"_bin{qbin_index:04d}" if qbin_index is not None else ""
-    return f"{basename}{qbin}_q{q_value:.4f}_phi{phi_value:.1f}.{output_format}"
+    phi = f"_phi{phi_value:.1f}" if phi_value is not None else ""
+    return f"{rel}{qbin}_q{q_value:.4f}{phi}.{output_format}"
 
 
-def process_single_file(file_path: str, args) -> int:
+def process_single_file(file_path: str, args, written: set[str] | None = None) -> int:
     """
     Process a single HDF file and generate twotime images.
 
     Args:
         file_path: Path to HDF file
         args: Command line arguments
+        written: Output paths already written in this run; an image whose path
+            is in it is not saved again. Updated in place.
 
     Returns:
         Number of images generated
     """
     logger.info(f"Processing file: {file_path}")
 
+    if written is None:
+        written = set()
     xfile = None  # Initialize outside try block for finally cleanup
     try:
         # Load XpcsFile
@@ -445,8 +446,15 @@ def process_single_file(file_path: str, args) -> int:
                         root=args.input if os.path.isdir(args.input) else None,
                     )
                     output_path = os.path.join(args.output, output_filename)
+                    key = os.path.normcase(os.path.abspath(output_path))
+                    if key in written:
+                        raise FileExistsError(
+                            f"{output_path} was already written in this run"
+                        )
 
+                    os.makedirs(os.path.dirname(output_path), exist_ok=True)
                     fig.savefig(output_path, dpi=args.dpi, bbox_inches="tight")
+                    written.add(key)
                     logger.info(f"Saved image: {output_path}")
                     images_generated += 1
                 finally:
@@ -522,12 +530,13 @@ def process_directory(directory: str, args) -> int:
 
     total_images = 0
     successful_files = 0
+    written: set[str] = set()
 
     for i, file_path in enumerate(hdf_files, 1):
         logger.info(f"Processing file {i}/{len(hdf_files)}: {file_path}")
 
         try:
-            images_count = process_single_file(file_path, args)
+            images_count = process_single_file(file_path, args, written)
             total_images += images_count
             if images_count > 0:
                 successful_files += 1
@@ -573,6 +582,11 @@ def run_twotime_batch(args) -> int:
         return 1
 
     # Validate argument values
+    for name, value in (("Q", args.q), ("Phi", args.phi)):
+        if value is not None and not math.isfinite(value):
+            logger.error(f"{name}-value must be finite, got: {value}")
+            return 1
+
     if args.q is not None and args.q <= 0:
         logger.error(f"Q-value must be positive, got: {args.q}")
         return 1

@@ -6,6 +6,7 @@ import time
 import traceback
 import uuid
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from contextlib import suppress
 from shutil import copyfile
 
 # Third-party imports
@@ -20,7 +21,7 @@ from xpcsviewer.gui.qt_compat import QObject, QtCore, Slot
 from xpcsviewer.utils.logging_config import get_logger
 
 # Local imports
-from ..fileIO.hdf_reader import put
+from ..fileIO.hdf_reader import clear_connection_pool, put
 from ..helper.listmodel import ListDataModel
 from ..xpcs_file import MemoryMonitor
 from ..xpcs_file import XpcsFile as XF
@@ -32,15 +33,30 @@ logger = get_logger(__name__)
 _TIME_FIELDS = frozenset({"g2", "g2_err", "G2", "IP", "IF"})
 
 
+def _canonical_fields(fields):
+    """IP and IF are channels of the NeXus ``G2`` dataset, not datasets of their own."""
+    return list(dict.fromkeys("G2" if f in ("IP", "IF") else f for f in fields))
+
+
+def _attr_of(xf, name):
+    """``xf.<name>``, else ``xf.qmap.<name>`` (index mappings live only on the qmap)."""
+    val = getattr(xf, name, None)
+    return val if val is not None else getattr(getattr(xf, "qmap", None), name, None)
+
+
 def _coords_of(xf, fields):
-    """Physical coordinates (delay, Q) that the averaged ``fields`` are indexed by."""
-    coords = {}
+    """Coordinates (delay, Q, index mapping, azimuth) the packed ``fields`` are indexed by."""
+    names = ()
     if _TIME_FIELDS.intersection(fields):
-        coords["t_el"] = getattr(xf, "t_el", None)
-        coords["dqlist"] = getattr(xf, "dqlist", None)
+        names += ("t_el", "dqlist", "dynamic_index_mapping", "dplist")
     if "saxs_1d" in fields:
-        coords["sqlist"] = getattr(xf, "sqlist", None)
-    return coords
+        names += ("sqlist", "static_index_mapping", "splist")
+    return {name: _attr_of(xf, name) for name in names}
+
+
+def _term(key, data):
+    """Per-file summand: errors add in quadrature, every other field linearly."""
+    return np.square(data) if key == "g2_err" else data
 
 
 def _accept_coords(ref, path, coords):
@@ -58,6 +74,28 @@ def _accept_coords(ref, path, coords):
         if a.shape != b.shape or not np.allclose(a, b, equal_nan=True):
             return False
     return True
+
+
+def _publish_average(template, save_path, result, input_paths):
+    """Write the average beside ``save_path`` and rename it into place.
+
+    A failure at any step leaves a previous ``save_path`` untouched, and the
+    rename replaces a link at ``save_path`` instead of writing through it.
+    """
+    out_dir = os.path.dirname(os.path.abspath(save_path))
+    tmp = os.path.join(out_dir, f".avg-{uuid.uuid4().hex}.tmp")
+    open(tmp, "xb").close()  # unique name, default permissions
+    try:
+        copyfile(template, tmp)
+        put(tmp, result, ftype="nexus", mode="alias")
+        _check_output_not_input(save_path, input_paths)
+        os.replace(tmp, save_path)
+    except BaseException:
+        with suppress(OSError):
+            os.remove(tmp)
+        raise
+    # pooled read handles and cached reads still refer to the replaced file
+    clear_connection_pool()
 
 
 def _check_output_not_input(save_path, input_paths):
@@ -163,6 +201,7 @@ class AverageToolbox(QtCore.QRunnable):
     ):
         if fields is None:
             fields = ["saxs_2d"]
+        fields = _canonical_fields(fields)
         if self.is_killed.is_set():
             # killed while still queued: never open a file
             self.status = "killed"
@@ -251,10 +290,11 @@ class AverageToolbox(QtCore.QRunnable):
             if key == "saxs_1d":
                 # only keep the Iq component, put method doesn't accept dict
                 result["saxs_1d"] = result["saxs_1d"] / np.sum(mask)
+            elif key == "g2_err":
+                # sigma of a mean of N independent values: sqrt(sum sigma_i^2) / N
+                result[key] = np.sqrt(result[key]) / np.sum(mask)
             else:
                 result[key] /= np.sum(mask)
-            if key == "g2_err":
-                result[key] /= np.sqrt(np.sum(mask))
             if key == "saxs_2d":
                 # saxs_2d needs to be (1, height, width)
                 saxs_2d = result[key]
@@ -276,8 +316,17 @@ class AverageToolbox(QtCore.QRunnable):
 
         logger.info(f"create file: {save_path}")
         # template = first accepted file, so metadata matches the averaged coordinates
-        copyfile(self._ref.get("path", self.origin_path), save_path)
-        put(save_path, result, ftype="nexus", mode="alias")
+        try:
+            _publish_average(
+                self._ref.get("path", self.origin_path),
+                save_path,
+                result,
+                [os.path.join(self.work_dir, f) for f in self.model[:]],
+            )
+        except Exception as e:
+            logger.error("cannot write the average to %s: %s", save_path, e)
+            self._finish(0)
+            return
 
         # Final cleanup to release memory
         del result
@@ -386,9 +435,11 @@ class AverageToolbox(QtCore.QRunnable):
                             if result[key] is None:
                                 # float64 so an integer-typed first file
                                 # cannot truncate or reject later additions
-                                result[key] = np.array(file_data[key], dtype=np.float64)
+                                result[key] = np.array(
+                                    _term(key, file_data[key]), dtype=np.float64
+                                )
                             else:
-                                result[key] += file_data[key]
+                                result[key] += _term(key, file_data[key])
                         mask[m] = 1
 
                 # Clear the XpcsFile to release memory immediately
@@ -504,10 +555,11 @@ class AverageToolbox(QtCore.QRunnable):
                                 for key in fields:
                                     if result[key] is None:
                                         result[key] = np.array(
-                                            file_result[key], dtype=np.float64
+                                            _term(key, file_result[key]),
+                                            dtype=np.float64,
                                         )
                                     else:
-                                        result[key] += file_result[key]
+                                        result[key] += _term(key, file_result[key])
                                 # counted only after every field was summed
                                 mask[m] = 1
 
@@ -701,6 +753,7 @@ def do_average(
     """
     if fields is None:
         fields = ["saxs_2d", "saxs_1d", "g2", "g2_err"]
+    fields = _canonical_fields(fields)
     if work_dir is None:
         work_dir = "./"
 
@@ -742,7 +795,7 @@ def do_average(
             return False
         mask[m] = 1
         for key in fields:
-            data = file_result[key]
+            data = _term(key, file_result[key])
             if result[key] is None:
                 result[key] = data
             else:
@@ -844,10 +897,11 @@ def do_average(
                 result["saxs_1d"] /= abs_cs_scale_tot
             else:
                 result["saxs_1d"] /= n_valid
+        elif key == "g2_err":
+            # sigma of a mean of N independent values: sqrt(sum sigma_i^2) / N
+            result[key] = np.sqrt(result[key]) / n_valid
         else:
             result[key] /= n_valid
-        if key == "g2_err":
-            result[key] /= np.sqrt(n_valid)
 
     logger.info("the valid dataset number is %d / %d", int(np.sum(mask)), int(tot_num))
 
@@ -864,8 +918,9 @@ def do_average(
         save_path = "AVG" + os.path.basename(flist[0])
         _check_output_not_input(save_path, [os.path.join(work_dir, f) for f in flist])
     logger.info(f"create file: {save_path}")
-    copyfile(original_file, save_path)
-    put(save_path, result, ftype="nexus", mode="alias")
+    _publish_average(
+        original_file, save_path, result, [os.path.join(work_dir, f) for f in flist]
+    )
 
     # Final cleanup
     del result

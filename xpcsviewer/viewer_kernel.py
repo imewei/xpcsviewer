@@ -28,6 +28,26 @@ _LAZY_MODULES = frozenset(
 )
 
 
+def _export_stems(xf_list) -> list[str]:
+    """Collision-free export basenames, one per file, from the source file names.
+
+    Display labels are not unique (``scan.hdf`` and ``scan_results.hdf`` both
+    become ``scan``). Names that would still coincide get ``_2``, ``_3``, ...
+    in selection order.
+    """
+    used: set[str] = set()
+    stems = []
+    for xf in xf_list:
+        stem = os.path.splitext(os.path.basename(str(xf.fname)))[0]
+        candidate, n = stem, 1
+        while candidate.casefold() in used:
+            n += 1
+            candidate = f"{stem}_{n}"
+        used.add(candidate.casefold())
+        stems.append(candidate)
+    return stems
+
+
 def _get_module(module_name: str) -> ModuleType | type:
     """Lazy load analysis modules to improve startup time"""
     if module_name not in _module_cache:
@@ -595,7 +615,11 @@ class ViewerKernel(FileLocator):
                     logger.info("g2 fitting is not available for %s", x.fname)
                 else:
                     x.fit_tauq(q_range, bounds, fit_flag, force_refit=force_refit)
-                    result[x.label] = x.get_fitting_info(mode="tauq_fitting")
+                    if (x.fit_summary or {}).get("tauq_success", False):
+                        result[x.label] = x.get_fitting_info(mode="tauq_fitting")
+                    else:
+                        logger.error("tau-q fit failed for %s", x.label)
+                        result[x.label] = "tauq fitting failed"
 
             if len(result) > 0:
                 _get_module("tauq").plot(
@@ -1021,7 +1045,7 @@ class ViewerKernel(FileLocator):
         successful_exports = 0
         total_files = len(xf_list)
 
-        for xf in xf_list:
+        for xf, stem in zip(xf_list, _export_stems(xf_list), strict=True):
             # Export raw G2 data
             logger.info(
                 f"G2 export kernel: Processing file {xf.label} (atype: {getattr(xf, 'atype', 'unknown')})"
@@ -1030,7 +1054,7 @@ class ViewerKernel(FileLocator):
                 q_val, t_el, g2, g2_err, _labels = xf.get_g2_data()
 
                 # Save G2 correlation data
-                g2_filename = os.path.join(folder, f"{xf.label}_g2_data.txt")
+                g2_filename = os.path.join(folder, f"{stem}_g2_data.txt")
 
                 # Create header
                 header = "tau(s)"
@@ -1049,7 +1073,7 @@ class ViewerKernel(FileLocator):
 
                 # Export fitting results if available
                 if xf.fit_summary is not None:
-                    fit_filename = os.path.join(folder, f"{xf.label}_g2_fitting.txt")
+                    fit_filename = os.path.join(folder, f"{stem}_g2_fitting.txt")
 
                     with open(fit_filename, "w") as f:
                         f.write(f"# G2 Fitting Results for {xf.label}\n")
@@ -1094,7 +1118,7 @@ class ViewerKernel(FileLocator):
                     # Export fitted curves if available
                     if "fit_line" in xf.fit_summary and "fit_x" in xf.fit_summary:
                         curve_filename = os.path.join(
-                            folder, f"{xf.label}_g2_fitted_curves.txt"
+                            folder, f"{stem}_g2_fitted_curves.txt"
                         )
 
                         fit_x = xf.fit_summary["fit_x"]
@@ -1175,24 +1199,38 @@ class ViewerKernel(FileLocator):
         if not xf_list:
             raise ValueError("No files with tau-q fitting results found")
 
-        # Filter files that actually have tau-q fitting data
+        # tauq_success is the single truth: a failed fit has no valid parameters
         valid_xf_list = []
+        n_failed = 0
         for xf in xf_list:
-            if xf.fit_summary and "tauq_fit_val" in xf.fit_summary:
+            fs = xf.fit_summary
+            if not fs or not ("tauq_fit_val" in fs or "tauq_success" in fs):
+                continue
+            if fs.get("tauq_success", False):
                 valid_xf_list.append(xf)
+            else:
+                n_failed += 1
+                logger.error(
+                    f"Tau-q fit failed for {xf.label}; fit parameters not exported"
+                )
 
         if not valid_xf_list:
+            if n_failed:
+                raise ValueError(
+                    f"Tau-q power law fit failed for all {n_failed} selected files; "
+                    "nothing to export."
+                )
             raise ValueError(
                 "No files with tau-q power law fitting results found. Please perform diffusion analysis first."
             )
 
         successful_exports = 0
-        total_files = len(valid_xf_list)
+        total_files = len(valid_xf_list) + n_failed
 
         # Export individual file results
-        for xf in valid_xf_list:
+        for xf, stem in zip(valid_xf_list, _export_stems(valid_xf_list), strict=True):
             try:
-                filename = os.path.join(folder, f"{xf.label}_diffusion_fitting.txt")
+                filename = os.path.join(folder, f"{stem}_diffusion_fitting.txt")
 
                 tauq_data = xf.fit_summary[
                     "tauq_fit_val"
@@ -1239,7 +1277,7 @@ class ViewerKernel(FileLocator):
                 f.write("# Power Law Fitting Summary\n")
                 f.write("# Model: tau = a * q^b\n")
                 f.write(f"# Export date: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-                f.write(f"# Total files: {total_files}\n\n")
+                f.write(f"# Total files: {len(valid_xf_list)}\n\n")
 
                 f.write("file_label\ta_value\ta_error\tb_value\tb_error\tfile_name\n")
 

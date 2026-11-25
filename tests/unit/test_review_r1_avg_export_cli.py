@@ -194,7 +194,7 @@ def test_r1_19_recursive_batch_does_not_overwrite_same_named_files(
     n = tb.process_directory(str(root), _batch_args(root, out))
 
     assert n == 2
-    assert len(list(out.glob("*.png"))) == 2
+    assert len(list(out.rglob("*.png"))) == 2
 
 
 @pytest.mark.unit
@@ -229,6 +229,7 @@ def test_r1_08_export_g2_labels_cropped_fit_with_its_own_q(tmp_path, monkeypatch
     fit_line = np.stack([np.full(4, 2.0), np.full(4, 3.0)])
     xf = SimpleNamespace(
         label="runA",
+        fname="runA.hdf",
         atype="Multitau",
         get_g2_data=lambda: (
             q_src,

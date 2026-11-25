@@ -66,6 +66,14 @@ logger = get_logger(__name__)
 # Cap on remembered per-file twotime qbin selections (LRU-evicted).
 _TWOTIME_QBIN_MEMORY_MAX = 256
 
+
+def _remember_twotime_qbin(memory, fname, index):
+    memory[fname] = index
+    memory.move_to_end(fname)
+    if len(memory) > _TWOTIME_QBIN_MEMORY_MAX:
+        memory.popitem(last=False)
+
+
 # Setup exception logging
 setup_exception_logging()
 
@@ -166,11 +174,14 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
     >>> viewer.show()
     """
 
-    def __init__(self, path=None, label_style=None):
+    def __init__(self, path=None, label_style=None, path_explicit=False):
         super().__init__()
         self.setupUi(self)
         self.home_dir = home_dir
         self.label_style = label_style
+        # True when the user named the startup directory: it then wins over the
+        # workspace stored in the saved session (see _restore_session).
+        self._path_explicit = path_explicit
 
         self.tabWidget.setCurrentIndex(0)  # show scattering 2d
         self.plot_kwargs_record = {}
@@ -288,9 +299,12 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
 
         # Bayesian fitting state — G2 (single-Q)
         self._g2_bayesian_results: dict[int, object] = {}
-        # q_idx -> (file name, actual Q value) each cached fit was computed for
-        self._g2_bayesian_context: dict[int, tuple[str | None, float]] = {}
+        # q_idx -> (file name, actual Q value, fitted delay array) of each cached fit
+        self._g2_bayesian_context: dict[
+            int, tuple[str | None, float, np.ndarray | None]
+        ] = {}
         self._g2_bayesian_fit_fname: str | None = None
+        self._g2_bayesian_fit_x: np.ndarray | None = None
         self._g2_diagnosis_window = None
         self._g2_bayesian_worker_active: bool = False
         self._g2_bayesian_worker: object | None = None  # current single-Q worker
@@ -303,6 +317,7 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         self._g2_batch_t_range: tuple[float, float] | None = None
         self._g2_batch_t_el: np.ndarray | None = None
         self._g2_batch_q_arr: np.ndarray | None = None
+        self._g2_batch_q_x: dict[int, np.ndarray] = {}  # q_idx -> fitted delays
         self._g2_batch_fit_func_name: str | None = None
         self._g2_batch_target_xf: object | None = None
 
@@ -1232,15 +1247,25 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
                 session.window_geometry.height,
             )
 
+        # An explicitly requested startup directory wins over the session's
+        # workspace; the session's target files belong to that workspace only.
+        restore_workspace = not (
+            getattr(self, "_path_explicit", False)
+            and session.data_path
+            and os.path.abspath(session.data_path)
+            != os.path.abspath(self.work_dir.text() or ".")
+        )
+
         # Restore data path if it still exists
-        if session.data_path and os.path.isdir(session.data_path):
+        if restore_workspace and session.data_path and os.path.isdir(session.data_path):
             self.load_path(session.data_path)
 
         # Restore target files from session.
         # Guard against self.vk being None when data_path was absent or
         # load_path() was skipped (e.g. directory no longer exists).
         if (
-            self.vk is not None
+            restore_workspace
+            and self.vk is not None
             and hasattr(session, "target_files")
             and session.target_files
         ):
@@ -1570,11 +1595,12 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
                 labels=labels,
                 num_figs=num_figs,
                 fit_results=fit_results,
+                # t_range/y_range are forwarded so the renderer applies the manual
+                # axis ranges (it ignores them itself when t_auto/y_auto is set).
                 **{
                     k: v
                     for k, v in plot_params.items()
-                    if k
-                    not in {"q_range", "t_range", "y_range", "rows", "target_timestamp"}
+                    if k not in {"q_range", "rows", "target_timestamp"}
                 },
             )
             self._initialize_g2_fit_bounds(result.get("fit_delay_extent"))
@@ -2127,6 +2153,9 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
 
     def plot_saxs_2d_selection(self):
         selection = self.spinBox_saxs2d_selection.value()
+        # The direct draw below supersedes any in-flight async SAXS plot, whose
+        # request (target rows) cannot tell it apart from this selection.
+        self._retire_plot_operations("saxs_2d")
         self.plot_saxs_2d(selection=selection)
 
     def _current_twotime_fname(self):
@@ -2160,10 +2189,7 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         # happened to be showing.
         fname = self._current_twotime_fname()
         if fname is not None and index >= 0:
-            self._twotime_qbin_memory[fname] = index
-            self._twotime_qbin_memory.move_to_end(fname)
-            if len(self._twotime_qbin_memory) > _TWOTIME_QBIN_MEMORY_MAX:
-                self._twotime_qbin_memory.popitem(last=False)
+            _remember_twotime_qbin(self._twotime_qbin_memory, fname, index)
 
         # Now trigger the plot update
         logger.debug("TWOTIME Q SELECTION CHANGED: Calling update_plot()")
@@ -2827,7 +2853,10 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
 
             xf_list = self.vk.get_xf_list()
             if xf_list:
-                # Apply partition maps to all loaded XpcsFile objects (BUG-001 fix)
+                # Apply partition maps to all loaded XpcsFile objects (BUG-001 fix).
+                # Display only: the instance attributes shadow xf.qmap's maps for
+                # the Q-map and static views, while G2/two-time bin selection keeps
+                # using xf.qmap (the partition the correlations were computed on).
                 dqmap = partition.get("dynamic_roi_map")
                 sqmap = partition.get("static_roi_map")
                 for xf in xf_list:
@@ -2842,7 +2871,9 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             )
 
             self.statusbar.showMessage(
-                f"Partition imported: {dq_num} dynamic Q-bins, {sq_num} static Q-bins"
+                f"Partition imported for display: {dq_num} dynamic Q-bins, "
+                f"{sq_num} static Q-bins (existing G2/two-time results keep "
+                "the file's own Q bins)"
             )
 
             self.update_plot()
@@ -3019,6 +3050,22 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         if not self.mp_2t_hdls:
             self.init_twotime_plot_handler()
         new_labels = self.vk.plot_twotime(self.mp_2t_hdls, **kwargs)
+        if highlight_xy is not None:
+            # The renderer plotted the bin under the click; make the controls and
+            # the remembered selection show that bin, not the previous one.
+            xf_list = self.vk.get_xf_list(kwargs["rows"], filter_atype="Twotime")
+            if xf_list:
+                resolved = xf_list[0].get_twotime_maps(
+                    auto_crop=kwargs["auto_crop"],
+                    highlight_xy=highlight_xy,
+                    selection=current_selection,
+                )[2]
+                if resolved is not None:
+                    current_selection = int(resolved)
+                    if fname is not None:
+                        _remember_twotime_qbin(
+                            self._twotime_qbin_memory, fname, current_selection
+                        )
         if new_labels is not None:
             logger.debug(f"Repopulating ComboBox with new labels: {new_labels}")
             # current_selection already holds the right target: the
@@ -3899,6 +3946,10 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         # do not leak into the new session.
         self.plot_kwargs_record = {v: {} for _, v in tab_mapping.items()}
 
+        # Stop the running batch BEFORE clearing the state its callbacks use.
+        if self._g2_batch_coordinator is not None:
+            self._cancel_g2_bayesian_batch()
+
         # Clear Bayesian fitting state from previous dataset
         self._g2_bayesian_results = {}
         self._g2_bayesian_context = {}
@@ -3910,12 +3961,11 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         self._g2_batch_t_range = None
         self._g2_batch_t_el = None
         self._g2_batch_q_arr = None
+        self._g2_batch_q_x = {}
         self._g2_batch_fit_func_name = None
         self._g2_batch_target_xf = None
         self._diff_bayesian_result = None
         self._diff_bayesian_data = None
-        if self._g2_batch_coordinator is not None:
-            self._cancel_g2_bayesian_batch()
         if hasattr(self, "btn_g2_diagnosis"):
             self.btn_g2_diagnosis.setEnabled(False)
         if hasattr(self, "btn_diff_diagnosis"):
@@ -4166,9 +4216,13 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         return
 
     def remove_target(self):
+        if self.vk is None:
+            return
         rmv_list = []
         for x in self.list_view_target.selectedIndexes():
             rmv_list.append(x.data())
+        if not rmv_list:
+            return
 
         logger.debug(f"remove_target: Removing {len(rmv_list)} files from target list")
 
@@ -4435,13 +4489,16 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         xf_list = self.vk.get_xf_list(self.get_selected_rows())
         return xf_list[0].fname if xf_list else None
 
-    def _g2_fit_matches_current(self, q_idx, q_value):
-        """True if the cached fit for *q_idx* was made for the current file and Q."""
+    def _g2_fit_matches_current(self, q_idx, q_value, x):
+        """True if the cached fit for *q_idx* was made for the current file, Q
+        and delay observations *x*."""
         ctx = self._g2_bayesian_context.get(q_idx)
         return (
             ctx is not None
             and ctx[0] == self._g2_first_fname()
             and bool(np.isclose(ctx[1], q_value))
+            and ctx[2] is not None
+            and np.array_equal(ctx[2], x)
         )
 
     def _on_g2_qbin_changed(self, q_idx):
@@ -4494,7 +4551,7 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
                 extracted = self._extract_g2_for_bayesian()
                 if extracted is not None:
                     x, y, yerr, _, q_value, _ = extracted
-                    if self._g2_fit_matches_current(q_idx, q_value):
+                    if self._g2_fit_matches_current(q_idx, q_value, x):
                         fit_result = self._g2_bayesian_results[q_idx]
                         self._g2_bayesian_data = (x, y, yerr, q_idx, q_value)
                         self._update_g2_diagnosis(fit_result, x, y, yerr, q_value)
@@ -4607,6 +4664,7 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
 
         self._g2_bayesian_data = (x, y, yerr, q_idx, q_value)
         self._g2_bayesian_fit_fname = self._g2_first_fname()
+        self._g2_bayesian_fit_x = np.array(x)
 
         warmup = self.sb_g2_bayesian_warmup.value()
         samples = self.sb_g2_bayesian_samples.value()
@@ -4662,6 +4720,7 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         self._g2_bayesian_context[q_idx] = (
             self._g2_bayesian_fit_fname,
             float(q_value),
+            self._g2_bayesian_fit_x,
         )
 
         # Enable diagnosis only if the CURRENT spinbox Q-bin has a result
@@ -4800,6 +4859,7 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         self._g2_batch_q_range = (p[0], p[1])
         self._g2_batch_t_range = (p[2], p[3])
         self._g2_batch_q_arr = q_arr
+        self._g2_batch_q_x = {s["q_idx"]: np.array(s["x"]) for s in specs}
         self._g2_batch_t_el = t_el
         self._g2_batch_fit_func_name = fit_func_name
         rows = self.get_selected_rows()
@@ -4853,6 +4913,7 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             self._g2_bayesian_context[q_idx] = (
                 xf.fname if xf is not None else None,
                 float(self._g2_batch_q_arr[q_idx]),
+                self._g2_batch_q_x.get(q_idx),
             )
 
     def _on_g2_batch_single_q_error(self, q_idx, error_msg):
@@ -4862,6 +4923,11 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
     def _on_g2_batch_finished(self, results):
         """Assemble fit_summary from batch results and refresh plots."""
         from .fitting.bayesian_assembly import assemble_fit_summary
+
+        # The workspace was reset (state cleared) after this batch was started.
+        if self._g2_batch_q_arr is None:
+            logger.debug("Ignoring batch Bayesian results: batch state was reset")
+            return
 
         # Extract FitResult and per-Q timing from worker result dicts
         fit_results: dict[int, object | None] = {}
@@ -5167,11 +5233,11 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             q_idx = extracted_q_idx
 
         # The cache is keyed by relative index only; refuse a fit that was
-        # computed for another file or another actual Q value.
-        if not self._g2_fit_matches_current(q_idx, q_value):
+        # computed for another file, Q value or delay window.
+        if not self._g2_fit_matches_current(q_idx, q_value, x):
             self.statusbar.showMessage(
-                f"Cached fit for Q-bin {q_idx} belongs to a different file or Q "
-                "value — re-run Fit",
+                f"Cached fit for Q-bin {q_idx} belongs to a different file, Q "
+                "value or delay window — re-run Fit",
                 4000,
             )
             return
@@ -5447,7 +5513,7 @@ def setup_windows_icon():
     ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(appid)
 
 
-def main_gui(path=None, label_style=None):
+def main_gui(path=None, label_style=None, path_explicit=False):
     if os.name == "nt":
         setup_windows_icon()
 
@@ -5480,7 +5546,9 @@ def main_gui(path=None, label_style=None):
     try:
         # Store reference to prevent garbage collection of the Python wrapper
         # while the C++ QMainWindow is alive (PySide6 lifecycle requirement)
-        _viewer = XpcsViewer(path=path, label_style=label_style)
+        _viewer = XpcsViewer(
+            path=path, label_style=label_style, path_explicit=path_explicit
+        )
         logger.info("XpcsViewer window created successfully")
         app.exec()  # exec_() is deprecated in PySide6
     except Exception as e:

@@ -45,12 +45,32 @@ MEMORY_PRESSURE_HIGH = 0.80  # 80% - High memory pressure
 MEMORY_PRESSURE_MODERATE = 0.70  # 70% - Moderate memory pressure
 
 
+def _file_identity(path: str) -> tuple[int, ...] | None:
+    """Identify the file revision currently at ``path`` (None if unreadable).
+
+    An atomic replace changes the inode (and usually mtime/size), so a handle
+    or cached array tied to the old identity no longer describes ``path``.
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_ino, st.st_dev, st.st_mtime_ns, st.st_size)
+
+
 class PooledConnection:
     """Wrapper for pooled HDF5 connections with metadata."""
 
-    def __init__(self, file_handle: h5py.File, file_path: str):
+    def __init__(
+        self,
+        file_handle: h5py.File,
+        file_path: str,
+        identity: tuple[int, ...] | None = None,
+    ):
         self.file_handle = file_handle
         self.file_path = file_path
+        # ``_file_identity`` of the path when the handle was opened.
+        self.identity = identity
         self.created_at = time.time()
         self.last_accessed = self.created_at
         self.access_count = 0
@@ -211,9 +231,10 @@ class HDF5ConnectionPool:
         self._pressure_adaptation_interval = 30.0  # seconds
 
         # Read-ahead cache for batch operations
-        self._read_cache: dict[str, dict[str, Any]] = {}
+        self._read_cache: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._read_cache_lock = threading.RLock()
         self._read_cache_max_size = 50  # Maximum cached read results per file
+        self._read_cache_max_files = 20  # Maximum files with cached results (LRU)
 
         logger.info(
             f"HDF5ConnectionPool initialized: max_size={max_pool_size}, health_check_interval={health_check_interval}s"
@@ -476,7 +497,14 @@ class HDF5ConnectionPool:
                     connection = self._pool[fname]
                     self._pool.move_to_end(fname)
 
-                    if connection.check_health():
+                    if connection.identity != _file_identity(fname):
+                        # The path now names a different file (e.g. atomic
+                        # replace); the old handle still reads the old data.
+                        logger.info(f"File replaced on disk, reopening: {fname}")
+                        self._close_if_idle(connection)
+                        del self._pool[fname]
+                        connection = None
+                    elif connection.check_health():
                         connection.touch()
                         self.stats.record_connection_reused()
                         logger.debug(f"Reusing healthy connection for {fname}")
@@ -504,8 +532,11 @@ class HDF5ConnectionPool:
                             is_direct_connection = True
                         else:
                             logger.debug(f"Creating new connection for {fname}")
+                            # Stat before open: a replace in between is caught
+                            # as a mismatch on the next reuse.
+                            identity = _file_identity(fname)
                             fh = h5py.File(fname, mode)
-                            connection = PooledConnection(fh, fname)
+                            connection = PooledConnection(fh, fname, identity)
                             self._pool[fname] = connection
                             self.stats.record_connection_created()
                             file_handle_to_yield = fh
@@ -644,17 +675,30 @@ class HDF5ConnectionPool:
         results = {}
         cache_key = f"batch_{hash(tuple(sorted(dataset_paths)))}"
 
+        # Taken before reading so a replace during the read is seen as a
+        # mismatch (and a re-read) on the next lookup.
+        identity = _file_identity(fname)
+
         # Check read cache first
         if use_cache:
             with self._read_cache_lock:
-                if fname in self._read_cache and cache_key in self._read_cache[fname]:
-                    cached_result = self._read_cache[fname][cache_key]
-                    # Check if cache entry is recent (within 5 minutes)
-                    if time.time() - cached_result["timestamp"] < CACHE_ENTRY_TIMEOUT:
+                bucket = self._read_cache.get(fname)
+                cached_result = bucket.get(cache_key) if bucket else None
+                if cached_result is not None:
+                    # Hit only if recent (within 5 minutes) and for the same
+                    # file revision; otherwise drop the dead entry now.
+                    if (
+                        time.time() - cached_result["timestamp"] < CACHE_ENTRY_TIMEOUT
+                        and cached_result["identity"] == identity
+                    ):
+                        self._read_cache.move_to_end(fname)
                         logger.debug(
                             f"Using cached batch read for {len(dataset_paths)} datasets from {fname}"
                         )
                         return cached_result["data"]
+                    del bucket[cache_key]
+                    if not bucket:
+                        del self._read_cache[fname]
 
         # Perform batch read
         with self.get_connection(fname, "r") as f:
@@ -693,7 +737,12 @@ class HDF5ConnectionPool:
                 self._read_cache[fname][cache_key] = {
                     "data": results,
                     "timestamp": time.time(),
+                    "identity": identity,
                 }
+                # Bound total retention: evict least recently used files.
+                self._read_cache.move_to_end(fname)
+                while len(self._read_cache) > self._read_cache_max_files:
+                    self._read_cache.popitem(last=False)
 
         read_time = time.time() - start_time
         logger.debug(

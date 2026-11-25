@@ -403,8 +403,8 @@ class HDF5Facade:
                 g2_group = f[group]
 
                 # Read G2 data. g2 shape is (n_delay, n_q); the Q-bin is axis 1.
+                n_q = g2_group["g2"].shape[1]
                 if q_idx is not None:
-                    n_q = g2_group["g2"].shape[1]
                     if q_idx < 0 or q_idx >= n_q:
                         raise ValueError(
                             f"q_idx {q_idx} out of bounds for {n_q} Q-bins"
@@ -424,11 +424,11 @@ class HDF5Facade:
                     q_values = list(g2_group["q_list"][:])
                 else:
                     # Fallback: create dummy Q values
-                    # g2 shape is (n_delay, n_q); use shape[1] for the Q axis
+                    # Use the unsliced Q-axis length so q_idx still indexes it.
                     logger.warning(
                         f"Q values not found in {file_path}, using dummy values"
                     )
-                    q_values = list(range(g2.shape[1]))
+                    q_values = list(range(n_q))
 
                 if q_idx is not None:
                     q_values = q_values[q_idx : q_idx + 1]

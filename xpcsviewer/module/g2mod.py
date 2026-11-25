@@ -203,6 +203,9 @@ def pg_plot_stability(
         return
 
     num_figs, num_lines = compute_geometry(g2, plot_type)
+    if num_figs < 1 or num_lines < 1:
+        logger.warning("G2 stability plot skipped: the Q selection has no Q bins")
+        return
 
     num_data, num_qval = len(g2), g2[0].shape[1]
     # col and row for the 2d layout
@@ -324,29 +327,56 @@ def compute_geometry(g2, plot_type):
     return num_figs, num_lines
 
 
-def _q_panel_indices(q, m, n_curves):
-    """Map each curve of file ``m`` to the Q-bin panel (defined by file 0) of equal Q.
+def _q_panel_indices(q, m, n_curves, labels=None):
+    """Map each curve of file ``m`` to the Q-bin panel (defined by file 0).
 
-    Returns one panel index per curve, or ``None`` (after logging a warning)
-    where no panel has that Q, so a curve is never drawn under another Q.
+    Identical ordered grids (same count, same Q, same bin labels) map
+    positionally.  Otherwise curves are matched one-to-one in order, by full
+    bin label when both files have labels (so equal radial Q at different
+    azimuth stay apart), else by Q.  Returns one panel index per curve, or
+    ``None`` (after logging a warning) where no free panel matches, so a curve
+    is never drawn under another bin.
     """
     if m == 0:
         return list(range(n_curves))
     ref = np.asarray(q[0], dtype=float)
     own = np.asarray(q[m], dtype=float)
+    ref_lab = labels[0] if labels is not None and len(labels) > 0 else None
+    own_lab = labels[m] if labels is not None and m < len(labels) else None
+    use_labels = (
+        ref_lab is not None
+        and own_lab is not None
+        and len(ref_lab) == ref.size
+        and len(own_lab) == own.size
+    )
+    if (
+        own.size == ref.size == n_curves
+        and np.allclose(ref, own)
+        and (not use_labels or list(ref_lab) == list(own_lab))
+    ):
+        return list(range(n_curves))
+    taken: set[int] = set()
     out = []
     for j in range(n_curves):
-        hit = np.flatnonzero(np.isclose(ref, own[j])) if j < own.size else []
-        if len(hit) == 0:
+        if j >= own.size:
+            free = []
+        elif use_labels:
+            free = [i for i in range(ref.size) if ref_lab[i] == own_lab[j]]
+        else:
+            free = np.flatnonzero(np.isclose(ref, own[j])).tolist()
+        free = [i for i in free if i not in taken]
+        if not free:
             logger.warning(
-                "G2 curve %d of file %d (Q=%s) has no panel with matching Q; skipped",
+                "G2 curve %d of file %d (Q=%s) has no free panel with matching "
+                "Q-bin; skipped",
                 j,
                 m,
                 own[j] if j < own.size else "unknown",
             )
             out.append(None)
         else:
-            out.append(int(hit[0]))
+            taken.add(free[0])
+            out.append(int(free[0]))
     return out
 
 
@@ -422,7 +452,8 @@ def pg_plot(
 
     q, tel, g2, g2_err, labels = get_data(xf_list, q_range=q_range, t_range=t_range)
     num_figs, _num_lines = compute_geometry(g2, plot_type)
-    if num_figs < 1:
+    # single/single-combined keep one figure, so also check the curve count
+    if num_figs < 1 or _num_lines < 1:
         logger.warning("G2 plot skipped: the Q selection contains no Q bins")
         return
 
@@ -465,7 +496,11 @@ def pg_plot(
     for m in range(num_data):
         # each file has its own number of Q bins
         num_qval = g2[m].shape[1]
-        panels = _q_panel_indices(q, m, num_qval) if plot_type == "multiple" else None
+        panels = (
+            _q_panel_indices(q, m, num_qval, labels)
+            if plot_type == "multiple"
+            else None
+        )
         # default base line to be 1.0; used for non-fitting or fit error cases
         baseline_offset = np.ones(num_qval)
         fit_summary = None
@@ -582,6 +617,9 @@ def pg_plot(
                         )
 
 
+_TAU_NAMES = ("τ", "τ1", "τ2")
+
+
 def _add_fit_param_annotation(ax, fit_val, fit_func, color):
     """Add fitted parameter text annotation to plot.
 
@@ -591,11 +629,20 @@ def _add_fit_param_annotation(ax, fit_val, fit_func, color):
         fit_func: Fitting function type ('single' or 'double')
         color: Color for the text
     """
-    # Format parameters based on fit function
+    # Names follow the model signatures in xpcs_file/fitting.py:
+    # single_exp_all(x, a, b, c, d); double_exp_all(x, a, b1, c1, d, b2, c2, f)
     if fit_func == "single":
-        param_names = ["τ", "bkg", "cts", "d"]
+        param_names = ["contrast", "τ", "stretch", "baseline"]
     else:  # double exponential
-        param_names = ["τ1", "bkg", "cts1", "τ2", "cts2"]
+        param_names = [
+            "contrast",
+            "τ1",
+            "stretch1",
+            "baseline",
+            "τ2",
+            "stretch2",
+            "f",
+        ]
 
     # Create parameter text
     param_text_lines = []
@@ -605,7 +652,7 @@ def _add_fit_param_annotation(ax, fit_val, fit_func, color):
 
         # Format error gracefully
         if np.isfinite(error) and error > 0:
-            if param_names[p_idx] == "τ" or param_names[p_idx] == "τ1":
+            if param_names[p_idx] in _TAU_NAMES:
                 param_text_lines.append(
                     f"{param_names[p_idx]} = {value:.3e} ± {error:.2e}"
                 )
@@ -613,7 +660,7 @@ def _add_fit_param_annotation(ax, fit_val, fit_func, color):
                 param_text_lines.append(
                     f"{param_names[p_idx]} = {value:.3f} ± {error:.3f}"
                 )
-        elif param_names[p_idx] == "τ" or param_names[p_idx] == "τ1":
+        elif param_names[p_idx] in _TAU_NAMES:
             param_text_lines.append(f"{param_names[p_idx]} = {value:.3e} ± --")
         else:
             param_text_lines.append(f"{param_names[p_idx]} = {value:.3f} ± --")
@@ -717,7 +764,11 @@ def pg_plot_from_data(
     for m in range(num_data):
         # each file has its own number of Q bins
         num_qval = g2[m].shape[1] if g2[m].ndim > 1 else 1
-        panels = _q_panel_indices(q, m, num_qval) if plot_type == "multiple" else None
+        panels = (
+            _q_panel_indices(q, m, num_qval, labels)
+            if plot_type == "multiple"
+            else None
+        )
         baseline_offset = np.ones(num_qval)
 
         # Use pre-computed fit_results from worker if available

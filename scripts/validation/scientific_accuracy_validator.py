@@ -470,7 +470,11 @@ class SAXSAccuracyValidator(AccuracyValidator):
         try:
             if "vectorized_q_binning" in globals():
                 computed_q, computed_I, _bin_counts = vectorized_q_binning(
-                    q_map.flatten(), image_2d.flatten(), q_bins[0], q_bins[-1], len(q_bins) - 1
+                    q_map.flatten(),
+                    image_2d.flatten(),
+                    q_bins[0],
+                    q_bins[-1],
+                    len(q_bins) - 1,
                 )
             else:
                 # Use reference implementation
@@ -609,7 +613,10 @@ class ReproducibilityValidator:
                 if not np.allclose(reference_result, result, rtol=1e-15, atol=1e-15):
                     reproducible = False
                     break
-            elif isinstance(result, (int, float)) and abs(reference_result - result) > 1e-15:
+            elif (
+                isinstance(result, (int, float))
+                and abs(reference_result - result) > 1e-15
+            ):
                 reproducible = False
                 break
 
@@ -936,8 +943,14 @@ class ScientificAccuracyValidationFramework:
         print(f"Summary report saved to: {text_file}")
 
 
-def main():
-    """Main function to run scientific accuracy validation"""
+def main() -> int:
+    """Run scientific accuracy validation.
+
+    Returns:
+        Process exit status: 0 on success; 1 if any test failed, the accuracy
+        score is in the CRITICAL range (< 80), the run was interrupted, or an
+        exception occurred.
+    """
     # Create validation framework
     validator = ScientificAccuracyValidationFramework(tolerance=1e-10)
 
@@ -969,14 +982,18 @@ def main():
             for i, rec in enumerate(report.recommendations[:5], 1):
                 print(f"  {i}. {rec}")
 
+        return 1 if report.tests_failed > 0 or report.overall_accuracy_score < 80 else 0
+
     except KeyboardInterrupt:
         print("\nValidation interrupted by user")
+        return 1
     except Exception as e:
         print(f"\nValidation failed with error: {e}")
         import traceback
 
         traceback.print_exc()
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

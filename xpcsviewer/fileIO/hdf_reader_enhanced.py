@@ -22,6 +22,7 @@ from xpcsviewer.constants import MAX_HISTORY_ENTRIES, MIN_HISTORY_SAMPLES
 from ..utils.log_utils import log_timing
 from ..utils.logging_config import get_logger
 from ..utils.memory_manager import MemoryPressure, get_memory_manager
+from .hdf_reader import _file_identity
 
 logger = get_logger(__name__)
 
@@ -393,7 +394,9 @@ class ReadAheadCache:
         self, file_path: str, dataset_path: str, slice_info: tuple[slice, ...] | None
     ) -> np.ndarray | None:
         """Get cached data if available."""
-        cache_key = f"{file_path}:{dataset_path}:{slice_info}"
+        cache_key = (
+            f"{file_path}:{_file_identity(file_path)}:{dataset_path}:{slice_info}"
+        )
         with self._lock:
             if cache_key in self.cache:
                 entry = self.cache[cache_key]
@@ -415,7 +418,9 @@ class ReadAheadCache:
         if data is None:
             return
 
-        cache_key = f"{file_path}:{dataset_path}:{slice_info}"
+        cache_key = (
+            f"{file_path}:{_file_identity(file_path)}:{dataset_path}:{slice_info}"
+        )
         data_size_mb = data.nbytes / (1024 * 1024)
 
         # Skip caching very large chunks

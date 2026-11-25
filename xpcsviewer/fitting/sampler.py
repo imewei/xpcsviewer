@@ -229,6 +229,12 @@ def compute_bfmi(arviz_data) -> float | None:
         return None
 
 
+def _ess_value(value: float) -> int | float:
+    """Integer ESS when finite, NaN (unavailable) otherwise."""
+    value = float(value)
+    return int(value) if np.isfinite(value) else float("nan")
+
+
 def _build_fit_result(
     mcmc: MCMC,
     samples: dict,
@@ -260,8 +266,23 @@ def _build_fit_result(
     for name in param_names:
         if name in summary.index:
             r_hat[name] = float(summary.loc[name, "r_hat"])
-            ess_bulk[name] = int(summary.loc[name, "ess_bulk"])
-            ess_tail[name] = int(summary.loc[name, "ess_tail"])
+            # ArviZ reports NaN when a diagnostic is unavailable (very short or
+            # single chains); keep NaN rather than casting it to int.
+            ess_bulk[name] = _ess_value(summary.loc[name, "ess_bulk"])
+            ess_tail[name] = _ess_value(summary.loc[name, "ess_tail"])
+
+    unavailable = [
+        k
+        for d in (r_hat, ess_bulk, ess_tail)
+        for k, v in d.items()
+        if not np.isfinite(v)
+    ]
+    if unavailable:
+        logger.warning(
+            "Non-finite convergence diagnostics (R-hat/ESS) for %s; "
+            "chains are too short to assess convergence.",
+            sorted(set(unavailable)),
+        )
 
     # Count divergences
     extra = mcmc.get_extra_fields()

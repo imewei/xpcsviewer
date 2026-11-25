@@ -9,6 +9,7 @@ while leveraging the new fitting infrastructure internally.
 
 from __future__ import annotations
 
+import pickle
 from collections.abc import Callable, Sequence
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from typing import Any, cast
@@ -236,6 +237,19 @@ def initial_fit_guess(
     return guess
 
 
+def _param_errors(pcov: Any, n_free: int) -> NDArray[np.floating[Any]]:
+    """Standard errors from the covariance diagonal; NaN where unavailable.
+
+    An uncertainty the solver could not estimate is reported as NaN, never
+    replaced by an invented value.
+    """
+    pcov = np.asarray(pcov, dtype=float)
+    if pcov.shape != (n_free, n_free):
+        return np.full(n_free, np.nan)
+    diag = np.diag(pcov)
+    return np.sqrt(np.where(np.isfinite(diag) & (diag >= 0), diag, np.nan))
+
+
 @log_timing(threshold_ms=100)
 def fit_with_fixed(
     base_func: Callable[..., NDArray[np.floating[Any]]],
@@ -274,14 +288,19 @@ def fit_with_fixed(
         bounds midpoint is used.
     return_status : bool, optional
         If True, also return a per-column boolean array that is False where the
-        solver raised. Such columns hold bounds-midpoint placeholders with zero
-        errors, which are not a fit result.
+        solver raised, where the column has fewer observations than free
+        parameters, or where the solver stopped without converging (for
+        example at the evaluation limit). Columns where the solver raised or
+        the problem is underdetermined hold bounds-midpoint placeholders with
+        zero errors, which are not a fit result; a non-converged column keeps
+        the solver's last iterate.
 
     Returns
     -------
     tuple
         (fit_line, fit_params), or (fit_line, fit_params, success) when
-        ``return_status`` is True.
+        ``return_status`` is True. Parameter errors are NaN where the solver
+        could not estimate the covariance.
 
     Raises
     ------
@@ -333,7 +352,12 @@ def fit_with_fixed(
     for n in range(y.shape[1]):
         try:
             sigma_col = sigma[:, n] if sigma.ndim > 1 else sigma
-            popt, pcov = curve_fit(
+            n_obs = int(np.count_nonzero(np.isfinite(y[:, n])))
+            if n_obs < len(p0):
+                raise ValueError(
+                    f"{n_obs} observations cannot determine {len(p0)} free parameters"
+                )
+            result = curve_fit(
                 wrapper_func,
                 x,
                 y[:, n],
@@ -342,19 +366,18 @@ def fit_with_fixed(
                 bounds=(bounds_fit[0], bounds_fit[1]),
                 max_nfev=5000,
             )
+            popt, pcov = result
+            # nlsq reports non-convergence (e.g. evaluation limit) in `success`
+            # instead of raising; the last iterate is kept but flagged.
+            if not getattr(result, "success", True):
+                logger.warning(
+                    f"Column {n}: solver did not converge: "
+                    f"{getattr(result, 'message', '')}"
+                )
+                success[n] = False
 
             fit_val[n, 0, fit_flag] = popt
-            pcov_diag = np.diag(pcov)
-            errors = np.sqrt(pcov_diag)
-
-            if np.any(pcov_diag < 0):
-                logger.warning(
-                    f"Column {n}: Negative diagonal elements in covariance matrix"
-                )
-            if np.any(~np.isfinite(errors)):
-                errors = np.where(np.isfinite(errors), errors, np.abs(popt) * 0.1)
-
-            fit_val[n, 1, fit_flag] = errors
+            fit_val[n, 1, fit_flag] = _param_errors(pcov, len(p0))
             fit_val[n, 0, fix_flag] = full_p0[fix_flag]
             fit_val[n, 1, fix_flag] = 0
 
@@ -373,6 +396,31 @@ def fit_with_fixed(
     if return_status:
         return fit_line, fit_val, success
     return fit_line, fit_val
+
+
+class _FixedParamModel:
+    """Model with some parameters held fixed, as a picklable callable.
+
+    Module level (not a closure) so a process pool can pickle it. Uses a plain
+    list, not np.array, to avoid TracerArrayConversionError when nlsq
+    JIT-traces it with JAX tracers as ``fit_params``.
+    """
+
+    def __init__(
+        self,
+        base_func: Callable[..., Any],
+        fixed_values: list[float],
+        fit_indices: list[int],
+    ) -> None:
+        self.base_func = base_func
+        self.fixed_values = fixed_values
+        self.fit_indices = fit_indices
+
+    def __call__(self, x_data: Any, *fit_params: Any) -> Any:
+        full_params = list(self.fixed_values)
+        for idx, val in zip(self.fit_indices, fit_params):
+            full_params[idx] = val
+        return self.base_func(x_data, *full_params)
 
 
 def _fit_single_qvalue(
@@ -395,13 +443,7 @@ def _fit_single_qvalue(
             max_nfev=5000,
         )
 
-        pcov_diag = np.diag(pcov)
-        errors = np.sqrt(np.abs(pcov_diag))
-
-        if np.any(~np.isfinite(errors)):
-            errors = np.where(np.isfinite(errors), errors, np.abs(popt) * 0.1)
-
-        return col_idx, popt, errors, True
+        return col_idx, popt, _param_errors(pcov, len(p0)), True
 
     except Exception as e:
         logger.warning(f"Fitting failed for q-value {col_idx}: {e}")
@@ -448,11 +490,15 @@ def fit_with_fixed_parallel(
     fixed_values_par = full_p0.tolist()
     fit_indices_par = [i for i in range(num_args) if fit_flag[i]]
 
-    def wrapper_func(x_data, *fit_params):
-        full_params = list(fixed_values_par)
-        for idx, val in zip(fit_indices_par, fit_params):
-            full_params[idx] = val
-        return base_func(x_data, *full_params)
+    wrapper_func = _FixedParamModel(base_func, fixed_values_par, fit_indices_par)
+    if not use_threads:
+        try:
+            pickle.dumps(wrapper_func)
+        except Exception as e:
+            raise ValueError(
+                "use_threads=False needs a picklable, module-level base_func; "
+                f"got {base_func!r} ({e}). Use use_threads=True instead."
+            ) from e
 
     fit_args = []
     for n in range(num_qvals):
@@ -494,22 +540,11 @@ def fit_with_fixed_parallel(
                     f"Parallel fitting progress: {progress:.1f}% ({completed_fits}/{num_qvals})"
                 )
 
-    def generate_fit_line(n):
-        return n, ensure_numpy(base_func(fit_x, *fit_val[n, 0, :]))
-
+    # Evaluating the model on fit_x is cheap; do it in-process (a local closure
+    # could not be sent to a process pool).
     fit_line = np.zeros((num_qvals, len(fit_x)))
-
-    with executor_class(max_workers=max_workers) as executor:
-        line_futures = {
-            executor.submit(generate_fit_line, n): n for n in range(num_qvals)
-        }
-
-        for future in as_completed(line_futures):
-            from typing import cast
-
-            result_tuple = cast(tuple[int, NDArray[np.floating[Any]]], future.result())
-            n, line_data = result_tuple
-            fit_line[n] = line_data
+    for n in range(num_qvals):
+        fit_line[n] = ensure_numpy(base_func(fit_x, *fit_val[n, 0, :]))
 
     logger.info(f"Parallel G2 fitting completed for {num_qvals} q-values")
     return fit_line, fit_val

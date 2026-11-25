@@ -127,6 +127,30 @@ def _get_cached_singletons():
     )
 
 
+def _tauq_failure() -> dict:
+    """tau-q result for a failed fit: overwrites any earlier fit's numbers."""
+    return {
+        "tauq_success": False,
+        "tauq_fit_line": None,
+        "tauq_fit_val": np.full((2, 2), np.nan),  # rows: value, error; cols: a, b
+    }
+
+
+def _g2_fit_digest(fit_summary: dict) -> str:
+    """Identity of the G2 fit that a tau-q fit is derived from (q and fit values)."""
+    h = hashlib.md5(usedforsecurity=False)
+    for key in ("q_val", "fit_val"):
+        try:
+            arr = np.ascontiguousarray(
+                np.asarray(fit_summary.get(key, ()), dtype=float)
+            )
+            h.update(str(arr.shape).encode())
+            h.update(arr.tobytes())
+        except (TypeError, ValueError):  # non-numeric entries: hash their repr
+            h.update(repr(fit_summary.get(key)).encode())
+    return h.hexdigest()
+
+
 def create_id(fname, label_style=None, simplify_flag=True):
     """
     Generate a simplified or customized ID string from a filename.
@@ -732,6 +756,13 @@ class XpcsFile:
                         )
                         self.saxs_2d_data = ret["saxs_2d"]
 
+                # Canonical NeXus layout is (1, rows, cols); drop that singleton
+                # axis for every loading strategy (the standard reader does the
+                # same). Genuine multi-frame data is left untouched.
+                saxs_loaded = self.saxs_2d_data
+                if getattr(saxs_loaded, "ndim", 0) == 3 and saxs_loaded.shape[0] == 1:
+                    self.saxs_2d_data = saxs_loaded[0]
+
                 # Cache the loaded data using unified memory manager
                 if (
                     estimated_saxs_size_mb < MAX_PARALLEL_WORKERS
@@ -1105,7 +1136,8 @@ class XpcsFile:
                     f"Filtering out invalid Q indices {invalid_qindex} (max valid: {max_q_index}) for file {self.label}"
                 )
 
-            if not valid_qindex:
+            # An empty selection (Q range matching no bin) is a valid empty result.
+            if not valid_qindex and len(qindex_selected) > 0:
                 raise ValueError(
                     f"No valid Q indices found in qindex_selected {qindex_selected} for file {self.label}"
                 )
@@ -1159,7 +1191,7 @@ class XpcsFile:
                     f"Filtering out unprocessed Q indices {invalid_qindex} for twotime file {self.label}"
                 )
 
-            if not valid_qindex:
+            if not valid_qindex and len(qindex_selected) > 0:
                 raise ValueError(
                     f"No valid Q indices found in qindex_selected {qindex_selected} for twotime file {self.label}"
                 )
@@ -1402,8 +1434,10 @@ class XpcsFile:
     def get_twotime_maps(
         self, scale="log", auto_crop=True, highlight_xy=None, selection=None
     ):
+        # Two-time bins are bound to the file's own dynamic map: an imported
+        # partition (xf.dqmap, display only) must not relabel c2_processed_bins.
         # Work on a view until we need to mutate (astype creates a copy)
-        dqmap = self.dqmap
+        dqmap = self.qmap.dqmap
         saxs = self.saxs_2d_log if scale == "log" else self.saxs_2d
 
         # Handle 3D SAXS data by taking the first frame if needed
@@ -1586,6 +1620,8 @@ class XpcsFile:
         elif mode == "tauq_fitting":
             if "tauq_fit_val" not in self.fit_summary:
                 result = "tauq fitting is not available"
+            elif not self.fit_summary.get("tauq_success", True):
+                result = "tauq fitting failed; no fit parameters available"
             else:
                 v = self.fit_summary["tauq_fit_val"]
 
@@ -1732,6 +1768,8 @@ class XpcsFile:
 
         # Use optimized get_g2_data (which now has caching)
         q_val, t_el, g2, sigma, label = self.get_g2_data(qrange=q_range, trange=t_range)
+        if np.shape(g2)[-1] == 0:
+            raise ValueError(f"Cannot fit G2: no Q bins in range {q_range}")
 
         # The fit UI has no initial-value entry: the bounds midpoint (geometric
         # mean for tau) is both the starting point and the documented fixed value.
@@ -2007,6 +2045,8 @@ class XpcsFile:
 
         # Get G2 data
         q_val, t_el, g2, sigma, label = self.get_g2_data(qrange=q_range, trange=t_range)
+        if np.shape(g2)[-1] == 0:
+            raise ValueError(f"Cannot fit G2: no Q bins in range {q_range}")
 
         # Check if we should use parallel processing
         num_qvals = g2.shape[1] if g2.ndim > 1 else 1
@@ -2034,29 +2074,16 @@ class XpcsFile:
                 "Using sequential fitting due to small dataset or memory constraints"
             )
 
-        # Prepare fitting parameters
+        # Same a,b,c,d (single) / 7-parameter (double) models as fit_g2, so the
+        # stored summary has the column layout every fit_val reader assumes.
+        from xpcsviewer.xpcs_file.fitting import double_exp_all, single_exp_all
+
         if fit_func == "single":
-            from .fitting import single_exp
-
-            func = single_exp
+            func = single_exp_all
         elif fit_func == "double":
-            from .fitting import double_exp
-
-            func = double_exp
+            func = double_exp_all
         else:
-            # Try dynamic import for other function names
-            from xpcsviewer.xpcs_file.fitting import double_exp_all, single_exp_all
-
-            try:
-                if fit_func == "single_exp_all":
-                    func = single_exp_all
-                elif fit_func == "double_exp_all":
-                    func = double_exp_all
-                else:
-                    raise ValueError(f"Unknown fit function: {fit_func}")
-            except ValueError:
-                logger.warning(f"Unknown fit function {fit_func}, using single_exp")
-                func = single_exp
+            raise ValueError(f"Unknown fit function: {fit_func}")
 
         # Generate fit_x for evaluation
         fit_x = np.logspace(
@@ -2097,6 +2124,7 @@ class XpcsFile:
             "g2_errors": sigma,
             "parallel_used": use_parallel_actual,
             "num_qvals": num_qvals,
+            "fit_x": fit_x,
         }
 
         # Convert results to XPCS format for compatibility
@@ -2135,85 +2163,27 @@ class XpcsFile:
         """
         Convert high-performance fitting results to standard XPCS format.
 
-        Maintains backward compatibility while preserving enhanced diagnostic information.
+        ``fit_with_fixed`` already returns ``fit_val`` shaped (n_q, 2, n_params)
+        and ``fit_line`` shaped (n_q, n_x), the same arrays ``fit_g2`` stores, so
+        they are passed through unchanged together with the run metadata.
         """
-        # Extract fit results
-        fit_results = results["fit_results"]
-        n_q = len(q_val)
-
-        # Create fit_line and fit_val in expected format
-        fit_x = np.logspace(
-            np.log10(np.min(t_el)) - 0.5, np.log10(np.max(t_el)) + 0.5, 128
-        )
-        fit_line = np.zeros((n_q, len(fit_x)))
-        fit_val = []
-
-        # Process results for each q-value
-        for i, fit_result in enumerate(fit_results[:n_q]):  # Ensure we don't exceed n_q
-            if fit_result["status"] == "success" and fit_result["params"] is not None:
-                # Reconstruct fitted curve
-                params = fit_result["params"]
-                try:
-                    if fit_func == "single" and len(params) >= 4:
-                        from .fitting import single_exp_all
-
-                        fit_line[i, :] = single_exp_all(
-                            fit_x, params, fit_flag or [True] * 4
-                        )
-                    elif fit_func == "double" and len(params) >= 7:
-                        from .fitting import double_exp_all
-
-                        fit_line[i, :] = double_exp_all(
-                            fit_x, params, fit_flag or [True] * 7
-                        )
-                    else:
-                        fit_line[i, :] = np.ones_like(fit_x)  # Fallback
-                except Exception:
-                    fit_line[i, :] = np.ones_like(fit_x)  # Fallback
-
-                # Create enhanced fit value dictionary
-                fit_val_entry = {
-                    "params": params,
-                    "param_errors": fit_result.get("param_errors"),
-                    "covariance": fit_result.get("covariance"),
-                    "robust_fit": fit_result.get("robust_fit", False),
-                    "diagnostics": fit_result.get("diagnostics", {}),
-                    "q_index": i,
-                    "status": "success",
-                }
-            else:
-                # Failed fit
-                fit_line[i, :] = np.ones_like(fit_x)
-                fit_val_entry = {
-                    "params": None,
-                    "error": fit_result.get("error", "Unknown error"),
-                    "status": "failed",
-                    "q_index": i,
-                }
-
-            fit_val.append(fit_val_entry)
-
-        # Create comprehensive fit summary with performance metrics
-        fit_summary = {
+        return {
             "fit_func": fit_func,
-            "fit_val": fit_val,
+            "fit_val": results["fit_results"],
             "t_el": t_el,
             "q_val": np.asarray(q_val),  # Ensure q_val is always a numpy array
             "q_range": str(q_range),
             "t_range": str(t_range),
             "bounds": bounds,
             "fit_flag": str(fit_flag),
-            "fit_line": fit_line,
+            "fit_line": results["fit_line"],
+            "fit_x": results["fit_x"],
             "label": label,
-            # Enhanced performance and diagnostic information
             "performance_info": results.get("performance_info", {}),
             "timing": results.get("timing", {}),
             "optimization_summary": results.get("optimization_summary", {}),
             "high_performance_fit": True,
-            "fit_x": fit_x,
         }
-
-        return fit_summary
 
     @staticmethod
     def correct_g2_err(g2_err=None, threshold=1e-6):
@@ -2237,7 +2207,10 @@ class XpcsFile:
             return None
 
         # Generate cache key for tauq fitting
-        cache_key = self._generate_cache_key("fit_tauq", q_range, bounds, fit_flag)
+        # The G2 fit it derives from is part of the key: a re-fit must not reuse it.
+        cache_key = self._generate_cache_key(
+            "fit_tauq", q_range, bounds, fit_flag, _g2_fit_digest(self.fit_summary)
+        )
         tauq_cache_key = f"tauq_fit_{cache_key}"
 
         # Check if tauq fitting result is already cached (unless force_refit is True)
@@ -2286,7 +2259,7 @@ class XpcsFile:
             # Validate that we have data after filtering
             if not np.any(q_slice):
                 logger.warning(f"No data points in q_range {q_range}")
-                tauq_result = {"tauq_success": False}
+                tauq_result = _tauq_failure()
                 self._memory_manager.cache_put(
                     tauq_full_cache_key, tauq_result, CacheType.COMPUTATION
                 )
@@ -2299,7 +2272,7 @@ class XpcsFile:
 
         except (IndexError, KeyError, ValueError) as e:
             logger.error(f"Array indexing error in fit_tauq: {e}")
-            tauq_result = {"tauq_success": False}
+            tauq_result = _tauq_failure()
             self._memory_manager.cache_put(
                 tauq_full_cache_key, tauq_result, CacheType.COMPUTATION
             )
@@ -2321,7 +2294,7 @@ class XpcsFile:
         valid_idx &= domain
 
         if np.sum(valid_idx) == 0:
-            tauq_result = {"tauq_success": False}
+            tauq_result = _tauq_failure()
             self._memory_manager.cache_put(
                 tauq_full_cache_key, tauq_result, CacheType.COMPUTATION
             )
@@ -2334,7 +2307,7 @@ class XpcsFile:
                 "fit_tauq: fewer than 2 distinct positive q values; "
                 "cannot fit both parameters"
             )
-            tauq_result = {"tauq_success": False}
+            tauq_result = _tauq_failure()
             self._memory_manager.cache_put(
                 tauq_full_cache_key, tauq_result, CacheType.COMPUTATION
             )
@@ -2445,7 +2418,7 @@ class XpcsFile:
             else None,
             "tauq_fit_val": fit_val[0]
             if fitting_success
-            else np.zeros((2, len(fit_flag))),
+            else np.full((2, len(fit_flag)), np.nan),
         }
 
         # Cache the result using unified memory manager
@@ -2715,7 +2688,7 @@ class XpcsFile:
         )
         use_streaming = (
             saxs_size_mb > 500  # Large dataset > 500MB
-            and self.memory_manager.get_memory_pressure()
+            and self._memory_manager.get_memory_pressure()
             in [MemoryPressure.HIGH, MemoryPressure.CRITICAL]
         )
 
@@ -2723,7 +2696,11 @@ class XpcsFile:
             logger.info(
                 f"Using streaming ROI calculation for large dataset ({saxs_size_mb:.1f}MB)"
             )
-            return self._get_roi_data_streaming(roi_parameter, phi_num)
+            streamed = self._get_roi_data_streaming(roi_parameter, phi_num)
+            if streamed is not None:
+                return streamed
+            # the streaming path does not implement every ROI type (e.g. "Ring")
+            logger.info(f"No streaming ROI for {roi_parameter['sl_type']}; using eager")
 
         # Access qmap data directly from attributes
         qmap = self.sqmap  # q map
@@ -2768,7 +2745,8 @@ class XpcsFile:
             # Vectorized qmax cutoff calculation and application
             dist = roi_parameter["dist"]
             wlength = 12.398 / self.X_energy
-            qmax = dist * self.pix_dim_x / self.det_dist * 2 * np.pi / wlength
+            # pixel_size and det_dist are both metres on the qmap
+            qmax = dist * self.pixel_size / self.det_dist * 2 * np.pi / wlength
 
             # Vectorized masking instead of separate assignments
             saxs_roi = np.where(
@@ -2786,7 +2764,13 @@ class XpcsFile:
 
             # Get phi range more efficiently using masked operations
             pmap_roi = pmap[rroi]
+            if pmap_roi.size == 0:
+                logger.warning(f"Ring ROI radius {(rmin, rmax)} contains no pixels")
+                return np.empty(0), np.empty(0)
             phi_min, phi_max = np.min(pmap_roi), np.max(pmap_roi)
+            if phi_min == phi_max:
+                # zero angular span: a single angle bin holding the mean intensity
+                return np.array([phi_min]), np.array([np.mean(self.saxs_2d[rroi])])
             x = np.linspace(phi_min, phi_max, phi_num)
             delta = (phi_max - phi_min) / phi_num
 
@@ -2871,7 +2855,7 @@ class XpcsFile:
             saxs_nor = np.zeros(qsize)
 
             # Process in chunks to avoid memory issues
-            chunk_size = min(1000000, self.saxs_2d.size // 10)  # Adaptive chunk size
+            chunk_size = max(1, min(1000000, self.saxs_2d.size // 10))  # Adaptive
             flat_saxs = self.saxs_2d.ravel()
             flat_mask = roi_mask_indexed.ravel()
 
@@ -2895,14 +2879,16 @@ class XpcsFile:
             # Apply qmax cutoff
             dist = roi_parameter["dist"]
             wlength = 12.398 / self.X_energy
-            qmax = dist * self.pix_dim_x / self.det_dist * 2 * np.pi / wlength
+            # pixel_size and det_dist are both metres on the qmap
+            qmax = dist * self.pixel_size / self.det_dist * 2 * np.pi / wlength
 
-            if qmax < np.max(self.sqspan):
-                qmax_idx = np.searchsorted(self.sqspan, qmax, side="right")
-                saxs_roi[qmax_idx:] = 0
-
+            # Same output contract as the eager path: q axis is sqlist and
+            # cut-off / non-positive bins are NaN.
+            saxs_roi = np.where(
+                (self.sqlist >= qmax) | (saxs_roi <= 0), np.nan, saxs_roi
+            )
             logger.info("Streaming ROI calculation completed")
-            return self.sqspan[:-1], saxs_roi
+            return self.sqlist, saxs_roi
 
         if roi_parameter["sl_type"] == "Phi_ring":
             # Similar streaming approach for phi_ring ROI

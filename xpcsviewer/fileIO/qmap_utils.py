@@ -596,9 +596,10 @@ class QMap:
 
         qselected_flat = qselected.flatten()
 
-        # Handle edge case where no q-bins are selected
+        # A range that matches no bin selects nothing (callers handle empty);
+        # only qrange=None means "all bins".
         if not np.any(qselected_flat):
-            qselected_flat = np.ones_like(qlist, dtype=bool).flatten()
+            logger.warning(f"qrange {qrange} matches no q-bin")
 
         # Vectorized approach to finding valid q-bins
         # Use boolean indexing instead of loops
@@ -688,7 +689,7 @@ class QMap:
         # Use memory-efficient data types where precision allows
         qmap = {
             "phi": phi_deg,  # Keep as float64 for precision
-            "alpha": alpha.astype(np.float32),
+            "alpha": np.rad2deg(alpha).astype(np.float32),  # displayed in degrees
             "q": qr,  # Keep as float64 for precision
             "qx": qx.astype(np.float32),
             "qy": qy.astype(np.float32),

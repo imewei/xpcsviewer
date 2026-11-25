@@ -46,7 +46,7 @@ class ValidationSummary:
     """Summary of all validation results"""
 
     overall_score: float
-    performance_score: float
+    performance_score: float | None  # None: not measured
     accuracy_score: float
     integration_score: float
     stability_score: float
@@ -96,6 +96,9 @@ class ValidationOrchestrator:
             "stability": None,
         }
 
+        # Steps that failed to run or whose required subprocess exited non-zero
+        self.failed_steps: list[str] = []
+
         # Phase validation tracking
         self.phase_validation_status = {
             "Phase1_Memory": "pending",
@@ -119,31 +122,16 @@ class ValidationOrchestrator:
         self.logger = logging.getLogger("ValidationOrchestrator")
 
     def run_performance_benchmarks(self) -> bool:
-        """Run comprehensive performance benchmarks"""
-        self.logger.info("Starting performance benchmarking...")
+        """Performance benchmarks are not implemented: report them as unavailable.
 
-        try:
-            self.results["performance"] = {
-                "summary": {
-                    "Phase1_Memory": {"avg_execution_time": 0.5, "max_memory_usage_mb": 120},
-                    "Phase2_IO": {"avg_execution_time": 0.8, "max_memory_usage_mb": 150},
-                    "Phase3_Vectorization": {"avg_execution_time": 0.3, "max_memory_usage_mb": 100},
-                    "Phase4_Threading": {"avg_execution_time": 0.4, "max_memory_usage_mb": 110},
-                    "Phase5_Caching": {"avg_execution_time": 0.2, "max_memory_usage_mb": 90},
-                },
-                "measurements": [1, 2, 3, 4, 5],
-            }
-
-            for phase in ["Phase1_Memory", "Phase2_IO", "Phase3_Vectorization", "Phase4_Threading", "Phase5_Caching"]:
-                self.phase_validation_status[phase] = "passed"
-
-            self.logger.info("Performance benchmarking completed successfully")
-            return True
-
-        except Exception as e:
-            self.logger.error(f"Performance benchmarking failed: {e}")
-            self.phase_validation_status["Phase6_Integration"] = "failed"
-            return False
+        No timing is fabricated; ``results["performance"]`` stays None and the
+        metric is excluded from the overall score.
+        """
+        self.logger.warning(
+            "Performance benchmarks are not implemented - metric unavailable, "
+            "excluded from the overall score"
+        )
+        return True
 
     def run_accuracy_validation(self) -> bool:
         """Run scientific accuracy validation"""
@@ -215,11 +203,13 @@ class ValidationOrchestrator:
                     if self.phase_validation_status[phase] == "pending":
                         self.phase_validation_status[phase] = "passed"
             else:
-                self.logger.warning("Some integration tests failed")
-                self.phase_validation_status["Phase6_Integration"] = "warning"
+                self.logger.error(
+                    f"Integration tests failed (exit code {result.returncode})"
+                )
+                self.phase_validation_status["Phase6_Integration"] = "failed"
 
             self.logger.info("Integration testing completed")
-            return True
+            return result.returncode == 0
 
         except Exception as e:
             self.logger.error(f"Integration testing failed: {e}")
@@ -258,10 +248,16 @@ class ValidationOrchestrator:
             )()
 
             if result.returncode == 0:
-                self.phase_validation_status["Phase6_Integration"] = "passed"
+                if self.phase_validation_status["Phase6_Integration"] != "failed":
+                    self.phase_validation_status["Phase6_Integration"] = "passed"
+            else:
+                self.logger.error(
+                    f"Stability tests failed (exit code {result.returncode})"
+                )
+                self.phase_validation_status["Phase6_Integration"] = "failed"
 
-            self.logger.info("System stability testing completed successfully")
-            return True
+            self.logger.info("System stability testing completed")
+            return result.returncode == 0
 
         except Exception as e:
             self.logger.error(f"Stability testing failed: {e}")
@@ -272,19 +268,8 @@ class ValidationOrchestrator:
         """Calculate overall validation scores"""
         scores = {}
 
-        # Performance score
-        if self.results["performance"] and "summary" in self.results["performance"]:
-            # Score based on average execution times
-            phase_times = [
-                metrics["avg_execution_time"]
-                for metrics in self.results["performance"]["summary"].values()
-            ]
-            avg_time = sum(phase_times) / len(phase_times) if phase_times else 10
-            scores["performance"] = max(
-                0, min(100, (10 - avg_time) * 10)
-            )  # Scale to 0-100
-        else:
-            scores["performance"] = 0
+        # Performance is not measured (no benchmarks): leave it out of the scores
+        # so it neither counts toward the overall score nor reads as 0.
 
         # Accuracy score
         if self.results["accuracy"] and hasattr(
@@ -324,7 +309,9 @@ class ValidationOrchestrator:
             "stability": 0.20,
         }
 
-        overall_score = sum(scores[key] * weights[key] for key in scores)
+        # Renormalise over the metrics that were actually measured
+        total_weight = sum(weights[key] for key in scores)
+        overall_score = sum(scores[key] * weights[key] for key in scores) / total_weight
 
         return overall_score, scores
 
@@ -359,14 +346,15 @@ class ValidationOrchestrator:
             critical_issues.append("Overall system integration score is critically low")
 
         # Performance recommendations
-        if individual_scores["performance"] < 70:
+        if "performance" not in individual_scores:
             recommendations.append(
-                "Review and optimize performance-critical code paths"
+                "Performance was not measured - implement real benchmarks"
             )
-            if individual_scores["performance"] < 40:
-                critical_issues.append(
-                    "Performance is significantly below acceptable levels"
-                )
+
+        if self.failed_steps:
+            critical_issues.append(
+                f"Validation steps failed: {', '.join(self.failed_steps)}"
+            )
 
         # Accuracy recommendations
         if individual_scores["accuracy"] < 95:
@@ -537,7 +525,7 @@ class ValidationOrchestrator:
         # Create validation summary
         validation_summary = ValidationSummary(
             overall_score=overall_score,
-            performance_score=individual_scores["performance"],
+            performance_score=individual_scores.get("performance"),
             accuracy_score=individual_scores["accuracy"],
             integration_score=individual_scores["integration"],
             stability_score=individual_scores["stability"],
@@ -604,11 +592,19 @@ class ValidationOrchestrator:
             performance_results=self.results["performance"],
             accuracy_results=asdict(self.results["accuracy"])
             if self.results["accuracy"] and is_dataclass(self.results["accuracy"])
-            else (self.results["accuracy"] if isinstance(self.results["accuracy"], dict) else getattr(self.results["accuracy"], "__dict__", None)),
+            else (
+                self.results["accuracy"]
+                if isinstance(self.results["accuracy"], dict)
+                else getattr(self.results["accuracy"], "__dict__", None)
+            ),
             integration_results=self.results["integration"],
             stability_results=asdict(self.results["stability"])
             if self.results["stability"] and is_dataclass(self.results["stability"])
-            else (self.results["stability"] if isinstance(self.results["stability"], dict) else getattr(self.results["stability"], "__dict__", None)),
+            else (
+                self.results["stability"]
+                if isinstance(self.results["stability"], dict)
+                else getattr(self.results["stability"], "__dict__", None)
+            ),
             deployment_readiness=deployment_readiness,
             detailed_recommendations=detailed_recommendations,
         )
@@ -685,9 +681,9 @@ class ValidationOrchestrator:
 
         # Score breakdown
         f.write("VALIDATION SCORES:\n")
-        f.write(
-            f"  Performance:     {report.validation_summary.performance_score:.1f}%\n"
-        )
+        perf = report.validation_summary.performance_score
+        perf_txt = "not measured" if perf is None else f"{perf:.1f}%"
+        f.write(f"  Performance:     {perf_txt}\n")
         f.write(f"  Accuracy:        {report.validation_summary.accuracy_score:.1f}%\n")
         f.write(
             f"  Integration:     {report.validation_summary.integration_score:.1f}%\n"
@@ -754,7 +750,7 @@ class ValidationOrchestrator:
                     f.write(f"    Avg Time: {metrics['avg_execution_time']:.3f}s\n")
                     f.write(f"    Max Memory: {metrics['max_memory_usage_mb']:.1f}MB\n")
         else:
-            f.write("Performance validation not completed\n")
+            f.write("Performance not measured (no benchmarks implemented)\n")
         f.write("\n")
 
         f.write("ACCURACY VALIDATION:\n")
@@ -842,7 +838,8 @@ class ValidationOrchestrator:
                 if success:
                     self.logger.info(f"{step_name} completed successfully")
                 else:
-                    self.logger.warning(f"{step_name} completed with issues")
+                    self.logger.error(f"{step_name} FAILED")
+                    self.failed_steps.append(step_name)
 
                 # Brief pause between validation steps
                 time.sleep(1)
@@ -909,7 +906,8 @@ def main():
 
         # Score breakdown
         print("VALIDATION SCORES:")
-        print(f"  Performance:  {report.validation_summary.performance_score:5.1f}%")
+        perf = report.validation_summary.performance_score
+        print(f"  Performance:  {'not measured' if perf is None else f'{perf:5.1f}%'}")
         print(f"  Accuracy:     {report.validation_summary.accuracy_score:5.1f}%")
         print(f"  Integration:  {report.validation_summary.integration_score:5.1f}%")
         print(f"  Stability:    {report.validation_summary.stability_score:5.1f}%")
@@ -938,6 +936,10 @@ def main():
             print("\nKEY RECOMMENDATIONS:")
             for i, rec in enumerate(report.validation_summary.recommendations[:5], 1):
                 print(f"  {i}. {rec}")
+
+        if orchestrator.failed_steps:
+            print(f"\nFAILED STEPS: {', '.join(orchestrator.failed_steps)}")
+            return False
 
         return report.validation_summary.overall_score >= 70  # Pass threshold
 

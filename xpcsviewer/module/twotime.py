@@ -300,7 +300,7 @@ def plot_twotime_g2(hdl, c2_result):
         hdl["c2g2"].plot(
             x=xaxis[1:],
             y=g2_partial_clean[n][1:],
-            pen=pg.mkPen(color=PG_COLORS[n], width=1),
+            pen=pg.mkPen(color=PG_COLORS[n % len(PG_COLORS)], width=1),
             name=f"g2_partial_{n}",
         )
     hdl["c2g2"].setLogMode(x=True, y=False)

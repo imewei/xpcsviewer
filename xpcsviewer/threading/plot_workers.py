@@ -130,9 +130,13 @@ class G2PlotWorker(BaseAsyncWorker):
 
         # Get parameters
         rows = self.plot_kwargs.get("rows", [])
-        q_range = self.plot_kwargs.get("q_range")
-        t_range = self.plot_kwargs.get("t_range")
-        self.plot_kwargs.get("y_range")
+        # Same semantics as g2mod.pg_plot: an auto flag overrides the stored limit.
+        q_range = (
+            None if self.plot_kwargs.get("q_auto") else self.plot_kwargs.get("q_range")
+        )
+        t_range = (
+            None if self.plot_kwargs.get("t_auto") else self.plot_kwargs.get("t_range")
+        )
         show_fit = self.plot_kwargs.get("show_fit", False)
 
         self.emit_progress(1, 6, "Loading G2 files")

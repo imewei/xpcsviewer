@@ -158,11 +158,11 @@ def _get_version():
     return __version__
 
 
-def _start_gui(path, label_style):
+def _start_gui(path, label_style, path_explicit=False):
     """Start the GUI application (deferred import for faster startup)."""
     from xpcsviewer.xpcs_viewer import main_gui
 
-    return main_gui(path, label_style)
+    return main_gui(path, label_style, path_explicit)
 
 
 def _run_twotime_batch(args):
@@ -233,7 +233,10 @@ def main_gui():
     logger.info(f"Starting XPCS Viewer GUI with path: {path}")
 
     try:
-        exit_code = _start_gui(path, args.label_style)
+        # A directory the user named wins over the saved session's workspace.
+        # shortcut: "--path ./" equals the default and counts as implicit.
+        path_explicit = args.positional_path is not None or args.path != "./"
+        exit_code = _start_gui(path, args.label_style, path_explicit)
         logger.info(f"XPCS Viewer GUI exited with code: {exit_code}")
         safe_shutdown()
         sys.exit(exit_code)

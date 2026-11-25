@@ -74,8 +74,13 @@ class BatchBayesianCoordinator(QObject):
             self._launch_next()
 
     def cancel(self) -> None:
-        """Stop launching new workers and cancel active ones."""
+        """Stop launching new workers and cancel active ones.
+
+        A cancelled coordinator emits no further signals: its owner has
+        already torn down the state those callbacks would write into.
+        """
         self._cancelled = True
+        self.blockSignals(True)
         for worker in self._active_workers.values():
             if hasattr(worker, "cancel"):
                 worker.cancel()

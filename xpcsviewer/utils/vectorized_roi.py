@@ -456,7 +456,10 @@ class RingROICalculator(VectorizedROICalculator):
 
         # Calculate angular indices for binning
         pmap_roi = pmap[roi_mask]
-        phi_min, phi_max = np.min(pmap_roi), np.max(pmap_roi)
+        # an empty ring has no angles to reduce over; bin it as zero span
+        phi_min, phi_max = (
+            (np.min(pmap_roi), np.max(pmap_roi)) if pmap_roi.size else (0.0, 0.0)
+        )
         if phi_max > phi_min:
             phi_indices = np.floor(
                 (pmap - phi_min) / (phi_max - phi_min) * phi_num

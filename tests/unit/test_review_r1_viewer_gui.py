@@ -30,6 +30,9 @@ def test_r1_11_all_finished_delivers_int_keyed_mapping(qapp):
 # ---------------------------------------------------------------------------
 
 
+FIT_X = [1.0]  # delay array every stubbed fit/extraction in this section shares
+
+
 def _diagnosis_stub(fit_fname, fit_q, cur_fname, cur_q):
     """Minimal stand-in for XpcsViewer exercising _show_g2_diagnosis."""
     from types import SimpleNamespace
@@ -41,7 +44,7 @@ def _diagnosis_stub(fit_fname, fit_q, cur_fname, cur_q):
     stub.sb_g2_bayesian_qidx = MagicMock()
     stub.sb_g2_bayesian_qidx.value.return_value = 0
     stub._g2_bayesian_results = {0: object()}
-    stub._g2_bayesian_context = {0: (fit_fname, fit_q)}
+    stub._g2_bayesian_context = {0: (fit_fname, fit_q, FIT_X)}
     stub.statusbar = MagicMock()
     stub._extract_g2_for_bayesian = lambda: ([1.0], [1.0], [0.1], 0, cur_q, "single")
     stub._g2_first_fname = lambda: cur_fname
@@ -96,12 +99,13 @@ def test_r1_12_single_fit_records_file_and_q_value():
         _g2_bayesian_results={},
         _g2_bayesian_context={},
         _g2_bayesian_fit_fname="A.h5",
+        _g2_bayesian_fit_x=FIT_X,
     )
     stub.sb_g2_bayesian_qidx.value.return_value = 3
     XpcsViewer._on_g2_bayesian_finished(
         stub, {"fit_result": fit_result, "q_index": 3, "q_value": 0.07}
     )
-    assert stub._g2_bayesian_context == {3: ("A.h5", 0.07)}
+    assert stub._g2_bayesian_context == {3: ("A.h5", 0.07, FIT_X)}
 
 
 @pytest.mark.unit
@@ -116,11 +120,12 @@ def test_r1_12_batch_fit_records_file_and_q_value():
         _g2_bayesian_results={},
         _g2_bayesian_context={},
         _g2_batch_q_arr=np.array([0.01, 0.02, 0.03]),
+        _g2_batch_q_x={2: FIT_X},
         _g2_batch_target_xf=SimpleNamespace(fname="A.h5"),
     )
     XpcsViewer._on_g2_batch_single_q_done(stub, 2, {"fit_result": "fit"})
     assert stub._g2_bayesian_results == {2: "fit"}
-    assert stub._g2_bayesian_context == {2: ("A.h5", 0.03)}
+    assert stub._g2_bayesian_context == {2: ("A.h5", 0.03, FIT_X)}
 
 
 # ---------------------------------------------------------------------------

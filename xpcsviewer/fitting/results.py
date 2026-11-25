@@ -7,6 +7,7 @@ and sampler configuration.
 from __future__ import annotations
 
 import logging
+import math
 import sys
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -163,14 +164,18 @@ class FitDiagnostics:
     @property
     def converged(self) -> bool:
         """Check if all diagnostics pass thresholds."""
+        # A diagnostic that could not be computed (NaN) is not evidence of
+        # convergence; NaN would pass every threshold comparison below.
+        for diag in (self.r_hat, self.ess_bulk, self.ess_tail):
+            if not all(math.isfinite(v) for v in diag.values()):
+                return False
+
         # R-hat threshold
         if any(r > 1.01 for r in self.r_hat.values()):
             return False
 
         # ESS thresholds
-        if any(e < 400 for e in self.ess_bulk.values()):
-            return False
-        if any(e < 400 for e in self.ess_tail.values()):
+        if any(e < 400 for d in (self.ess_bulk, self.ess_tail) for e in d.values()):
             return False
 
         # No divergences
