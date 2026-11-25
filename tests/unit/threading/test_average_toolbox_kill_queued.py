@@ -25,7 +25,8 @@ def test_kill_queued_job_then_run_reads_nothing(tmp_path, monkeypatch):
 
     XpcsViewer.avg_kill_job(viewer)
     assert worker.is_killed.is_set()
-    viewer.timer.stop.assert_called_once()
+    # the poll keeps running until the worker itself reports "killed"
+    viewer.timer.stop.assert_not_called()
 
     worker.do_average(save_path=str(tmp_path / "out.h5"))
     assert worker.status == "killed"

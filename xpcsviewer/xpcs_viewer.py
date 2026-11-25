@@ -3320,11 +3320,9 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         if worker.status not in ("queued", "running"):
             self.statusbar.showMessage("the selected job isn't running", 1000)
             return
+        # The 1 Hz poll stops itself once the worker reports "killed" (a queued
+        # job only gets there when the pool starts it), so keep it running.
         worker.kill()
-        # Stop the 1 Hz progress-polling timer so it doesn't keep firing
-        # update_avg_info after the job is gone. (ponytail: the finished-job
-        # case would ideally stop on a worker.finished signal; not wired here.)
-        self.timer.stop()
 
     def show_g2_fit_summary_func(self):
         rows = self.get_selected_rows()
