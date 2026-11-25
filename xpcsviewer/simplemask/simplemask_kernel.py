@@ -727,8 +727,8 @@ class SimpleMaskKernel:
         swing_v = float(self.metadata.get("swing_angle_vertical") or 0.0)
         if swing_h == 0.0 and swing_v == 0.0:
             return (bcx, bcy)
-        scale = self.metadata.get("det_dist", 5000.0) / self.metadata.get(
-            "pix_dim", 0.075
+        scale = (self.metadata.get("det_dist") or 5000.0) / (
+            self.metadata.get("pix_dim") or 0.075
         )
         return (
             bcx + scale * float(np.tan(np.deg2rad(swing_h))),

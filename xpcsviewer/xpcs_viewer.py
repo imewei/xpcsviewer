@@ -3351,7 +3351,7 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
                 )
             )
             if hi <= lo:
-                logger.info(
+                logger.warning(
                     "G2 fit bounds not initialised: delays %s..%s give tau bounds "
                     "%s..%s after spin-box rounding",
                     t_min,

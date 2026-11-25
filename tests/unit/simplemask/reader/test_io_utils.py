@@ -162,9 +162,7 @@ class TestAverageFramesLogsRange:
         _write_stack(path, np.ones((6000, 2, 2), dtype=np.uint16))
         caplog.set_level("INFO", logger="xpcsviewer.simplemask.reader.io_utils")
         average_frames_parallel(path, num_frames=-1, num_processes=1)
-        assert "Averaging frames [0, 1200) of 6000 (representative subset)" in (
-            caplog.text
-        )
+        assert "Averaging frames [0, 1200) of 6000 (partial range)" in (caplog.text)
 
     def test_full_range_is_logged_without_subset_note(self, tmp_path, caplog):
         path = str(tmp_path / "stack.h5")
@@ -172,7 +170,7 @@ class TestAverageFramesLogsRange:
         caplog.set_level("INFO", logger="xpcsviewer.simplemask.reader.io_utils")
         average_frames_parallel(path, num_frames=0, num_processes=1)
         assert "Averaging frames [0, 40) of 40" in caplog.text
-        assert "representative subset" not in caplog.text
+        assert "partial range" not in caplog.text
 
     @needs_fork
     def test_pool_branch_is_logged(self, tmp_path, monkeypatch, caplog):

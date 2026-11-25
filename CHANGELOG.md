@@ -31,7 +31,7 @@ All notable changes to this project will be documented in this file.
 - Fitting: tau-q with fewer than two distinct positive q values and both parameters free now reports a failed fit instead of raising a linear-algebra error or reporting the bounds midpoint as a success
 - G2 regroup: a positive delay whose elapsed time underflows to zero seconds is now rejected with an error
 - Q-map: the q-bin label lookup returns "invalid qbin" for booleans, non-integral numbers and non-numeric values, and accepts integral floats and NumPy integers
-- Mask Editor: raw-frame averaging accumulates in float64 on every path, so one and several processes give the same image, and the averaged frame range (with a note when only a representative subset is used) is logged
+- Mask Editor: raw-frame averaging accumulates in float64 on every path, so one and several processes give the same image, and the averaged frame range (with a note when fewer frames than the dataset holds are used) is logged
 - Mask Editor: a rejected mask import is reported as a failure in the status bar and log, without a modal dialog; datasets of unsupported type (strings, bytes, complex) are rejected the same way, and upper-case `.H5`/`.HDF5` extensions are accepted
 - Mask Editor: draw and parameter edits replace their own mask layer instead of accumulating; Apply with nothing drawable is a no-op
 - Mask Editor: ROIs are rasterised through their transform, so rotated shapes match pySimpleMask geometry; line ROIs (vertical and angled) created programmatically or as pyqtgraph `LineROI` items are rasterised the same way, but the toolbar Line tool still does not create an ROI (known issue, unchanged in this release); degenerate and off-image ROIs are ignored

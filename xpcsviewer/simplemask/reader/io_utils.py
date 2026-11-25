@@ -101,7 +101,7 @@ def average_frames_parallel(
             start_frame,
             stop,
             total_frames,
-            " (representative subset)" if num_frames < total_frames else "",
+            " (partial range)" if num_frames < total_frames else "",
         )
 
         if num_processes == 1 or num_frames < chunk_size:

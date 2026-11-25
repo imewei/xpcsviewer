@@ -49,3 +49,15 @@ def test_kill_ignores_other_states(tmp_path, status):
     XpcsViewer.avg_kill_job(viewer)
     assert not worker.is_killed.is_set()
     viewer.timer.stop.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("status", "stops"),
+    [("killed", True), ("finished", True), ("queued", False), ("running", False)],
+)
+def test_poll_stops_only_on_terminal_states(status, stops):
+    viewer = MagicMock()
+    viewer.vk.avg_worker.status = status
+    viewer.vk.avg_worker.n_accepted = 1
+    XpcsViewer._poll_avg_job(viewer)
+    assert viewer.timer.stop.called is stops

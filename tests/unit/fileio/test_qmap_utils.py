@@ -683,7 +683,9 @@ def _qmap_with_two_bins() -> QMap:
     return qmap
 
 
-@pytest.mark.parametrize("qbin", [True, False, 1.5, "1", None])
+@pytest.mark.parametrize(
+    "qbin", [True, False, 1.5, "1", None, float("nan"), float("inf"), np.array(1)]
+)
 def test_qbin_label_rejects_non_integral_or_non_numeric_ids(qbin):
     assert _qmap_with_two_bins().get_qbin_label(qbin) == "invalid qbin"
 

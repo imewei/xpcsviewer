@@ -191,9 +191,20 @@ class TestSwingAngles:
         assert q_plain[3, 4] == pytest.approx(0.0, abs=1e-12)
         assert q_swung[3, 4] > 0.1
 
-    def test_nan_swing_is_rejected_naming_the_field(self, tmp_path):
-        fname = str(tmp_path / "nan.h5")
+    @pytest.mark.parametrize(
+        ("horizontal", "vertical", "field"),
+        [
+            (float("nan"), 0.0, "swing_angle_horizontal"),
+            (float("inf"), 0.0, "swing_angle_horizontal"),
+            (0.0, float("nan"), "swing_angle_vertical"),
+            (0.0, float("-inf"), "swing_angle_vertical"),
+        ],
+    )
+    def test_non_finite_swing_is_rejected_naming_the_field(
+        self, tmp_path, horizontal, vertical, field
+    ):
+        fname = str(tmp_path / "bad.h5")
         _write_8idi_file(fname)
-        _add_swing(fname, float("nan"), 0.0)
-        with pytest.raises(ValueError, match="swing_angle_horizontal"):
+        _add_swing(fname, horizontal, vertical)
+        with pytest.raises(ValueError, match=field):
             self._kernel_metadata(fname)

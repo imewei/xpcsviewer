@@ -551,7 +551,7 @@ class QMap:
                 combined_list.append(f"{item_a}, {item_b}")
         return combined_list
 
-    def get_qbin_label(self, qbin: int, append_qbin=False):
+    def get_qbin_label(self, qbin: object, append_qbin: bool = False) -> str:
         if (
             isinstance(qbin, bool)
             or not isinstance(qbin, (int, float, np.integer, np.floating))
