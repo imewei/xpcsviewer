@@ -64,3 +64,34 @@ def test_fit_tauq_all_positive_input_unchanged() -> None:
         _stub(1.0e-3 / Q**2), (0.0, 1.0), BOUNDS, np.array([True, False])
     )
     _assert_recovers_true_law(out, Q)
+
+
+@pytest.mark.parametrize(
+    ("q", "tau"),
+    [([0.5, 0.5, 2.0], [1.0, 2.0, 0.0]), ([1.0, 1.0], [1.0, 2.0])],
+)
+def test_fit_tauq_single_distinct_q_fails_when_both_parameters_free(q, tau) -> None:
+    fit_val = np.zeros((len(q), 2, 2))
+    fit_val[:, 0, 1], fit_val[:, 1, 1] = tau, 0.01
+    stub = _stub(np.asarray(tau))
+    stub.fit_summary = {"q_val": np.asarray(q), "fit_val": fit_val}
+    out = XpcsFile.fit_tauq(stub, (0.0, 10.0), BOUNDS, np.array([True, True]))
+    assert not out["tauq_success"]
+
+
+def test_fit_tauq_three_distinct_q_with_both_free_still_succeeds() -> None:
+    out = XpcsFile.fit_tauq(
+        _stub(1.0e-3 / Q**2), (0.0, 1.0), BOUNDS, np.array([True, True])
+    )
+    assert out["tauq_success"]
+    assert out["tauq_fit_val"][0, 1] == pytest.approx(-2.0, rel=1e-3)
+
+
+def test_fit_tauq_single_distinct_q_with_one_parameter_free_still_fits() -> None:
+    q = np.array([0.5, 0.5])
+    fit_val = np.zeros((2, 2, 2))
+    fit_val[:, 0, 1], fit_val[:, 1, 1] = 1.0e-3 / q**2, 0.01
+    stub = _stub(np.zeros(2))
+    stub.fit_summary = {"q_val": q, "fit_val": fit_val}
+    out = XpcsFile.fit_tauq(stub, (0.0, 10.0), BOUNDS, np.array([True, False]))
+    assert out["tauq_success"]

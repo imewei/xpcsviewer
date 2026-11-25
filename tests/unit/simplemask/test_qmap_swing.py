@@ -791,8 +791,16 @@ def test_zero_swing_matches_five_argument_call() -> None:
 def test_zero_swing_preserves_pre_change_arrays(use_backend) -> None:
     use_backend("jax")  # goldens were captured on the jax default backend
     qmap, _ = compute_transmission_qmap(*ARGS)
+    # Goldens come from Linux libm; trig differs in the last bits on macOS and
+    # Windows, so compare to 1e-12 (any real change is orders of magnitude larger).
     for key in ("TTH", "phi", "qx", "qy", "x", "y"):
-        assert np.array_equal(qmap[key], np.array(PRE_CHANGE_ZERO_SWING[key])), key
+        np.testing.assert_allclose(
+            qmap[key],
+            np.array(PRE_CHANGE_ZERO_SWING[key]),
+            rtol=1e-12,
+            atol=1e-15,
+            err_msg=key,
+        )
     # Only q changes: k0*sin(alpha) -> 2*k0*sin(alpha/2), about alpha^2/8 relative.
     np.testing.assert_allclose(
         qmap["q"], np.array(PRE_CHANGE_ZERO_SWING["q"]), rtol=1e-8, atol=0

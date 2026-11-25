@@ -37,10 +37,10 @@ def _cast_to_signed(arr: np.ndarray) -> np.ndarray:
 def process_chunk(
     file_path: str, dataset_name: str, start_idx: int, end_idx: int
 ) -> np.ndarray:
-    """Return the per-pixel float32 sum over ``[start_idx, end_idx)`` of a dataset."""
+    """Return the per-pixel float64 sum over ``[start_idx, end_idx)`` of a dataset."""
     with h5py.File(file_path, "r") as f:
         chunk = _cast_to_signed(f[dataset_name][start_idx:end_idx])
-        return cast(np.ndarray, np.sum(chunk, axis=0, dtype=np.float32))
+        return cast(np.ndarray, np.sum(chunk, axis=0, dtype=np.float64))
 
 
 def resolve_frame_range(
@@ -96,6 +96,13 @@ def average_frames_parallel(
         logger.info("Total frames in dataset: %d", total_frames)
         num_frames = resolve_frame_range(total_frames, start_frame, num_frames)
         stop = start_frame + num_frames
+        logger.info(
+            "Averaging frames [%d, %d) of %d%s",
+            start_frame,
+            stop,
+            total_frames,
+            " (partial range)" if num_frames < total_frames else "",
+        )
 
         if num_processes == 1 or num_frames < chunk_size:
             total = np.zeros(dataset.shape[1:], dtype=np.float64)

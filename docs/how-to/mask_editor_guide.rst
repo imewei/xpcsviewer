@@ -94,8 +94,9 @@ Load Mask
 4. If dimensions match, the mask is loaded and displayed
 
 .. note::
-   Loading a mask with different dimensions than the current detector will show
-   an error dialog. Ensure the mask was created for the same detector geometry.
+   A mask that cannot be loaded (wrong shape, unsupported file) is reported in
+   the status bar and the log, and the current mask is kept. A transposed mask
+   is accepted. Ensure the mask was created for the same detector geometry.
 
 Geometry Parameters
 ===================

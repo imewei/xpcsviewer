@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from ..base_reader import FileReader
 from ..formats import HdfDataset, get_format_loader
 from ..metadata import read_nexus_metadata
+
+logger = logging.getLogger(__name__)
 
 # Metadata key -> NeXus HDF5 path.
 METADATA_KEYMAPS: dict[str, str] = {
@@ -20,9 +23,12 @@ METADATA_KEYMAPS: dict[str, str] = {
     "ccdy0": "/entry/instrument/detector_1/beam_center_position_y",
     "bcx0": "/entry/instrument/detector_1/beam_center_x",
     "bcy0": "/entry/instrument/detector_1/beam_center_y",
+    "swing_angle_horizontal": "/entry/instrument/detector_1/flightpath_swing",
+    "swing_angle_vertical": "/entry/instrument/detector_1/flightpath_swing_vertical",
 }
 
-OPTIONAL_FIELDS: list[str] = []
+# Detector swing (degrees); absent in unswung scans, which then read as 0.0.
+OPTIONAL_FIELDS: list[str] = ["swing_angle_horizontal", "swing_angle_vertical"]
 
 
 def get_nexus_metadata(fname: str, metadata_fname: str | None = None) -> dict[str, Any]:
@@ -43,6 +49,11 @@ def get_nexus_metadata(fname: str, metadata_fname: str | None = None) -> dict[st
     meta, _meta_fname = read_nexus_metadata(
         fname, METADATA_KEYMAPS, OPTIONAL_FIELDS, metadata_fname=metadata_fname
     )
+
+    for key in OPTIONAL_FIELDS:
+        if meta.get(key) is None:
+            logger.info("%s not found in metadata, set to 0.0 degree", key)
+            meta[key] = 0.0
 
     # Beam center = recorded center + detector translation in pixels.
     # Type: ignore needed because dict values are Any, but arithmetic is safe.

@@ -646,7 +646,7 @@ class SimpleMaskKernel:
         flag_consistency = check_consistency(d_map, s_map, self.mask)
         logger.info(f"dqmap/sqmap consistency check: {flag_consistency}")
 
-        center = self.get_center()
+        center = self._display_center()
 
         # Warn when using default physical constants
         _defaults = {"pix_dim": 0.075, "energy": 10.0, "det_dist": 5000.0}
@@ -712,6 +712,28 @@ class SimpleMaskKernel:
         if mode == "vh":
             return (bcy, bcx)
         return (bcx, bcy)
+
+    def _display_center(self) -> tuple[float | None, float | None]:
+        """Beam position on the detector, as pySimpleMask saves it.
+
+        The metadata centre is the direct-beam pixel of an unswung detector; a
+        swung detector sees it shifted by ``D * tan(swing) / pixel`` along
+        each axis. With zero swing the centre is returned untouched.
+        """
+        bcx, bcy = self.get_center()
+        if bcx is None or bcy is None:
+            return (bcx, bcy)
+        swing_h = float(self.metadata.get("swing_angle_horizontal") or 0.0)
+        swing_v = float(self.metadata.get("swing_angle_vertical") or 0.0)
+        if swing_h == 0.0 and swing_v == 0.0:
+            return (bcx, bcy)
+        scale = (self.metadata.get("det_dist") or 5000.0) / (
+            self.metadata.get("pix_dim") or 0.075
+        )
+        return (
+            bcx + scale * float(np.tan(np.deg2rad(swing_h))),
+            bcy + scale * float(np.tan(np.deg2rad(swing_v))),
+        )
 
     def find_beam_center(
         self, intensity_threshold: float | None = None

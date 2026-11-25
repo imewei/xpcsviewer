@@ -14,6 +14,7 @@ draft.
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 _REQUIRED_READER_FIELDS = (
@@ -25,6 +26,20 @@ _REQUIRED_READER_FIELDS = (
     "pixel_size",
     "detector_distance",
 )
+
+
+def _swing_degrees(reader_metadata: dict[str, Any], key: str) -> float:
+    """Return a swing angle in degrees; absent means 0.0, present must be finite."""
+    value = reader_metadata.get(key)
+    if value is None:
+        return 0.0
+    try:
+        angle = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{key} must be a finite scalar, got {value!r}") from exc
+    if not math.isfinite(angle):
+        raise ValueError(f"{key} must be a finite scalar, got {value!r}")
+    return angle
 
 
 def to_kernel_metadata(reader_metadata: dict[str, Any], stype: str) -> dict[str, Any]:
@@ -40,6 +55,8 @@ def to_kernel_metadata(reader_metadata: dict[str, Any], stype: str) -> dict[str,
             :func:`~xpcsviewer.simplemask.reader.base_reader.get_fake_metadata`
             guarantees these fields exist at runtime, so this should never
             fire against real reader output).
+        ValueError: A swing angle is present but not a finite scalar. Callers
+            in the raw-file worker wrap this in ``RawDataReadError``.
         NotImplementedError: ``stype == "Reflection"`` -- the 9-ID-D
             orientation mapping (incident_angle/orientation) lands in PR2.
             Refusing beats silently defaulting to a wrong incidence angle.
@@ -65,4 +82,8 @@ def to_kernel_metadata(reader_metadata: dict[str, Any], stype: str) -> dict[str,
             reader_metadata["detector_shape_x"],
         ),
         "stype": stype,
+        "swing_angle_horizontal": _swing_degrees(
+            reader_metadata, "swing_angle_horizontal"
+        ),
+        "swing_angle_vertical": _swing_degrees(reader_metadata, "swing_angle_vertical"),
     }

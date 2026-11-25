@@ -51,6 +51,11 @@ class HdfDataset(ScatteringDataset):
         """Read a scattering image, checking cancellation before single-process reads."""
         # A 2-D dataset is already a single image; there is nothing to average.
         if self.ndim == 2:
+            if begin_idx != 0 or num_frames not in (-1, 0, 1):
+                raise ValueError(
+                    f"frame range (begin_idx={begin_idx}, num_frames={num_frames}) "
+                    "is outside a single 2-D image"
+                )
             with h5py.File(self.fname, "r") as f:
                 if check_cancelled is not None:
                     check_cancelled()

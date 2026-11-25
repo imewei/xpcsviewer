@@ -396,3 +396,14 @@ def test_g2_reset_does_not_cache_an_inflight_file_load(viewer, monkeypatch, tmp_
 
     assert viewer.vk.get_xf_list(rows=[0])[0].fname == str(new / "scan.h5")
     assert opened == [str(old / "scan.h5"), str(new / "scan.h5")]
+
+
+def test_g2_fit_bounds_skip_extent_that_rounds_to_inverted_bounds(viewer):
+    defaults = _bounds(viewer)
+    viewer._initialize_g2_fit_bounds((4e-8, 4e-7))
+    assert _bounds(viewer) == defaults
+    assert not viewer._g2_fit_bounds_initialized
+
+    viewer._initialize_g2_fit_bounds((0.4, 1.6))
+    assert _bounds(viewer) == (0.02, 16.0)
+    assert viewer._g2_fit_bounds_initialized
