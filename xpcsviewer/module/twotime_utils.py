@@ -35,11 +35,22 @@ _C2_CACHE_MAX_ENTRIES = 32
 _C2_CACHE_MAX_BYTES = 512 * 1024 * 1024
 
 
-def _nbytes(obj) -> int:
+def _nbytes(obj, _seen: set[int] | None = None) -> int:
+    """Bytes of backing storage kept alive by the arrays in ``obj``.
+
+    A view is charged for its base array, once per distinct base.
+    """
+    seen = set() if _seen is None else _seen
     if isinstance(obj, np.ndarray):
-        return obj.nbytes
+        root = obj
+        while isinstance(root.base, np.ndarray):
+            root = root.base
+        if id(root) in seen:
+            return 0
+        seen.add(id(root))
+        return root.nbytes
     if isinstance(obj, dict):
-        return sum(_nbytes(v) for v in obj.values())
+        return sum(_nbytes(v, seen) for v in obj.values())
     return 0
 
 
@@ -661,8 +672,8 @@ def get_single_c2_from_hdf(
         "delta_t": t0 * sampling_rate,  # put absolute time in xpcs_file
         "acquire_period": t0,
         "dq_selection": selection,
-        "g2_full": g2_full[selection],
-        "g2_partial": g2_partial[selection],
+        "g2_full": g2_full[selection].copy(),  # own the bin, not the whole cube
+        "g2_partial": g2_partial[selection].copy(),
     }
     return c2_result
 
@@ -685,8 +696,8 @@ def get_c2_g2partials_from_hdf(full_path):
     g2_partial = np.swapaxes(g2_partial, 0, 2)
 
     g2_partials = {
-        "g2_full": g2_full,
-        "g2_partial": g2_partial,
+        "g2_full": g2_full.copy(),  # own the data, not a swapaxes view
+        "g2_partial": g2_partial.copy(),
     }
     return g2_partials
 

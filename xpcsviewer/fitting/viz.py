@@ -7,6 +7,7 @@ and export to CSV, PDF, and netCDF formats.
 from __future__ import annotations
 
 import csv
+import importlib.util
 import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -18,6 +19,9 @@ if TYPE_CHECKING:
     from numpy.typing import NDArray
 
 logger = logging.getLogger(__name__)
+
+# Packages xarray can write grouped NETCDF4 files with; neither is a declared dependency.
+_NETCDF_BACKENDS = ("netCDF4", "h5netcdf")
 
 # Column names for single and double exponential legacy fit_val format
 _SINGLE_COLS = ("contrast", "tau", "stretching", "baseline")
@@ -136,7 +140,7 @@ def plot_bayesian_all_q(
     ax.set(xscale="log", xlabel="Delay time (s)", ylabel=r"$g_2(\tau)$")
     title = "All-Q Bayesian Fit Overview"
     if failed_mask is not None:
-        title += f"\n{int((~failed_mask).sum())}/{num_q} Q-bins succeeded"
+        title += f"\n{int((~failed_mask).sum())} converged of {num_q} Q-bins"
     ax.set_title(title)
 
     sm = ScalarMappable(cmap=cmap, norm=norm)
@@ -154,6 +158,7 @@ def export_bayesian_csv(
     fit_func_name: str,
     *,
     failed_mask: NDArray | None = None,
+    nonconverged_mask: NDArray | None = None,
 ) -> None:
     """Export Bayesian fit parameters to CSV.
 
@@ -168,7 +173,12 @@ def export_bayesian_csv(
     fit_func_name : str
         'single' or 'double'.
     failed_mask : ndarray or None
-        Boolean array (True = failed). Adds a ``status`` column when provided.
+        Boolean array (True = not a measurement). Adds a ``status`` column
+        when provided; only rows with False are written as ``ok``.
+    nonconverged_mask : ndarray or None
+        Subset of ``failed_mask`` that sampled but did not pass the
+        convergence diagnostics; written as ``not_converged`` instead of
+        ``failed``.
     """
     cols = _SINGLE_COLS if fit_func_name == "single" else _DOUBLE_COLS
     path = Path(path)
@@ -188,7 +198,12 @@ def export_bayesian_csv(
                 row.append(f"{fit_val[qi, 0, ci]:.6g}")
                 row.append(f"{fit_val[qi, 1, ci]:.6g}")
             if failed_mask is not None:
-                row.append("failed" if failed_mask[qi] else "ok")
+                if not failed_mask[qi]:
+                    row.append("ok")
+                elif nonconverged_mask is not None and nonconverged_mask[qi]:
+                    row.append("not_converged")
+                else:
+                    row.append("failed")
             writer.writerow(row)
 
     logger.info("Exported Bayesian parameters to %s", path)
@@ -197,8 +212,13 @@ def export_bayesian_csv(
 def export_bayesian_diagnostics(
     path: Path | str,
     bayesian_results: dict[int, Any],
-) -> None:
+) -> list[Path]:
     """Export ArviZ DataTree to netCDF for all Q-bins.
+
+    The grouped netCDF4 write needs the optional ``netCDF4`` or ``h5netcdf``
+    package (neither is a declared dependency). Without one the format is
+    skipped with a warning instead of raising, so the caller's other formats
+    are unaffected.
 
     Parameters
     ----------
@@ -206,6 +226,13 @@ def export_bayesian_diagnostics(
         Output netCDF file path.
     bayesian_results : dict[int, FitResult]
         Per-Q FitResult objects with arviz_data attribute.
+
+    Returns
+    -------
+    list[Path]
+        The netCDF files written; empty when the format was skipped (no
+        backend, ArviZ unavailable, or no ArviZ data), so the caller can tell
+        the user.
     """
     path = Path(path)
 
@@ -213,7 +240,14 @@ def export_bayesian_diagnostics(
         import arviz as az  # noqa: F401
     except ImportError:
         logger.warning("ArviZ not available, skipping netCDF export")
-        return
+        return []
+
+    if not any(importlib.util.find_spec(m) for m in _NETCDF_BACKENDS):
+        logger.warning(
+            "Skipping netCDF export: no NETCDF4 backend is installed; "
+            "install netCDF4 or h5netcdf to enable it"
+        )
+        return []
 
     datasets = {}
     for q_idx, fr in sorted(bayesian_results.items()):
@@ -222,13 +256,16 @@ def export_bayesian_diagnostics(
 
     if not datasets:
         logger.warning("No ArviZ data available for export")
-        return
+        return []
 
     # Write one netCDF file per Q-bin to preserve all diagnostics
+    written: list[Path] = []
     for q_idx, idata in sorted(datasets.items()):
         q_path = path.with_stem(f"{path.stem}_q{q_idx:03d}")
         idata.to_netcdf(str(q_path))
+        written.append(q_path)
 
     logger.info(
-        "Exported ArviZ diagnostics to %s (%d Q-bin files)", path.parent, len(datasets)
+        "Exported ArviZ diagnostics to %s (%d Q-bin files)", path.parent, len(written)
     )
+    return written

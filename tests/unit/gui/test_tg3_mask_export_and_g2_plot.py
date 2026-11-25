@@ -42,6 +42,7 @@ def _make_viewer(xf_list):
     viewer.vk.target = xf_list  # non-empty → guard passes
     viewer.vk.get_xf_list.return_value = xf_list
     viewer.statusbar = MagicMock()
+    viewer._display_partition_version = 0  # instance attribute: not in the spec
 
     # Bind real methods so the code runs, not the mock
     viewer.import_mask = XpcsViewer.import_mask.__get__(viewer, XpcsViewer)

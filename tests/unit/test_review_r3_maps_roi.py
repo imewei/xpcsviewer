@@ -295,6 +295,8 @@ def _import_partition(xf, partition):
         vk=SimpleNamespace(target=["f"], get_xf_list=lambda: [xf]),
         statusbar=MagicMock(),
         update_plot=MagicMock(),
+        _display_partition_version=0,
+        _invalidate_plots=MagicMock(),
     )
     XpcsViewer.import_partition(viewer, partition)
     viewer.update_plot.assert_called_once()
@@ -636,6 +638,11 @@ def test_r3_20_exported_wedge_is_the_wedge_the_pie_roi_draws(real_xf, qapp, angl
     assert (centre - angle + 180) % 360 - 180 == pytest.approx(0.0, abs=1e-6)
     param = roi.get_parameter()
     param["dist"] = 1e3  # no q cut-off
+    # R4-08: with the drawn polygon the export uses the drawn region itself. This
+    # test pins the angle frame of the legacy descriptor (wedge about the beam
+    # centre), so it exercises that path; the polygon path is in test_review_r4.
+    for key in ("polygon", "origin", "rotation"):
+        param.pop(key)
     # pixels inside the drawn wedge: direction (column, row) from the beam centre
     # within the half angle of the central direction
     yy, xx = np.mgrid[0:H, 0:W]

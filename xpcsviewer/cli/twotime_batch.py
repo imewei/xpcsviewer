@@ -1,9 +1,9 @@
 """Batch processing module for twotime correlation data."""
 
+import contextlib
 import gc
 import math
 import os
-import re
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -50,57 +50,68 @@ def parse_q_phi_pair(q_phi_str: str) -> tuple[float, float]:
         raise ValueError(f"Invalid q-phi pair format '{q_phi_str}': {e}") from e
 
 
-def extract_q_phi_from_label(label: str) -> tuple[float | None, float | None]:
-    """
-    Extract q and phi values from qbin label string.
-
-    Args:
-        label: Qbin label string (e.g., "qbin=5, q=0.0532 Å⁻¹, φ=45.2 deg")
-
-    Returns:
-        Tuple of (q_value, phi_value) or (None, None) if not found
-    """
-    q_value = None
-    phi_value = None
-
-    # Extract q value - handle scientific notation and units like "Å⁻¹"
-    q_match = re.search(r"q=([0-9.eE+-]+)", label)
-    if q_match:
-        q_value = float(q_match.group(1))
-
-    # Extract phi value - handle both "phi=" and "φ=" (Greek phi) and units like "deg"
-    phi_match = re.search(r"(?:phi|φ)=([0-9.eE+-]+)", label)
-    if phi_match:
-        phi_value = float(phi_match.group(1))
-
-    return q_value, phi_value
-
-
 def _angular_diff(a: float, b: float) -> float:
     """Absolute angular difference in degrees on the circle, in [0, 180]."""
     return abs((a - b + 180.0) % 360.0 - 180.0)
 
 
+def _bin_coords(qmap, absolute: int) -> tuple[float | None, float | None]:
+    """Full-precision (q, phi) of dynamic bin ``absolute`` from the QMap arrays.
+
+    Mirrors ``QMap.create_qbin_labels``: axis 0 is ``dqlist``; with a second
+    axis the bins form a ``dqlist`` x ``dplist`` grid, axis 0 major. An axis
+    contributes only when it is named ``q`` / ``phi``; a radial-only map (one
+    point on axis 1) has no phi.
+    """
+    if absolute < 0:
+        raise IndexError(absolute)
+    dq = np.asarray(qmap.dqlist, dtype=np.float64)
+    names = list(qmap.map_names)
+    if int(qmap.dynamic_num_pts[1]) == 1:
+        coords = {names[0]: dq[absolute]}
+    else:
+        dp = np.asarray(qmap.dplist, dtype=np.float64)
+        i0, i1 = divmod(absolute, len(dp))
+        coords = {names[0]: dq[i0], names[1]: dp[i1]}
+    q, phi = coords.get("q"), coords.get("phi")
+    return (None if q is None else float(q)), (None if phi is None else float(phi))
+
+
 def _collect_valid_qbins(
     xfile: XpcsFile, require_phi: bool = True
 ) -> list[tuple[int, str, float, float | None]]:
-    """Return (index, label, q, phi) for qbins whose label carries a q value.
+    """Return (index, label, q, phi) for the processed bins that have a q value.
 
-    phi is None for a radial-only map (no angle in the label); such bins are
-    kept only when ``require_phi`` is False.
+    The index is the position in ``c2_processed_bins``. q and phi are the
+    numbers in the file's own arrays; the label is display text only. phi is
+    None for a radial-only map; such bins are kept only when ``require_phi`` is
+    False. Bins with a missing or non-finite coordinate are skipped.
     """
+    qmap = xfile.qmap
+    mapping = np.asarray(qmap.dynamic_index_mapping)
+    labels = xfile.get_twotime_qbin_labels()
     valid_qbins = []
-    for i, label in enumerate(xfile.get_twotime_qbin_labels()):
-        q_value, phi_value = extract_q_phi_from_label(label)
-        if q_value is not None and (phi_value is not None or not require_phi):
+    for i, (label, bin_id) in enumerate(
+        zip(labels, np.ravel(xfile.c2_processed_bins).tolist(), strict=True)
+    ):
+        q_value = phi_value = None
+        if 1 <= bin_id <= len(mapping):
+            with contextlib.suppress(IndexError):  # bin outside the q/phi axes
+                q_value, phi_value = _bin_coords(qmap, int(mapping[int(bin_id) - 1]))
+        if (
+            q_value is not None
+            and math.isfinite(q_value)
+            and (phi_value is None or math.isfinite(phi_value))
+            and (phi_value is not None or not require_phi)
+        ):
             valid_qbins.append((i, label, q_value, phi_value))
         else:
-            logger.warning(f"Could not extract q/phi from qbin {i}: {label}")
+            logger.warning(f"No usable q/phi for processed qbin {i}: {label}")
     return valid_qbins
 
 
 def _qbins_with_phi(xfile: XpcsFile) -> list[tuple[int, str, float, float]]:
-    """Qbins whose label carries both q and phi (the angle-based modes need phi)."""
+    """Qbins that have both q and phi (the angle-based modes need phi)."""
     return [
         (i, label, q, phi)
         for i, label, q, phi in _collect_valid_qbins(xfile)
@@ -365,7 +376,7 @@ def generate_output_filename(
 def process_single_file(
     file_path: str,
     args,
-    written: dict[tuple[str, str], str] | None = None,
+    written: dict[str, str] | None = None,
     refused: list[str] | None = None,
 ) -> int:
     """
@@ -373,7 +384,8 @@ def process_single_file(
 
     Within one run, two different (input file, Q-bin) pairs never write the same
     output file, however the paths are spelled: the destination is keyed on the
-    real (symlink-resolved) output directory and the case-normalised file name.
+    case-normalised real path of the complete output file, so symlinked
+    directories and symlinked file names both resolve to one destination.
     Re-running the CLI into the same output folder in a separate run overwrites
     the earlier images by design.
 
@@ -414,8 +426,7 @@ def process_single_file(
         # Log all qbin labels for debugging
         logger.debug("Available qbins:")
         for i, label in enumerate(qbin_labels):
-            q_val, phi_val = extract_q_phi_from_label(label)
-            logger.debug(f"  Qbin {i}: {label} -> q={q_val}, phi={phi_val}")
+            logger.debug(f"  Qbin {i}: {label}")
 
         # Determine qbins to process based on selection mode
         qbins_to_process: Sequence[tuple[int, str, float, float | None]] = []
@@ -478,10 +489,8 @@ def process_single_file(
                     output_path = os.path.join(args.output, output_filename)
                     out_dir = os.path.dirname(output_path)
                     os.makedirs(out_dir, exist_ok=True)
-                    key = (
-                        os.path.normcase(os.path.realpath(out_dir)),
-                        os.path.normcase(os.path.basename(output_path)),
-                    )
+                    # the whole destination, so a symlink at the file name counts
+                    key = os.path.normcase(os.path.realpath(output_path))
                     source = f"{file_path} (qbin {qbin_index})"
                     if key in written:
                         message = (
@@ -572,7 +581,7 @@ def process_directory(directory: str, args, refused: list[str] | None = None) ->
 
     total_images = 0
     successful_files = 0
-    written: dict[tuple[str, str], str] = {}
+    written: dict[str, str] = {}
 
     for i, file_path in enumerate(hdf_files, 1):
         logger.info(f"Processing file {i}/{len(hdf_files)}: {file_path}")

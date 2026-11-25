@@ -24,9 +24,10 @@ class TestQMapManager:
         assert isinstance(manager.db, MutableMapping)
         assert len(manager.db) == 0
 
+    @patch("xpcsviewer.fileIO.qmap_utils._calibration_digest", return_value="cal")
     @patch("xpcsviewer.fileIO.qmap_utils.get_hash")
     @patch("xpcsviewer.fileIO.qmap_utils.QMap")
-    def test_get_qmap_new(self, mock_qmap_class, mock_get_hash):
+    def test_get_qmap_new(self, mock_qmap_class, mock_get_hash, _mock_digest):
         """Test getting new QMap."""
         mock_get_hash.return_value = "test_hash_123"
         mock_qmap = Mock()
@@ -36,22 +37,23 @@ class TestQMapManager:
         result = manager.get_qmap("/test/file.hdf")
 
         assert result is mock_qmap
-        assert "test_hash_123" in manager.db
-        assert manager.db["test_hash_123"] is mock_qmap
+        # shared key = partition hash + calibration digest (R4-05)
+        assert manager.db[("test_hash_123", "cal")] is mock_qmap
 
         mock_get_hash.assert_called_once_with("/test/file.hdf")
         mock_qmap_class.assert_called_once_with(fname="/test/file.hdf")
 
+    @patch("xpcsviewer.fileIO.qmap_utils._calibration_digest", return_value="cal")
     @patch("xpcsviewer.fileIO.qmap_utils.get_hash")
     @patch("xpcsviewer.fileIO.qmap_utils.QMap")
-    def test_get_qmap_cached(self, mock_qmap_class, mock_get_hash):
+    def test_get_qmap_cached(self, mock_qmap_class, mock_get_hash, _mock_digest):
         """Test getting cached QMap."""
         mock_get_hash.return_value = "test_hash_123"
         mock_qmap = Mock()
 
         manager = QMapManager()
         # Manually add to cache
-        manager.db["test_hash_123"] = mock_qmap
+        manager.db[("test_hash_123", "cal")] = mock_qmap
 
         result = manager.get_qmap("/test/file.hdf")
 

@@ -56,7 +56,7 @@ def _diagnosis_stub(fit_fname, fit_bin, cur_fname, cur_bin):
     stub.sb_g2_bayesian_qidx = MagicMock()
     stub.sb_g2_bayesian_qidx.value.return_value = 0
     stored = _bundle(fit_fname, fit_bin, result=object())
-    stub._g2_bayesian_store = {stored.key: stored}
+    stub._g2_bayesian_store = {(stored.fname, None, stored.bin_id): stored}
     stub.statusbar = MagicMock()
     stub._g2_bin_table = lambda: (cur_fname, [(cur_bin, 0.01, "q")])
     stub._g2_current_bundle = lambda: XpcsViewer._g2_current_bundle(stub)
@@ -107,6 +107,9 @@ def test_r1_12_single_fit_records_file_and_bin():
         statusbar=MagicMock(),
         _g2_bayesian_store={},
         _g2_current_bundle=lambda: None,
+        _g2_bayesian_launch_revision=None,  # "A.h5" does not exist: no revision
+        _evict_stale_bayesian=lambda: 0,
+        _announce_bayesian_fit=MagicMock(),
     )
     stub.sb_g2_bayesian_qidx.value.return_value = 3
     XpcsViewer._on_g2_bayesian_finished(
@@ -114,8 +117,8 @@ def test_r1_12_single_fit_records_file_and_bin():
         {"fit_result": fit_result, "q_index": 3, "q_value": 0.07, "launch": launch},
     )
     # keyed by (file, absolute bin), not by the relative index 3
-    assert list(stub._g2_bayesian_store) == [("A.h5", 5)]
-    assert stub._g2_bayesian_store[("A.h5", 5)].result is fit_result
+    assert list(stub._g2_bayesian_store) == [("A.h5", None, 5)]
+    assert stub._g2_bayesian_store[("A.h5", None, 5)].result is fit_result
 
 
 @pytest.mark.unit
@@ -126,13 +129,14 @@ def test_r1_12_batch_fit_records_file_and_bin():
 
     launch = _bundle("A.h5", 7, 0.03)
     stub = SimpleNamespace(
-        _g2_bayesian_store={}, _g2_batch_launch={"specs": [], "fname": "A.h5"}
+        _g2_bayesian_store={},
+        _g2_batch_launch={"specs": [], "fname": "A.h5", "revision": None},
     )
     XpcsViewer._on_g2_batch_single_q_done(
         stub, 2, {"fit_result": "fit", "launch": launch}
     )
-    assert list(stub._g2_bayesian_store) == [("A.h5", 7)]
-    assert stub._g2_bayesian_store[("A.h5", 7)].result == "fit"
+    assert list(stub._g2_bayesian_store) == [("A.h5", None, 7)]
+    assert stub._g2_bayesian_store[("A.h5", None, 7)].result == "fit"
 
 
 # ---------------------------------------------------------------------------
@@ -202,6 +206,7 @@ def _plot_stub(request, current):
         _plot_pending=set(),
         _retiring_plots=False,
         plot_kwargs_record={},
+        _plot_request=lambda kwargs: kwargs,  # no revision part in these stubs
     )
     stub._plot_request_is_stale = lambda *a: XpcsViewer._plot_request_is_stale(stub, *a)
     stub._settle_plot_operation = lambda *a, **k: XpcsViewer._settle_plot_operation(

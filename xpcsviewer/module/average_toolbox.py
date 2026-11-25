@@ -39,12 +39,15 @@ _TIME_FIELDS = frozenset({"g2", "g2_err", "G2", "IP", "IF"})
 #
 #   field          coordinates
 #   -------------  ---------------------------------------------------------
-#   g2, g2_err     _DYNAMIC: delays t_el; Q dqlist; azimuth dplist; occupancy
-#                  dynamic_index_mapping; layout dynamic_num_pts
+#   g2, g2_err     _DYNAMIC: delays t_el; axis values dqlist, dplist; occupancy
+#                  dynamic_index_mapping; layout dynamic_num_pts; and what the
+#                  axes measure: map_names + map_units ((q, phi) is not (x, y)
+#                  in pixels even when the numbers agree)
 #   G2 (IP, IF)    _DYNAMIC + _DETECTOR (unnormalised per-pixel sums, so the
 #                  pixel geometry and pixel maps matter as well)
-#   saxs_1d        _STATIC: Q sqlist; azimuth splist; occupancy
-#                  static_index_mapping; layout static_num_pts
+#   saxs_1d        _STATIC: axis values sqlist, splist; occupancy
+#                  static_index_mapping; layout static_num_pts; the same
+#                  map_names + map_units (one partition names both maps)
 #   saxs_2d        _DETECTOR: image shape (compared as the array shape), beam
 #                  centre bcx/bcy, distance det_dist, pixel_size, X_energy,
 #                  mask, dqmap, sqmap
@@ -55,8 +58,17 @@ _DYNAMIC = (
     "dplist",
     "dynamic_index_mapping",
     "dynamic_num_pts",
+    "map_names",
+    "map_units",
 )
-_STATIC = ("sqlist", "splist", "static_index_mapping", "static_num_pts")
+_STATIC = (
+    "sqlist",
+    "splist",
+    "static_index_mapping",
+    "static_num_pts",
+    "map_names",
+    "map_units",
+)
 _DETECTOR = (
     "bcx",
     "bcy",
@@ -77,9 +89,9 @@ _FIELD_COORDS = {
     "saxs_2d": _DETECTOR,
 }
 
-# Identities (bin IDs, index mappings, pixel maps, counts) match exactly, as
-# does every integer/bool array whatever its name.  Only continuous
-# coordinates (delays, Q, angles, geometry) use this relative tolerance, with
+# Identities (bin IDs, index mappings, pixel maps, counts, axis names and units)
+# match exactly, as does every integer/bool array whatever its name.  Only
+# continuous coordinates (delays, Q, angles, geometry) use this relative tolerance, with
 # no absolute floor so that small delays and Q values are not swamped.
 _EXACT_COORDS = frozenset(
     {
@@ -87,6 +99,8 @@ _EXACT_COORDS = frozenset(
         "static_index_mapping",
         "dynamic_num_pts",
         "static_num_pts",
+        "map_names",
+        "map_units",
         "mask",
         "dqmap",
         "sqmap",

@@ -9,6 +9,7 @@ import h5py
 import numpy as np
 import pytest
 
+from tests.unit.test_review_r4_cli_average import fake_qmap_from_labels
 from xpcsviewer.fileIO.hdf_reader import HDF5ConnectionPool
 from xpcsviewer.io.hdf5_facade import HDF5Facade, HDF5ValidationError
 
@@ -34,6 +35,15 @@ class _StubTwotimeFile:
 
     def get_twotime_qbin_labels(self):
         return self.labels
+
+    # numeric axes the CLI reads (it no longer parses coordinates from labels)
+    @property
+    def c2_processed_bins(self):
+        return fake_qmap_from_labels(self.labels)[0]
+
+    @property
+    def qmap(self):
+        return fake_qmap_from_labels(self.labels)[1]
 
     def get_twotime_c2(self, selection=None, correct_diag=True):
         return {"c2_mat": np.eye(8), "delta_t": 1.0}

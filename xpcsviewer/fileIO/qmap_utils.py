@@ -1,4 +1,5 @@
 # Standard library imports
+import hashlib
 import logging
 import threading
 import warnings
@@ -80,13 +81,68 @@ DEFAULT_DETECTOR_SIZE = 1024
 DEFAULT_BEAM_CENTER = DEFAULT_DETECTOR_SIZE // 2  # 512
 
 
-class QMapManager:
-    """Share one QMap between files of the same geometry (same stored hash).
+# Every dataset QMap.load_dataset reads from the file.
+_QMAP_FILE_KEYS = (
+    "mask",
+    "dqmap",
+    "sqmap",
+    "dqlist",
+    "sqlist",
+    "dplist",
+    "splist",
+    "bcx",
+    "bcy",
+    "X_energy",
+    "static_index_mapping",
+    "dynamic_index_mapping",
+    "pixel_size",
+    "det_dist",
+    "dynamic_num_pts",
+    "static_num_pts",
+    "map_names",
+    "map_units",
+)
+# Detector-sized datasets: too large to read just to build a key. Their shape and
+# dtype are keyed; their content is covered by the stored partition hash.
+_QMAP_BULK_KEYS = frozenset({"mask", "dqmap", "sqmap"})
 
-    Values are weak: a map lives only while some XpcsFile owns it, so removing
-    files releases their detector-sized arrays. Files without a stored hash are
-    keyed by path *and* file revision, so a replaced file never reuses the old
-    revision's map.
+
+def _calibration_digest(fname) -> str | None:
+    """Digest of every small per-file input a QMap loads (None if unreadable).
+
+    Covers X-ray energy, detector distance, beam centre, pixel size, the
+    partition value lists, index mappings, point counts, map names and units,
+    plus shape and dtype of the detector-sized datasets. Missing datasets are
+    part of the digest (the QMap substitutes defaults for them).
+    """
+    digest = hashlib.blake2b(digest_size=16)
+    try:
+        with _connection_pool.get_connection(fname, "r") as f:
+            for name in sorted(_QMAP_FILE_KEYS):
+                ds = f.get(key_map["nexus"][name])
+                if ds is None:
+                    digest.update(f"{name}:missing;".encode())
+                elif name in _QMAP_BULK_KEYS:
+                    digest.update(f"{name}:{ds.shape}:{ds.dtype.str};".encode())
+                else:
+                    value = np.asarray(ds[()]).tolist()  # repr of floats round-trips
+                    digest.update(f"{name}:{ds.dtype.str}:{value!r};".encode())
+    except Exception as e:
+        logger.warning(f"Could not read QMap calibration from {fname}: {e}")
+        return None
+    return digest.hexdigest()
+
+
+class QMapManager:
+    """Share one QMap between files that agree on everything the map holds.
+
+    The sharing key is the stored partition hash plus a digest of every
+    per-file calibration input (see ``_calibration_digest``), so files that
+    merely copy a partition hash but differ in energy, distance, beam centre or
+    pixel size never share q/phi arrays. Files without a stored hash, or whose
+    calibration cannot be read, are keyed by path *and* file revision (no
+    sharing). Values are weak: a map lives only while some XpcsFile owns it, so
+    removing files releases their detector-sized arrays.
     """
 
     def __init__(self):
@@ -96,14 +152,21 @@ class QMapManager:
     def get_qmap(self, fname):
         identity = _file_identity(fname)  # before the read
         hash_value = get_hash(fname)  # Compute hash
-        if isinstance(hash_value, str) and hash_value == fname:  # hash-less file
-            hash_value = (fname, identity)
+        digest = None
+        if not (isinstance(hash_value, str) and hash_value == fname):
+            digest = _calibration_digest(fname)
+        if digest is None:  # hash-less or unreadable: no sharing across files
+            key: object = (fname, identity)
+        else:
+            key = (hash_value, digest)
         with self._lock:
-            qmap = self.db.get(hash_value)
+            qmap = self.db.get(key)
         if qmap is None:
             qmap = QMap(fname=fname)  # I/O outside the lock
+            if _file_identity(fname) != identity:
+                return qmap  # replaced while loading: usable once, never shared
             with self._lock:
-                qmap = self.db.setdefault(hash_value, qmap)
+                qmap = self.db.setdefault(key, qmap)
         return qmap
 
 
@@ -146,28 +209,7 @@ class QMap:
                     return self._create_default_qmap()
 
                 # Batch read all required keys in one file operation
-                keys_to_load = [
-                    "mask",
-                    "dqmap",
-                    "sqmap",
-                    "dqlist",
-                    "sqlist",
-                    "dplist",
-                    "splist",
-                    "bcx",
-                    "bcy",
-                    "X_energy",
-                    "static_index_mapping",
-                    "dynamic_index_mapping",
-                    "pixel_size",
-                    "det_dist",
-                    "dynamic_num_pts",
-                    "static_num_pts",
-                    "map_names",
-                    "map_units",
-                ]
-
-                for key in keys_to_load:
+                for key in _QMAP_FILE_KEYS:
                     try:
                         path = key_map["nexus"][key]
                         if path in f:

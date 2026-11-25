@@ -244,9 +244,15 @@ def assemble_fit_summary(
     dict
         fit_summary dict with keys: ``fit_func``, ``fit_val``, ``t_el``,
         ``q_val``, ``q_range``, ``t_range``, ``bounds``, ``fit_flag``,
-        ``fit_line``, ``fit_x``, ``label``, ``failed_mask``.
-        Failed Q-bins have NaN in ``fit_val``/``fit_line`` and
-        ``failed_mask[q_idx] == True``.
+        ``fit_line``, ``fit_x``, ``label``, ``failed_mask``,
+        ``nonconverged_mask``, ``n_converged``.
+        Only Q-bins whose ``FitDiagnostics.converged`` is True are
+        measurements. Failed and non-converged Q-bins have NaN in
+        ``fit_val``/``fit_line`` and ``failed_mask[q_idx] == True`` (the rule
+        ``fit_success_mask`` applies); ``nonconverged_mask`` marks those that
+        sampled but did not pass the diagnostics, whose posterior stays on the
+        ``FitResult`` for diagnosis. Single-chain runs have no R-hat, so they
+        never converge.
     """
     num_q = len(q_arr)
     if bin_ids is not None and len(bin_ids) != num_q:
@@ -282,16 +288,30 @@ def assemble_fit_summary(
         )
     fit_line = np.full((num_q, len(fit_x)), np.nan)
 
-    # Track which Q-bins failed (True = failed)
+    # failed_mask is True for every bin that is NOT a measurement: no result, a
+    # failed extraction, or a posterior whose diagnostics did not pass
+    # (nonconverged_mask). A non-converged posterior stays on its FitResult for
+    # the diagnosis views; the summary never carries its values as a measurement.
     failed_mask = np.ones(num_q, dtype=bool)
+    nonconverged_mask = np.zeros(num_q, dtype=bool)
 
-    succeeded = 0
+    converged = 0
     failed = 0
+    rhat_unavailable = 0
 
     for q_idx in range(num_q):
         fr = results.get(q_idx)
         if fr is None:
             failed += 1
+            continue
+
+        diag = getattr(fr, "diagnostics", None)
+        if diag is None or not diag.converged:
+            nonconverged_mask[q_idx] = True
+            if diag is not None and not all(
+                np.isfinite(v) for v in diag.r_hat.values()
+            ):
+                rhat_unavailable += 1
             continue
 
         try:
@@ -302,15 +322,18 @@ def assemble_fit_summary(
                 _compute_fit_line(model_func, fit_x, fr, fit_func_name)
             )
             failed_mask[q_idx] = False
-            succeeded += 1
+            converged += 1
         except (KeyError, ValueError) as exc:
             logger.warning("Failed to extract params for Q-index %d: %s", q_idx, exc)
             failed += 1
 
+    nonconverged = int(nonconverged_mask.sum())
     logger.info(
-        "Bayesian assembly: %d/%d Q-bins succeeded, %d failed",
-        succeeded,
+        "Bayesian assembly: %d converged of %d Q-bins, %d not converged "
+        "(kept for diagnosis only), %d failed",
+        converged,
         num_q,
+        nonconverged,
         failed,
     )
 
@@ -328,6 +351,9 @@ def assemble_fit_summary(
         "fit_x": fit_x,
         "label": label,
         "failed_mask": failed_mask,
+        "nonconverged_mask": nonconverged_mask,
+        "n_converged": converged,
+        "n_rhat_unavailable": rhat_unavailable,
         "fname": fname,
         "bin_ids": None if bin_ids is None else np.asarray(bin_ids),
         "fit_q_range": fit_q_range,
@@ -335,3 +361,27 @@ def assemble_fit_summary(
         "obs_g2": None if obs_g2 is None else _frozen(obs_g2),
         "obs_t_el": None if obs_t_el is None else _frozen(obs_t_el),
     }
+
+
+def convergence_message(fit_summary: dict[str, Any]) -> str:
+    """User-facing outcome of a Bayesian batch: how many Q-bins are measurements.
+
+    Counts converged bins ("N converged of M"), never "succeeded", and says why
+    single-chain runs are not measurements.
+    """
+    total = len(fit_summary["failed_mask"])
+    n_conv = int(np.sum(~np.asarray(fit_summary["failed_mask"], dtype=bool)))
+    msg = f"Bayesian fit: {n_conv} converged of {total} Q-bins"
+    n_non = int(np.sum(fit_summary.get("nonconverged_mask", [])))
+    if n_non:
+        msg += (
+            f"; {n_non} not converged (excluded from plots, exports and tau-Q; "
+            "kept for diagnosis)"
+        )
+    if fit_summary.get("n_rhat_unavailable"):
+        msg += (
+            f"; R-hat unavailable for {fit_summary['n_rhat_unavailable']} "
+            "(single-chain runs have no R-hat and cannot count as converged: "
+            "use 2 or more chains)"
+        )
+    return msg

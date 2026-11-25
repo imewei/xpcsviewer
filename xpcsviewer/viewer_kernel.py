@@ -788,8 +788,10 @@ class ViewerKernel(FileLocator):
     def export_saxs_1d(self, pg_hdl, folder):
         xf_list = self.get_xf_list()
         roi_list = pg_hdl.get_roi_list()
-        for xf in xf_list:
-            xf.export_saxs1d(roi_list, folder)
+        # Stems are allocated for the whole export so two files sharing a display
+        # label (scan.hdf / scan_results.hdf) cannot overwrite each other.
+        for xf, stem in zip(xf_list, _export_stems(xf_list), strict=True):
+            xf.export_saxs1d(roi_list, folder, basename=stem)
 
     def switch_saxs1d_line(self, mp_hdl, lb_type):
         """Switch SAXS 1D line builder type (stub for future implementation)."""

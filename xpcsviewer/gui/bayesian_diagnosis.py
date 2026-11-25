@@ -410,7 +410,17 @@ class BayesianDiagnosisWindow(QMainWindow):
         if not path:
             return
         fig = self._pp_canvas.figure
-        fig.savefig(path, dpi=300, bbox_inches="tight")
+        note = None
+        if self._result is not None and not self._result.diagnostics.converged:
+            # a posterior that did not converge is not a measurement
+            note = fig.text(
+                0.5, 0.995, "NOT CONVERGED - not a measurement", color="red", va="top"
+            )
+        try:
+            fig.savefig(path, dpi=300, bbox_inches="tight")
+        finally:
+            if note is not None:
+                note.remove()
         logger.info("Exported fit plot to %s", path)
 
     def _export_fit_data(self) -> None:
@@ -457,6 +467,8 @@ class BayesianDiagnosisWindow(QMainWindow):
             writer = csv.writer(f)
             # Header with metadata comment
             f.write(f"# Q = {self._q_value}\n" if self._q_value is not None else "")
+            if not result.diagnostics.converged:
+                f.write("# NOT CONVERGED: not a measurement (diagnosis only)\n")
             header = [
                 self._xlabel,
                 self._ylabel,
@@ -509,7 +521,14 @@ class BayesianDiagnosisWindow(QMainWindow):
         )
         if not path:
             return
-        self._result.arviz_data.to_netcdf(path)
+        try:
+            self._result.arviz_data.to_netcdf(path)
+        except ValueError as e:  # xarray: no netCDF backend installed
+            logger.warning("netCDF export needs netCDF4 or h5netcdf: %s", e)
+            self.setWindowTitle(
+                f"{self.windowTitle()} — netCDF export needs netCDF4 or h5netcdf"
+            )
+            return
         logger.info("Exported ArviZ traces to %s", path)
 
     def closeEvent(self, event: Any) -> None:

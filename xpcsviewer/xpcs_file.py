@@ -1435,6 +1435,35 @@ class XpcsFile:
             g2 = g2 - g2_baseline + np.mean(g2_baseline)
         return g2
 
+    def _saxs_axes_mismatch(self, bkg_xf, bkg_rows):
+        """Why ``bkg_xf``'s SAXS curves are not on this file's axes, or None.
+
+        Equal Q values and row counts do not make the rows comparable: the
+        static map's axis names/units say what the numbers measure, and when the
+        background has sector curves (rows 1..n of ``saxs_1d``, one per
+        ``splist`` entry) each must be measured at the sample's azimuth. A
+        single-row background is one curve broadcast over every sample row.
+        """
+        mine, theirs = self.qmap, bkg_xf.qmap
+        for attr, what in (("map_names", "names"), ("map_units", "units")):
+            a, b = getattr(mine, attr, None), getattr(theirs, attr, None)
+            if a is not None and b is not None and list(a) != list(b):
+                return (
+                    f"its static-map axis {what} {list(b)} differ from the "
+                    f"sample's {list(a)}"
+                )
+        if bkg_rows > 1:
+            sample_phi = np.atleast_1d(np.asarray(self.splist, dtype=float))
+            bkg_phi = np.atleast_1d(np.asarray(bkg_xf.splist, dtype=float))
+            if sample_phi.shape != bkg_phi.shape or not np.allclose(
+                sample_phi, bkg_phi, rtol=0.0, atol=1e-6
+            ):
+                return (
+                    f"its azimuth sectors {bkg_phi.tolist()} differ from the "
+                    f"sample's {sample_phi.tolist()}"
+                )
+        return None
+
     @log_timing(threshold_ms=200)
     def get_saxs1d_data(
         self,
@@ -1454,22 +1483,28 @@ class XpcsFile:
         if bkg_xf is not None:
             bkg_q, bkg_iq = bkg_xf.saxs_1d["q"], bkg_xf.saxs_1d["Iq"]
             # Compare shapes before values: allclose raises on different Q counts.
-            if (
+            if not (
                 np.shape(q) == np.shape(bkg_q)
                 and np.shape(bkg_iq)[-1] == np.shape(Iq)[-1]
                 and np.shape(bkg_iq)[0] in (1, np.shape(Iq)[0])
                 and np.allclose(q, bkg_q)
             ):
+                problem = (
+                    "its q axis does not match the sample's "
+                    f"({np.shape(bkg_q)[-1:] or 'scalar'} vs "
+                    f"{np.shape(q)[-1:] or 'scalar'} Q bins)"
+                )
+            else:
+                problem = self._saxs_axes_mismatch(bkg_xf, np.shape(bkg_iq)[0])
+            if problem is None:
                 Iq = Iq - bkg_weight * bkg_iq
                 Iq[Iq < 0] = np.nan
             else:
                 logger.warning(
-                    "background subtraction is not applied for %s because its "
-                    "q axis does not match the sample's (%s vs %s Q bins); "
+                    "background subtraction is not applied for %s because %s; "
                     "the sample trace is kept",
                     getattr(bkg_xf, "label", "background"),
-                    np.shape(bkg_q)[-1:] or "scalar",
-                    np.shape(q)[-1:] or "scalar",
+                    problem,
                 )
         if qrange is not None:
             q_roi = (q >= qrange[0]) * (q <= qrange[1])
@@ -2642,6 +2677,55 @@ class XpcsFile:
             count += np.bincount(idx, minlength=nbins + 1)[1:]
         return np.divide(total, count, out=np.full(nbins, np.nan), where=count > 0)
 
+    @staticmethod
+    def _pixels_in_polygon(polygon, shape, origin=(0.0, 0.0), rotation=0.0):
+        """Boolean ``shape = (rows, cols)`` mask of the pixels inside a polygon.
+
+        ``polygon`` is ``[(x, y), ...]`` in a local frame that sits at ``origin``
+        in the image frame and is rotated by ``rotation`` [degree], exactly as a
+        ``pg.ROI``: ``image = origin + R(rotation) @ local`` with
+        ``R = [[cos, -sin], [sin, cos]]``. The image frame is x = column,
+        y = row [pixel]; pixel (row, col) sits at (col, row), as in
+        ``QMap.r_pixel``. Each pixel is moved into the local frame and tested
+        with the even-odd rule and scan-conversion convention of
+        ``QPainterPath.contains`` (a ray towards -x; an edge counts for
+        ``y1 <= y < y2``; crossings at ``x <= px``; horizontal edges ignored), so
+        a pixel exactly on an edge is decided as Qt decides it for the drawn
+        shape. (Qt's rotation is exact for multiples of 90 degrees; so is this.)
+        """
+        pts = np.asarray(polygon, dtype=float)
+        rows, cols = np.indices(shape)
+        turn = float(rotation) % 360.0
+        exact = {
+            0.0: (1.0, 0.0),
+            90.0: (0.0, 1.0),
+            180.0: (-1.0, 0.0),
+            270.0: (0.0, -1.0),
+        }
+        cos, sin = exact.get(turn) or (
+            np.cos(np.radians(turn)),
+            np.sin(np.radians(turn)),
+        )
+        dx, dy = cols - origin[0], rows - origin[1]
+        px, py = dx * cos + dy * sin, -dx * sin + dy * cos  # R(-rotation) @ (dx, dy)
+        winding = np.zeros(shape, dtype=np.int32)
+        for (x1, y1), (x2, y2) in zip(pts, np.roll(pts, -1, axis=0), strict=True):
+            if np.isclose(y1, y2, rtol=1e-12, atol=0.0):
+                continue
+            direction = 1
+            if y2 < y1:
+                x1, y1, x2, y2, direction = x2, y2, x1, y1, -1
+            crossing = (py >= y1) & (py < y2)
+            x_at = x1 + (x2 - x1) / (y2 - y1) * (py - y1)
+            winding += direction * (crossing & (x_at <= px))
+        in_box = (
+            (px >= pts[:, 0].min())
+            & (px <= pts[:, 0].max())
+            & (py >= pts[:, 1].min())
+            & (py <= pts[:, 1].max())
+        )
+        return in_box & (winding % 2 != 0)
+
     def _roi_profile(self, roi_parameter, phi_num, chunk=None):
         """Pie or Ring ROI profile ``(x, y)``; None for other ROI types."""
         sl_type = roi_parameter["sl_type"]
@@ -2650,7 +2734,25 @@ class XpcsFile:
         r_pixel, phi, qbin, qlist, mask = self._roi_geometry()
         saxs = np.asarray(self.saxs_2d).ravel()
 
+        if sl_type == "Pie" and roi_parameter.get("polygon") is not None:
+            # The drawn region itself: exactly the (unmasked) detector pixels
+            # inside it, binned by the file's static q bin. No further angle or
+            # radius cut: the polygon already is the finite wedge. Bins that
+            # receive no pixel are NaN.
+            inside = self._pixels_in_polygon(
+                roi_parameter["polygon"],
+                qbin.shape,
+                roi_parameter.get("origin", (0.0, 0.0)),
+                roi_parameter.get("rotation", 0.0),
+            )
+            y = self._binned_mean(
+                np.where(inside & (mask > 0), qbin, 0).ravel(), saxs, len(qlist), chunk
+            )
+            return qlist, np.where(y <= 0, np.nan, y)
+
         if sl_type == "Pie":
+            # Legacy descriptor without the drawn polygon: an angular wedge about
+            # the beam centre cut at `dist`.
             # `angle_range` [degree] is in the frame of PieROI.get_parameter:
             # the direction (column, row) of the pixel from the beam centre,
             # theta = atan2(row, column), measured from 6 o'clock, theta - 90.
@@ -2675,6 +2777,14 @@ class XpcsFile:
             return qlist, np.where((qlist >= qmax) | (y <= 0), np.nan, y)
 
         rmin, rmax = sorted(roi_parameter["radius"])  # pixels
+        if roi_parameter.get("center") is not None:
+            # Annulus about the CENTRE THAT WAS DRAWN (x = column, y = row,
+            # pixel-index frame), not necessarily this file's beam centre; r and
+            # phi follow QMap.compute_qmap: phi = -atan2(row - cy, col - cx).
+            cx, cy = roi_parameter["center"]
+            rows, cols = np.indices(r_pixel.shape)
+            r_pixel = np.hypot(cols - cx, rows - cy)
+            phi = np.mod(-np.degrees(np.arctan2(rows - cy, cols - cx)), 360.0)
         annulus = (r_pixel >= rmin) & (r_pixel < rmax) & (mask > 0)
         if not annulus.any():
             logger.warning(f"Ring ROI radius {(rmin, rmax)} contains no pixels")
@@ -2733,7 +2843,15 @@ class XpcsFile:
         chunk = max(1, min(1_000_000, np.asarray(self.saxs_2d).size // 10))
         return self._roi_profile(roi_parameter, phi_num, chunk)
 
-    def export_saxs1d(self, roi_list, folder):
+    def export_saxs1d(self, roi_list, folder, basename=None):
+        """Write ROI profiles and the full SAXS 1D curves into ``folder``.
+
+        ``basename`` prefixes every output name. ViewerKernel passes a stem that
+        is unique across the whole export; the default is the source file's own
+        name (display labels are not unique).
+        """
+        if basename is None:
+            basename = os.path.splitext(os.path.basename(str(self.fname)))[0]
         # export ROI
         for idx, roi in enumerate(roi_list):
             profile = self.get_roi_data(roi)
@@ -2741,7 +2859,7 @@ class XpcsFile:
                 logger.warning(f"ROI type {roi['sl_type']} cannot be exported; skipped")
                 continue
             fname = os.path.join(
-                folder, self.label + "_" + roi["sl_type"] + f"_{idx:03d}.txt"
+                folder, basename + "_" + roi["sl_type"] + f"_{idx:03d}.txt"
             )
             if roi["sl_type"] == "Ring":
                 header = "phi(degree) Intensity"
@@ -2750,7 +2868,7 @@ class XpcsFile:
             np.savetxt(fname, np.vstack(profile).T, header=header)
 
         # export all saxs1d
-        fname = os.path.join(folder, self.label + "_" + "saxs1d.txt")
+        fname = os.path.join(folder, basename + "_" + "saxs1d.txt")
         Iq, q = self.saxs_1d["Iq"], self.saxs_1d["q"]
         header = "q(1/Angstrom) Intensity"
         for n in range(Iq.shape[0] - 1):

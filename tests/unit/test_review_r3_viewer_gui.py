@@ -99,10 +99,13 @@ def _viewer(xf, *, q_range=(0.0, 1.0), q_idx=1):
         check_g2_fitting_number=lambda: (None, None, "single"),
         _g2_bayesian_store={},
         _g2_bayesian_launch=None,
+        _g2_bayesian_launch_revision=None,  # "A.h5" does not exist: no revision
         _g2_bayesian_worker=None,
         _g2_bayesian_worker_active=False,
         _g2_diagnosis_window=None,
         _update_g2_diagnosis=MagicMock(),
+        _evict_stale_bayesian=lambda: 0,
+        toast_manager=MagicMock(),
         q_range=list(q_range),
     )
     st.sb_g2_bayesian_qidx.value.return_value = q_idx
@@ -120,6 +123,7 @@ def _viewer(xf, *, q_range=(0.0, 1.0), q_idx=1):
         "_on_g2_bayesian_cancelled",
         "_on_g2_qbin_changed",
         "_show_g2_diagnosis",
+        "_announce_bayesian_fit",
     )
 
 
@@ -171,8 +175,8 @@ def test_r3_14_narrowed_q_range_does_not_alias_other_azimuth():
 def test_r3_14_store_is_keyed_by_file_and_absolute_bin():
     st = _viewer(FakeXf(), q_idx=2)
     _fit_current_bin(st)
-    assert list(st._g2_bayesian_store) == [("A.h5", 2)]
-    done = st._g2_bayesian_store[("A.h5", 2)]
+    assert list(st._g2_bayesian_store) == [("A.h5", None, 2)]
+    done = st._g2_bayesian_store[("A.h5", None, 2)]
     assert "phi=90" in done.label and done.model_name == "single"
 
 
@@ -191,7 +195,7 @@ def test_r3_14_bundle_observations_are_private_read_only_copies():
     xf = FakeXf()
     st = _viewer(xf, q_idx=1)
     _fit_current_bin(st)
-    bundle = st._g2_bayesian_store[("A.h5", 1)]
+    bundle = st._g2_bayesian_store[("A.h5", None, 1)]
     xf.g2[:, 1] = 0.0
     np.testing.assert_array_equal(bundle.y, [1.4, 1.1])
     assert not bundle.y.flags.writeable
@@ -290,7 +294,7 @@ def test_r3_14_reset_keeps_a_start_up_disabled_fit_button_disabled():
         btn_g2_plot_all_q=MagicMock(),
         sb_g2_bayesian_qidx=MagicMock(value=lambda: 0),
     )
-    _bind(st, "_reset_bayesian_state")
+    _bind(st, "_reset_bayesian_state", "_close_bayesian_windows")
     st._reset_bayesian_state()  # no fit was running: NumPyro-missing state stays
     st.btn_g2_bayesian.setEnabled.assert_not_called()
     st.btn_diff_bayesian.setEnabled.assert_not_called()
@@ -373,6 +377,7 @@ def _diffusion_viewer():
         _diff_bayesian_worker_active=False,
         _diff_bayesian_worker=None,
         _diff_bayesian_launch=None,
+        _diff_bayesian_launch_revision=None,  # "A.h5" does not exist
         _diff_bayesian_store={},
         statusbar=MagicMock(),
         sb_g2_bayesian_warmup=MagicMock(value=lambda: 10),
@@ -445,7 +450,7 @@ def test_r3_29_completion_of_superseded_fit_is_ignored_and_new_one_commits():
 
     second, res_new = _diff_result(st._diff_bayesian_worker, "second")
     st._on_diff_bayesian_finished(res_new)
-    bundle = st._diff_bayesian_store["A.h5"]
+    bundle = st._diff_bayesian_store[("A.h5", None)]
     assert bundle.result is second
     np.testing.assert_array_equal(bundle.y, [3.0, 4.0])
 
@@ -581,9 +586,11 @@ def test_r3_30_batch_results_commit_to_store_by_absolute_bin(qapp):
     xf = FakeXf()
     st = _batch_viewer(xf, (0.015, 0.03))  # selects bins 1 and 2 only
     _run_batch(st, xf, qapp)
-    assert sorted(st._g2_bayesian_store) == [("A.h5", 1), ("A.h5", 2)]
-    assert "phi=90" in st._g2_bayesian_store[("A.h5", 2)].label
-    np.testing.assert_array_equal(st._g2_bayesian_store[("A.h5", 1)].y, [1.4, 1.1])
+    assert sorted(st._g2_bayesian_store) == [("A.h5", None, 1), ("A.h5", None, 2)]
+    assert "phi=90" in st._g2_bayesian_store[("A.h5", None, 2)].label
+    np.testing.assert_array_equal(
+        st._g2_bayesian_store[("A.h5", None, 1)].y, [1.4, 1.1]
+    )
 
 
 def test_r3_30_summary_without_stored_observations_draws_fit_lines_only(qapp):
@@ -761,6 +768,7 @@ def _async_viewer(*, request, current, pending=False):
         _plot_pending={"g2"} if pending else set(),
         _retiring_plots=False,
         plot_kwargs_record={"g2": dict(request)},
+        _plot_request=lambda kwargs: kwargs,  # no revision part in this stub
         vk=SimpleNamespace(timestamp="t1"),
         plot_g2=lambda dryrun=False: dict(current),
         update_plot_async=MagicMock(),

@@ -250,6 +250,36 @@ def _param_errors(pcov: Any, n_free: int) -> NDArray[np.floating[Any]]:
     return np.sqrt(np.where(np.isfinite(diag) & (diag >= 0), diag, np.nan))
 
 
+def _identifiability_problem(result: Any, n_obs: int, n_free: int) -> str:
+    """Why the solution's free parameters are not identifiable; "" if they are.
+
+    nlsq reports a rank-deficient Jacobian only as a logged warning, so the rule
+    is applied here to ``result.jac`` (the weighted Jacobian at the solution)
+    with nlsq's own covariance test: equilibrate columns to unit norm, then a
+    singular value <= eps * max(n_obs, n_free) * s_max is zero. Equilibration
+    makes the rank independent of parameter units; a parameter sitting on a
+    bound is not rank loss because only the Jacobian columns are tested. A
+    result without a Jacobian cannot be judged and is not rejected here.
+    """
+    jac = getattr(result, "jac", None)
+    if jac is None or n_free == 0:
+        return ""
+    jac = np.asarray(jac, dtype=float)
+    if jac.ndim != 2 or jac.shape[1] != n_free:
+        return ""
+    if not np.all(np.isfinite(jac)):
+        return "non-finite Jacobian at the solution"
+    norms = np.linalg.norm(jac, axis=0)
+    s = np.linalg.svd(jac / np.where(norms > 0, norms, 1.0), compute_uv=False)
+    rank = int(np.count_nonzero(s > np.finfo(float).eps * max(n_obs, n_free) * s[0]))
+    if rank < n_free:
+        return (
+            f"Jacobian rank {rank} < {n_free} free parameters: "
+            "parameters are not identifiable"
+        )
+    return ""
+
+
 def fit_success_mask(fit_summary: dict[str, Any]) -> NDArray[np.bool_]:
     """Per-Q boolean mask: True where a G2 fit result is a usable measurement.
 
@@ -288,9 +318,10 @@ def _solve_column(
     """Fit one column under the single set of rules every solver path shares.
 
     Returns ``(popt, errors, ok, reason)``. ``ok`` is False when the column has
-    fewer finite observations than free parameters, when the solver raised, or
-    when it stopped without converging (``result.success`` False, e.g. at the
-    evaluation limit). ``popt`` is None when no iterate exists; a non-converged
+    fewer finite observations than free parameters, when the solver raised, when
+    it stopped without converging (``result.success`` False, e.g. at the
+    evaluation limit), or when the converged solution's free parameters are not
+    identifiable (rank-deficient Jacobian, ``_identifiability_problem``). ``popt`` is None when no iterate exists; a non-converged
     column keeps the solver's last iterate (still ``ok`` False). ``errors`` come
     from ``_param_errors`` (NaN where the covariance is unavailable).
     """
@@ -326,6 +357,10 @@ def _solve_column(
         )
     if not np.all(np.isfinite(popt)):
         return popt, errors, False, "non-finite parameters"
+    problem = _identifiability_problem(result, n_obs, len(p0))
+    if problem:
+        # the iterate is kept for inspection; its uncertainties are meaningless
+        return popt, np.full(len(p0), np.nan), False, problem
     return popt, errors, True, ""
 
 
@@ -685,6 +720,11 @@ def sequential_fitting(
             if not getattr(result, "success", True):
                 logger.debug("NLSQ fitting stopped without converging")
                 return popt, unavailable_pcov, "nlsq_not_converged"
+            n_obs = int(np.count_nonzero(np.isfinite(y) & np.isfinite(x)))
+            problem = _identifiability_problem(result, n_obs, n_params)
+            if problem:
+                logger.debug(f"NLSQ fitting: {problem}")
+                return popt, unavailable_pcov, "nlsq_rank_deficient"
             if pcov.shape == (n_params, n_params) and np.all(np.isfinite(pcov)):
                 logger.debug("NLSQ multistart fitting succeeded")
                 return popt, pcov, "nlsq_multistart"
@@ -729,6 +769,8 @@ def sequential_fitting(
 
 # sequential_fitting methods whose popt came from a converged solve.
 _CONVERGED_METHODS = frozenset({"nlsq_multistart", "nlsq_partial"})
+# methods that keep the solver's last iterate but are not a measurement
+_FLAGGED_ITERATE_METHODS = frozenset({"nlsq_not_converged", "nlsq_rank_deficient"})
 
 
 @log_timing(threshold_ms=500)
@@ -817,7 +859,7 @@ def fit_with_fixed_sequential(
                         f"expected ({n_fit_params},)."
                     )
                     method_used = "fallback_shape_mismatch"
-                elif method_used in _CONVERGED_METHODS | {"nlsq_not_converged"}:
+                elif method_used in _CONVERGED_METHODS | _FLAGGED_ITERATE_METHODS:
                     errors = _param_errors(pcov, n_fit_params)
                     success[n] = method_used in _CONVERGED_METHODS
                 if errors is None:
@@ -871,6 +913,12 @@ def robust_curve_fit(
         result: Any = curve_fit(func, x, y, **kwargs)
         if not getattr(result, "success", True):
             raise RuntimeError(f"did not converge: {getattr(result, 'message', '')}")
+        n_params = len(np.atleast_1d(result[0]))
+        problem = _identifiability_problem(
+            result, int(np.count_nonzero(np.isfinite(y) & np.isfinite(x))), n_params
+        )
+        if problem:
+            raise RuntimeError(problem)
         if hasattr(result, "popt"):
             return np.asarray(result.popt), np.asarray(result.pcov)
         return np.asarray(result[0]), np.asarray(result[1])
@@ -919,7 +967,9 @@ def vectorized_parameter_estimation(
             method="trf",
             maxfev=5000,
         )
-        if not getattr(result, "success", True):
+        if not getattr(result, "success", True) or _identifiability_problem(
+            result, int(np.count_nonzero(np.isfinite(y) & np.isfinite(x))), 3
+        ):
             return None
         if hasattr(result, "popt"):
             popt = cast(Any, result).popt

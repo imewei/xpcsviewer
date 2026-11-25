@@ -147,8 +147,16 @@ def test_parallel_worker_evaluation_limit_is_flagged(monkeypatch):
 
 
 def test_parallel_converged_fit_reports_success():
+    # legacy.single_exp_all is a * exp(..) + c + d: c and d are degenerate (R4-01
+    # now rejects it), so a converged, identifiable fit needs the GUI's model.
+    from xpcsviewer.xpcs_file.fitting import single_exp_all
+
     ok = fit_with_fixed_parallel(
-        *_single_exp_all_args(12), p0=P0, use_threads=True, return_status=True
+        single_exp_all,
+        *_single_exp_all_args(12)[1:],
+        p0=P0,
+        use_threads=True,
+        return_status=True,
     )[2]
     assert ok.all()
 

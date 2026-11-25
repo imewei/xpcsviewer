@@ -100,8 +100,7 @@ class TestPlotBayesianAllQ:
 
         fig = plot_bayesian_all_q(bayesian_summary, g2_data)
         title = fig.axes[0].get_title()
-        assert "2/3" in title
-        assert "succeeded" in title
+        assert "2 converged of 3" in title
 
         import matplotlib.pyplot as plt
 

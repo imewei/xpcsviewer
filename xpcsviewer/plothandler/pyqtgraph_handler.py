@@ -288,11 +288,20 @@ class ImageViewDev(ImageView):
             if key == "Center":
                 continue
             if key.startswith("RingB"):
+                state = roi.getState()
                 temp = {
                     "sl_type": "Ring",
+                    # [pixel] radii of the two drawn circles (CircleROI size = 2r)
                     "radius": (
-                        roi.getState()["size"][1] / 2.0,
+                        state["size"][1] / 2.0,
                         self.roi_record["RingA"].getState()["size"][1] / 2.0,
+                    ),
+                    # [pixel-index frame, (x=column, y=row)] centre of the drawn
+                    # circles: CircleROI pos is its bounding-square corner and the
+                    # ring is not movable or rotatable, so centre = pos + size/2.
+                    "center": (
+                        float(state["pos"][0]) + state["size"][0] / 2.0,
+                        float(state["pos"][1]) + state["size"][1] / 2.0,
                     ),
                 }
                 parameter.append(temp)
@@ -402,8 +411,28 @@ class PieROI(pg.ROI):
         self.poly = None
         self.poly = poly
 
+    def drawn_polygon(self):
+        """Vertices of the drawn wedge in the ROI's LOCAL frame.
+
+        The local shape (``shape()``) is a circular sector whose apex is the
+        local point (0, h/2) (the middle of the left edge, NOT ``pos``), with
+        radius hypot(w, h/2) and half-angle atan(h / 2w), approximated by the
+        16-segment polygon that Qt both paints and hit-tests. Local units are
+        image pixels; the parent (image) frame is x = column, y = row (the
+        frame of the beam centre and ``QMap.r_pixel``: pixel (row, col) at
+        (col, row)), reached by ``parent = pos + R(angle) @ local`` with R the
+        Qt rotation x' = x cos a - y sin a, y' = x sin a + y cos a.
+        """
+        pts = [(p.x(), p.y()) for p in self.shape().toSubpathPolygons()[0]]
+        if len(pts) > 1 and pts[0] == pts[-1]:
+            pts.pop()
+        return pts
+
     def get_parameter(self):
         state = self.getState()
+        # half_angle is refreshed by shape(); recompute it for the current size
+        # so a resize that Qt has not repainted yet cannot leave it stale.
+        self.create_poly(*state["size"])
         angle_range = np.array([-1, 1]) * self.half_angle + state["angle"]
         # shift angle_range's origin to 6 clock
         angle_range = angle_range - 90
@@ -415,11 +444,18 @@ class PieROI(pg.ROI):
             "dist": dist,
             "angle_range": angle_range,
             "pos": tuple(self.pos()),
+            # The exact drawn region (see drawn_polygon): local-frame vertices
+            # [pixel], the parent-frame position of the local origin [pixel] and
+            # the rotation [degree]; the export averages the pixels inside it.
+            "polygon": self.drawn_polygon(),
+            "origin": (float(self.pos().x()), float(self.pos().y())),
+            "rotation": float(state["angle"]),
         }
         return ret
 
     def paint(self, p, *args):
         r = self.boundingRect()
+        self.create_poly(r.width(), r.height())  # same polygon shape() hit-tests
         p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
         p.scale(r.width(), r.height())
         p.setPen(self.currentPen)

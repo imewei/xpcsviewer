@@ -244,13 +244,16 @@ def test_r2_22_single_fit_records_fit_time_delays():
         statusbar=MagicMock(),
         _g2_bayesian_store={},
         _g2_current_bundle=lambda: None,
+        _g2_bayesian_launch_revision=None,  # "A.h5" does not exist: no revision
+        _evict_stale_bayesian=lambda: 0,
+        _announce_bayesian_fit=MagicMock(),
     )
     stub.sb_g2_bayesian_qidx.value.return_value = 3
     _viewer_cls()._on_g2_bayesian_finished(
         stub,
         {"fit_result": fit_result, "q_index": 3, "q_value": 0.07, "launch": launch},
     )
-    done = stub._g2_bayesian_store[("A.h5", 3)]
+    done = stub._g2_bayesian_store[("A.h5", None, 3)]
     assert done.q_value == 0.07
     np.testing.assert_array_equal(done.x, x)
 
@@ -258,11 +261,13 @@ def test_r2_22_single_fit_records_fit_time_delays():
 def test_r2_22_batch_fit_records_fit_time_delays():
     x = np.array([0.001, 0.01])
     launch = _fit_bundle(x, bin_id=4, q=0.02, result=None)
-    stub = SimpleNamespace(_g2_bayesian_store={}, _g2_batch_launch={"specs": []})
+    stub = SimpleNamespace(
+        _g2_bayesian_store={}, _g2_batch_launch={"specs": [], "revision": None}
+    )
     _viewer_cls()._on_g2_batch_single_q_done(
         stub, 1, {"fit_result": "fit", "launch": launch}
     )
-    done = stub._g2_bayesian_store[("A.h5", 4)]
+    done = stub._g2_bayesian_store[("A.h5", None, 4)]
     assert done.q_value == 0.02
     np.testing.assert_array_equal(done.x, x)
 

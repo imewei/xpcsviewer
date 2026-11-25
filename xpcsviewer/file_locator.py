@@ -84,6 +84,9 @@ class FileLocator:
         self._cache_identity: dict[str, tuple[int, ...] | None] = {}
         self._cache_lock = threading.Lock()
         self.timestamp = None
+        # Full paths whose cached entry the last build() dropped because the
+        # file on disk was replaced or modified since it was loaded.
+        self.replaced_paths: set[str] = set()
 
     def set_path(self, path):
         with self._cache_lock:
@@ -102,11 +105,21 @@ class FileLocator:
         return recorded is _UNTRACKED or recorded == _file_identity(full_fname)
 
     def _drop_stale_cache(self):
-        """Forget cache entries whose source file was replaced or modified."""
+        """Forget cache entries whose source file was replaced or modified.
+
+        Returns the set of dropped full paths.
+        """
         with self._cache_lock:
-            for full_fname in [p for p in self.cache if not self._is_current(p)]:
+            stale = {p for p in self.cache if not self._is_current(p)}
+            for full_fname in stale:
                 del self.cache[full_fname]
                 self._cache_identity.pop(full_fname, None)
+        return stale
+
+    def file_revision(self, fname):
+        """On-disk revision (``_file_identity``) of *fname* (a name in the
+        target list or an absolute path); this is what the next read serves."""
+        return _file_identity(os.path.normpath(os.path.join(self.path, fname)))
 
     def _store(self, full_fname, xf_obj, identity):
         """Insert ``xf_obj`` loaded from revision ``identity`` (lock held)."""
@@ -316,7 +329,7 @@ class FileLocator:
 
         self.set_path(path)
         # Reload: entries loaded from a since-replaced file must not outlive it.
-        self._drop_stale_cache()
+        self.replaced_paths = self._drop_stale_cache()
         flist = [
             entry.name
             for entry in os.scandir(path)
