@@ -1,5 +1,8 @@
+from typing import NamedTuple
+
 import numpy as np
 
+from xpcsviewer.fileIO.qmap_utils import Q_UNIT_DISPLAY, convert_q, convert_q_range
 from xpcsviewer.plothandler.plot_constants import BASIC_COLORS as colors
 from xpcsviewer.plothandler.plot_constants import EXTENDED_MARKERS as shapes
 from xpcsviewer.utils.exceptions import XPCSValidationError
@@ -18,6 +21,53 @@ def fit_success_mask(fit_summary):
     from xpcsviewer.fitting.legacy import fit_success_mask as _mask
 
     return _mask(fit_summary)
+
+
+class TauqRows(NamedTuple):
+    """Observations of the tau-q power law and what the selection dropped."""
+
+    q: np.ndarray  # inverse angstrom
+    tau: np.ndarray
+    err: np.ndarray
+    n_in_range: int  # fitted Q bins in the range (G2 fit ok or not)
+    n_g2_failed: int  # of those, bins whose G2 fit failed
+    n_dropped: int  # of the rest, rows with a non-positive or non-finite q or tau
+
+
+def tauq_rows(fit_summary, q_range) -> TauqRows:
+    """The rows of the tau-q power-law fit for ``q_range`` (inverse angstrom).
+
+    THE one row selection of the NLSQ fit (``XpcsFile.fit_tauq``) and the Bayesian
+    launch (``_extract_diffusion_for_bayesian``), so they cannot disagree. The
+    range is converted to the unit the file's Q values are stored in
+    (``convert_q_range``, inclusive bounds), the rows are selected THERE, and only
+    the selected rows are converted to inverse angstrom. ``fit_summary`` carries
+    its native values as ``q_val_native`` / ``q_native_unit`` when its ``q_val``
+    is already converted (``viewer_kernel._in_diffusion_unit``); without them
+    ``q_val`` is inverse angstrom. Rows: Q bins whose G2 fit succeeded, with
+    finite positive q and tau and a positive finite uncertainty.
+    """
+    unit = fit_summary.get("q_native_unit", Q_UNIT_DISPLAY)
+    x = np.asarray(fit_summary.get("q_val_native", fit_summary["q_val"])).ravel()
+    fit_val = np.asarray(fit_summary["fit_val"])
+    n = min(len(x), fit_val.shape[0])
+    x, fit_val = x[:n], fit_val[:n]
+    lo, hi = convert_q_range(q_range, Q_UNIT_DISPLAY, unit)
+    in_range = (x >= lo) & (x <= hi)
+    g2_ok = fit_success_mask({**fit_summary, "fit_val": fit_val})[:n]
+    chosen = in_range & g2_ok
+    q = convert_q(x[chosen], unit, Q_UNIT_DISPLAY)
+    tau, err = fit_val[chosen, 0, 1], fit_val[chosen, 1, 1]
+    usable = (err > 0) & np.isfinite(tau) & np.isfinite(err)
+    domain = np.isfinite(q) & (q > 0) & (tau > 0)
+    return TauqRows(
+        q[usable & domain],
+        tau[usable & domain],
+        err[usable & domain],
+        int(np.count_nonzero(in_range)),
+        int(np.count_nonzero(in_range & ~g2_ok)),
+        int(np.count_nonzero(usable & ~domain)),
+    )
 
 
 def plot(xf_list, hdl, q_range, offset, plot_type=3):

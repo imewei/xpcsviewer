@@ -31,6 +31,12 @@ def _same_file(a: str, b: str) -> bool:
         return False
 
 
+def same_destination(a: str | os.PathLike[str], b: str | os.PathLike[str]) -> bool:
+    """True when two output paths name one file (links, hard links, ``..``)."""
+    a, b = os.fspath(a), os.fspath(b)
+    return _real(a) == _real(b) or _same_file(a, b)
+
+
 class ExportGuard:
     """Refuses destinations that alias an input or an earlier output."""
 

@@ -104,6 +104,10 @@ def convert_q(values, from_unit: str, to_unit: str):
     return arr * b / a
 
 
+class SaxsNormalizationRefused(ValueError):
+    """A SAXS normalisation not defined on the file's axis (I*q^2 off a radial ``q``)."""
+
+
 def map_axis(qmap, index: int = 0) -> tuple[str, str]:
     """``(name, unit)`` of axis ``index`` of the file's Q map.
 
@@ -165,6 +169,75 @@ def convert_q_range(q_range, from_unit: str, to_unit: str):
         return q_range
     lo, hi = (float(v) for v in convert_q(q_range, from_unit, to_unit))
     return (lo - abs(lo) * _Q_RANGE_RTOL, hi + abs(hi) * _Q_RANGE_RTOL)
+
+
+# Angle units a second (azimuth) axis is stored in, as "degrees per unit". The
+# spellings are the ones files and docs use (docs/explanation/xpcs_data_formats.rst:
+# "radians or degrees"; ``map_units`` ``deg`` / ``degree`` / ``rad``).
+_ANGLE_UNITS_IN_DEGREES: dict[str, float] = {
+    "deg": 1.0,
+    "degs": 1.0,
+    "degree": 1.0,
+    "degrees": 1.0,
+    "°": 1.0,
+    "rad": 180.0 / np.pi,
+    "rads": 180.0 / np.pi,
+    "radian": 180.0 / np.pi,
+    "radians": 180.0 / np.pi,
+}
+
+#: Two azimuths closer than this (degrees, shortest way round the circle) are
+#: the same bin coordinate: above float32 storage noise at 360 deg (~3e-5), far
+#: below any real sector spacing.
+ANGLE_TOLERANCE_DEG = 1e-3
+
+
+def is_angle_unit(unit) -> bool:
+    """True when ``unit`` is a spelling of degrees or radians."""
+    return str(unit).strip().lower() in _ANGLE_UNITS_IN_DEGREES
+
+
+def to_degrees(values, unit):
+    """``values`` of an angle axis in ``unit`` as degrees (float array).
+
+    Raises ``ValueError`` for a unit that is not degrees or radians.
+    """
+    scale = _ANGLE_UNITS_IN_DEGREES.get(str(unit).strip().lower())
+    if scale is None:
+        raise ValueError(f"{unit!r} is not an angle unit (degrees or radians)")
+    return np.asarray(values, dtype=np.float64) * scale
+
+
+def angular_difference(a_deg, b_deg):
+    """Shortest way round the circle between angles in degrees, in [0, 180]."""
+    diff = np.asarray(a_deg, dtype=np.float64) - np.asarray(b_deg, dtype=np.float64)
+    return np.abs((diff + 180.0) % 360.0 - 180.0)
+
+
+def same_bin_coordinate(a, a_axis, b, b_axis):
+    """Whether second-axis value(s) ``a`` and ``b`` are the same bin coordinate.
+
+    THE one second-axis comparison (G2 panels, anything that pairs bins of two
+    files). ``a_axis`` / ``b_axis`` are ``(name, unit)``. Different axis names are
+    never the same coordinate. An ANGLE axis (unit degrees or radians) is
+    periodic and compared in degrees by the shortest way round the circle
+    (``ANGLE_TOLERANCE_DEG``), so -15 deg == 345 deg and 0.17453 rad == 10 deg.
+    Any other axis is compared linearly in a common reciprocal-length unit
+    (relative 1e-6, absolute 1e-9) and units that cannot be converted never match.
+    """
+    (a_name, a_unit), (b_name, b_unit) = a_axis, b_axis
+    if a_name != b_name:
+        return np.zeros(np.broadcast(a, b).shape, dtype=bool)
+    if is_angle_unit(a_unit) and is_angle_unit(b_unit):
+        return (
+            angular_difference(to_degrees(a, a_unit), to_degrees(b, b_unit))
+            <= ANGLE_TOLERANCE_DEG
+        )
+    try:
+        other = convert_q(b, b_unit, a_unit)
+    except ValueError:
+        return np.zeros(np.broadcast(a, b).shape, dtype=bool)
+    return np.isclose(a, other, rtol=1e-6, atol=1e-9)
 
 
 def q_axis_label(name: str, unit: str, *, mathtext: bool = False) -> str:
@@ -769,10 +842,9 @@ class QMap:
         if qrange_key in self._qbin_cache:
             return self._qbin_cache[qrange_key]
 
-        if self.map_names[0] != "q":
-            logger.info("qrange is only supported for qmaps with 0-axis as q")
-            qrange = None
-
+        # ``qrange`` is read on the map's FIRST axis whatever it is called (q, qx,
+        # x ...) and in that axis' own unit; callers convert it first
+        # (``q_range_in_file_unit``). Never widened to "all bins" for a non-q axis.
         # Optimize qlist computation using broadcasting
         qlist = np.broadcast_to(
             self.dqlist[:, np.newaxis], (len(self.dqlist), self.dynamic_num_pts[1])

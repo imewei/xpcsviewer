@@ -11,6 +11,7 @@ Functions:
 # Third-party imports
 
 # Local imports
+from xpcsviewer.fileIO.qmap_utils import SaxsNormalizationRefused
 from xpcsviewer.utils.logging_config import get_logger
 
 from .saxs1d import get_pyqtgraph_anchor_params, plot_line_with_marker
@@ -45,6 +46,10 @@ def plot(
         loc: Legend anchor position string, e.g. ``'upper right'``.
         **kwargs: Additional keyword arguments (currently unused).
 
+    Returns:
+        ``{file label: reason}`` when the plot was refused (a normalisation that
+        needs a radial ``q`` axis on another axis), else an empty dict.
+
     Example:
         >>> from xpcsviewer.module import stability
         >>> stability.plot(xf, pg_widget, plot_type=3, plot_norm=1)
@@ -68,9 +73,14 @@ def plot(
     log_y = (False, True)[plot_type // 2]
     plot_item.setLogMode(x=log_x, y=log_y)
 
-    q, Iqp, xlabel, ylabel = fc.get_saxs1d_data(
-        target="saxs1d_partial", norm_method=norm_method
-    )
+    try:
+        q, Iqp, xlabel, ylabel = fc.get_saxs1d_data(
+            target="saxs1d_partial", norm_method=norm_method
+        )
+    except SaxsNormalizationRefused as e:
+        # an empty plot, with the reason handed back for the status bar
+        logger.warning(f"Stability plot refused for {fc.label}: {e}")
+        return {fc.label: str(e)}
     logger.debug(
         f"Retrieved SAXS1D data: q shape={q.shape}, Iqp shape={Iqp.shape}, norm_method='{norm_method}'"
     )
@@ -93,3 +103,4 @@ def plot(
     plot_item.showGrid(x=True, y=True, alpha=0.3)
 
     logger.info("Stability plot completed successfully")
+    return {}

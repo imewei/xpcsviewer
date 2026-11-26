@@ -33,6 +33,9 @@ class ImageViewDev(ImageView):
             super().__init__(*args, **kwargs)
         self.roi_record: dict[str, Any] = {}
         self.roi_idx = 0
+        # Saxs2dFrame of the last SAXS-2D draw (set by saxs2d.draw only): the
+        # one record of which file (path + revision + rotate) this view shows.
+        self.rendered_frame: Any = None
         logger.debug("ImageViewDev initialized")
 
     def apply_theme(self, theme: str) -> None:
@@ -76,6 +79,7 @@ class ImageViewDev(ImageView):
     def clear(self):
         logger.debug("Clearing ImageViewDev")
         super().clear()
+        self.rendered_frame = None  # nothing is shown any more
 
         self.remove_rois()
         self.reset_limits()

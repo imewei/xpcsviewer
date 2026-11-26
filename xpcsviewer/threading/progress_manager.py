@@ -298,6 +298,13 @@ class ProgressManager(QObject):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.active_operations: dict[str, OperationInfo] = {}
+        #: IDs that were completed or cancelled (bounded, oldest dropped first): a
+        #: progress message queued before the end must not recreate the record
+        self._closed_operations: dict[str, None] = {}
+        #: IDs registered only by ``update_progress`` (never ``start_operation``):
+        #: they are fixed, non-unique names (the preloader's), so they are never
+        #: closed and the next progress message with the ID starts a new operation
+        self._auto_registered: set[str] = set()
         self.progress_dialog = None
         self.statusbar = None
         self.current_statusbar_operation = None
@@ -340,6 +347,8 @@ class ProgressManager(QObject):
         )
 
         self.active_operations[operation_id] = operation_info
+        self._closed_operations.pop(operation_id, None)  # an ID may be started again
+        self._auto_registered.discard(operation_id)  # now started explicitly
 
         # Create progress dialog if needed
         if self.progress_dialog is None:
@@ -378,6 +387,15 @@ class ProgressManager(QObject):
                 self.progress_dialog.show()
                 self.progress_dialog.raise_()
 
+    def _close(self, operation_id: str) -> None:
+        """Remember that ``operation_id`` has ended (the last 1000 IDs)."""
+        if operation_id in self._auto_registered:
+            self._auto_registered.discard(operation_id)
+            return  # a fixed ID that only progress messages ever named
+        self._closed_operations[operation_id] = None
+        while len(self._closed_operations) > 1000:
+            del self._closed_operations[next(iter(self._closed_operations))]
+
     def update_progress(
         self,
         operation_id: str,
@@ -386,6 +404,8 @@ class ProgressManager(QObject):
         status: str = "",
     ):
         """Update progress for an operation."""
+        if operation_id in self._closed_operations:
+            return  # a late message of an operation that already ended
         if operation_id not in self.active_operations:
             # Auto-register missing operations so long tasks still surface progress
             inferred_description = status or f"Operation {operation_id}"
@@ -397,6 +417,7 @@ class ProgressManager(QObject):
                 is_cancellable=True,
                 show_in_statusbar=True,
             )
+            self._auto_registered.add(operation_id)
 
         if operation_id not in self.active_operations:
             return
@@ -461,6 +482,7 @@ class ProgressManager(QObject):
 
         # Clean up
         del self.active_operations[operation_id]
+        self._close(operation_id)
 
         status_text = "successfully" if success else "with errors"
         logger.info(
@@ -490,6 +512,7 @@ class ProgressManager(QObject):
 
         # Clean up
         del self.active_operations[operation_id]
+        self._close(operation_id)
 
         logger.info(f"Operation {operation_id} cancelled after {elapsed:.1f}s")
 

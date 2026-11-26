@@ -23,6 +23,7 @@ from xpcsviewer.fileIO.qmap_utils import (
     convert_q,
     convert_q_range,
     map_axis,
+    same_bin_coordinate,
 )
 from xpcsviewer.plothandler.plot_constants import MATPLOTLIB_COLORS_RGB as colors
 
@@ -112,8 +113,13 @@ class _BinLabels(list):
     second_axis = None
 
 
-def _labelled(labels, fc, own_q_range, shared2, n_cols):
-    """``labels`` as ``_BinLabels`` keyed by the bins' second-axis coordinate."""
+def _labelled(labels, fc, own_q_range, n_cols):
+    """``labels`` as ``_BinLabels`` keyed by the bins' second-axis coordinate.
+
+    ``second`` is in the file's OWN unit with its own ``(name, unit)``: whether
+    two files' bins are the same coordinate is decided by ``same_bin_coordinate``
+    (unit conversion and the azimuth's periodicity included).
+    """
     try:
         qmap = fc.qmap
         axis = map_axis(qmap, 1)
@@ -125,15 +131,19 @@ def _labelled(labels, fc, own_q_range, shared2, n_cols):
         values = dplist[np.asarray(qmap.dynamic_index_mapping)[sel] % len(dplist)]
         if len(values) != n_cols:
             return labels
-        if shared2 is not None and axis[1] != shared2[1] and axis[0] == shared2[0]:
-            try:  # e.g. a Cartesian pair in inverse nm next to one in inverse A
-                values, axis = convert_q(values, axis[1], shared2[1]), shared2
-            except ValueError:
-                pass
         out.second, out.second_axis = values, axis
         return out
     except (AttributeError, IndexError, TypeError, ValueError):
         return labels  # not a loaded file: the label text is all there is
+
+
+def effective_q_range(q_auto, q_range):
+    """The Q range the G2 view uses: ``None`` (every bin) when "auto" is set.
+
+    The one rule shared by the plot request, the plot worker, ``pg_plot`` and the
+    Bayesian bin table, so the Q-index spinbox addresses the plotted panels.
+    """
+    return None if q_auto else q_range
 
 
 def get_data(xf_list, q_range=None, t_range=None):
@@ -225,7 +235,6 @@ def get_data(xf_list, q_range=None, t_range=None):
             _labels,
             fc,
             file_q_range,
-            map_axis(getattr(xf_list[0], "qmap", None), 1),
             _n_q(_g2),
         )
 
@@ -307,8 +316,7 @@ def pg_plot_stability(
     **kwargs : dict
         Additional plotting parameters
     """
-    if q_auto:
-        q_range = None
+    q_range = effective_q_range(q_auto, q_range)
     if t_auto:
         t_range = None
     if y_auto:
@@ -478,8 +486,8 @@ def _q_panel_indices(q, m, n_curves, labels=None, ref=0):
     A curve belongs to a panel only if it is the same physical bin: its numeric
     Q (in the shared unit; ``get_data`` converts) equals the panel's within
     ``_Q_RTOL`` (relative) AND its value on the map's second axis equals the
-    panel's (``_BinLabels.second``, same axis name and unit, relative
-    ``_Q_RTOL`` / absolute 1e-9).  Labels are display text in each file's own
+    panel's (``_BinLabels.second``, decided by ``same_bin_coordinate``: same
+    axis name, units converted, an azimuth compared on the circle).  Labels are display text in each file's own
     unit and never decide a match, except for plain label lists that carry no
     numeric key (compared for equality as before).  Neither the rounded label
     nor Q alone can alias two bins.  Identical ordered grids map positionally;
@@ -508,12 +516,17 @@ def _q_panel_indices(q, m, n_curves, labels=None, ref=0):
     def same_second(i, j):
         if not numeric:
             return not use_labels or ref_lab[i] == own_lab[j]
-        if ref_lab.second_axis != own_lab.second_axis:
+        if (ref_lab.second is None) != (own_lab.second is None):
             return False
         if ref_lab.second is None:  # both maps have one axis
             return True
         return bool(
-            np.isclose(ref_lab.second[i], own_lab.second[j], rtol=_Q_RTOL, atol=1e-9)
+            same_bin_coordinate(
+                ref_lab.second[i],
+                ref_lab.second_axis,
+                own_lab.second[j],
+                own_lab.second_axis,
+            )
         )
 
     if (
@@ -610,8 +623,7 @@ def pg_plot(
         ...         t_range=(1e-4, 10), y_range=(0.9, 1.5),
         ...         show_fit=True, fit_func='single')
     """
-    if q_auto:
-        q_range = None
+    q_range = effective_q_range(q_auto, q_range)
     if t_auto:
         t_range = None
     if y_auto:

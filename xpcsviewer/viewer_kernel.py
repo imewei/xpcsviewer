@@ -18,8 +18,8 @@ from .backends import ensure_numpy
 from .constants import MEMORY_CLEANUP_TIMEOUT_S
 from .file_locator import FileLocator
 from .fileIO.hdf_reader import _file_identity
-from .fileIO.qmap_utils import Q_UNIT_DISPLAY, convert_q, map_axis
-from .utils.export_guard import ExportCollisionError, ExportGuard
+from .fileIO.qmap_utils import Q_UNIT_DISPLAY, axis_mismatch, convert_q, map_axis
+from .utils.export_guard import ExportCollisionError, ExportGuard, same_destination
 from .utils.log_utils import log_timing
 from .utils.logging_config import get_logger
 from .utils.qmap_notice import PLACEHOLDER_QMAP_WARNING, has_placeholder_qmap
@@ -217,12 +217,51 @@ def _bin_row_comment(row: int, ident: tuple | None, axes=None) -> str:
     return f"# row {row}: dynamic_bin_id={bin_id} map_index={absolute} {coords}\n"
 
 
+_CARTESIAN_COMPONENTS = ("qx", "qy")
+
+
+def _cartesian_partner(xf) -> tuple[tuple[float, str] | None, str]:
+    """``((value, unit), "")`` of the other Cartesian component, else ``(None, why)``.
+
+    tau(q) = a q^b is a model in the radial magnitude |q| = sqrt(qx^2 + qy^2). It
+    can be formed per fitted bin only when the file's dynamic axis is one of
+    ``qx`` / ``qy`` in a reciprocal length and the map's second axis is the OTHER
+    component with a single value (every bin then has that value); on a qx x qy
+    grid the fitted rows do not record which qy each belongs to.
+    """
+    qmap: Any = getattr(xf, "qmap", None)
+    first, second = map_axis(qmap, 0), map_axis(qmap, 1)
+    if first[0] not in _CARTESIAN_COMPONENTS:
+        return None, f"its axis is {first[0]!r}, not the radial 'q'"
+    other = _CARTESIAN_COMPONENTS[1 - _CARTESIAN_COMPONENTS.index(first[0])]
+    try:
+        single = int(qmap.dynamic_num_pts[1]) == 1
+        value = float(np.ravel(qmap.dplist)[0])
+    except (AttributeError, IndexError, TypeError, ValueError):
+        return None, "its second axis cannot be read"
+    if not np.isfinite(value):
+        return None, f"its {other} value is {value}, not a finite number"
+    if second[0] != other or not single:
+        return None, (
+            f"its bins form a {first[0]} x {second[0]} map without one {other} "
+            f"per bin, so |q| cannot be formed for the fitted rows"
+        )
+    try:
+        convert_q(1.0, second[1], first[1])
+    except ValueError:
+        return None, f"{other} is in {second[1]}, not a reciprocal length"
+    return (value, second[1]), ""
+
+
 def _diffusion_axis_problem(xf) -> str | None:
     """Why ``xf``'s dynamic Q axis cannot be shown as tau(q) in inverse Angstrom.
 
     Diffusion works in ONE unit, inverse Angstrom (D keeps its conventional
-    units). The dynamic axis is the first axis of the file's map; a file whose
-    axis is not a reciprocal length (e.g. Cartesian pixels) is refused.
+    units), on ONE quantity, the radial q. The axis is accepted by the same
+    name-and-unit rule as every shared axis (``axis_mismatch``): a file whose
+    axis is not a reciprocal length (e.g. Cartesian pixels) is refused, and so is
+    a Cartesian component (``qx``) unless |q| can be formed per bin
+    (``_cartesian_partner``).
     """
     name, unit = map_axis(getattr(xf, "qmap", None), 0)
     try:
@@ -231,6 +270,14 @@ def _diffusion_axis_problem(xf) -> str | None:
         return (
             f"{xf.label}: its dynamic axis is {name} in {unit}, which is not a "
             f"reciprocal length; tau-q needs q in {Q_UNIT_DISPLAY}"
+        )
+    if axis_mismatch((name, unit), ("q", Q_UNIT_DISPLAY)) is None:
+        return None
+    partner, why = _cartesian_partner(xf)
+    if partner is None:
+        return (
+            f"{xf.label}: its dynamic axis is {name} in {unit}, not the radial q "
+            f"tau-q needs ({why})"
         )
     return None
 
@@ -255,17 +302,43 @@ def _in_diffusion_unit(xf, summary: dict | None) -> dict | None:
     the summary itself); any other reciprocal-length file gets a copy whose
     ``q_val`` is converted, so the Q range, the tau-q fit and the plot all see
     one unit. ``tauq_q_unit`` travels with the tau-q results into the export.
+
+    The copy also keeps the file's NATIVE values (``q_val_native`` in
+    ``q_native_unit``): the tau-q row selection (``module.tauq.tauq_rows``)
+    applies the Q range there and converts only the rows it keeps. A Cartesian
+    file (``_cartesian_partner``) is shown through |q| = sqrt(qx^2 + qy^2), formed
+    in its own unit, and ``tauq_q_source`` says so in the export.
     """
     if summary is None:
         return None
-    _, unit = map_axis(getattr(xf, "qmap", None), 0)
+    name, unit = map_axis(getattr(xf, "qmap", None), 0)
     if "q_val" not in summary:
         return summary
-    if convert_q(1.0, unit, Q_UNIT_DISPLAY) == 1.0:  # already inverse Angstrom
-        summary["tauq_q_unit"] = Q_UNIT_DISPLAY
+    partner, _ = (
+        (None, "")
+        if axis_mismatch((name, unit), ("q", Q_UNIT_DISPLAY)) is None
+        else _cartesian_partner(xf)
+    )
+    if partner is None and convert_q(1.0, unit, Q_UNIT_DISPLAY) == 1.0:
+        summary["tauq_q_unit"] = Q_UNIT_DISPLAY  # already radial inverse Angstrom
         return summary
-    q_val = convert_q(summary["q_val"], unit, Q_UNIT_DISPLAY)
-    return {**summary, "q_val": q_val, "tauq_q_unit": Q_UNIT_DISPLAY}
+    native = np.asarray(summary["q_val"], dtype=float)
+    shown = {**summary, "tauq_q_unit": Q_UNIT_DISPLAY}
+    if partner is not None:
+        other = float(convert_q(partner[0], partner[1], unit))
+        native = np.hypot(native, other)
+        other_name = map_axis(xf.qmap, 1)[0]
+        shown["tauq_q_source"] = (
+            f"|q| = sqrt({name}^2 + {other_name}^2) per bin, with the file's "
+            f"{other_name} = {partner[0]!r} {partner[1]} for every bin; "
+            f"{name} is in {unit}"
+        )
+    shown.update(
+        q_val=convert_q(native, unit, Q_UNIT_DISPLAY),
+        q_val_native=native,
+        q_native_unit=unit,
+    )
+    return shown
 
 
 @contextlib.contextmanager
@@ -369,10 +442,12 @@ class ViewerKernel(FileLocator):
         self.path = path
         # Plotting and analysis state
         self.avg_worker: AverageToolbox | None = None
-        self.avg_worker_active: dict[int, Any] = {}
+        self.avg_worker_active: dict[Any, Any] = {}  # keyed by the job's UUID
         # Jobs taken out of the list: queued worker messages that still arrive for
         # them are dropped instead of recreating their progress record.
         self._retired_avg_jobs: set[Any] = set()
+        # detached jobs that are still running (kept referenced until they end)
+        self._detached_avg_workers: list[Any] = []
 
         # Memory-aware caching for current_dset with weak references.
         # Lock guards all reads/writes: WeakValueDictionary is not thread-safe
@@ -1306,7 +1381,9 @@ class ViewerKernel(FileLocator):
             logger.warning("No files available for stability analysis")
             return
         xf_obj = xf_list[0]
-        _get_module("stability").plot(xf_obj, mp_hdl, **kwargs)
+        self.report_left_out(
+            "Stability", _get_module("stability").plot(xf_obj, mp_hdl, **kwargs)
+        )
 
     def submit_job(self, *args, **kwargs):
         if len(self.target) <= 0:
@@ -1314,17 +1391,37 @@ class ViewerKernel(FileLocator):
             return
         worker = _get_module("average_toolbox")(self.path, flist=self.target)
         worker.setup(*args, **kwargs)
-        self.remove_job()  # a replaced job is retired like a removed one
+        old = self.avg_worker
+        # A replaced job leaves the list like a removed one. It is only killed when
+        # the new job would write the same file; otherwise it finishes and publishes.
+        self.remove_job(
+            kill=old is not None
+            and old.destination is not None
+            and worker.destination is not None
+            and same_destination(old.destination, worker.destination)
+        )
         self.avg_worker = worker
         logger.info("create average job, ID = %s", worker.jid)
         # the worker copied the names; the loaded files of the emptied target
         # list go with it (cache entries and their recorded revisions)
         self.clear_target()
 
-    def remove_job(self):
+    def remove_job(self, kill: bool = True):
         # the job is gone from the list: its progress record goes with it
         worker = self.avg_worker
         if worker is not None:
+            # Remove Job kills: once kill() returns the job can no longer commit
+            # (a finished job's file stays). A replacement by submit passes
+            # kill=False for a different destination: the job is only detached.
+            if kill:
+                worker.kill()
+            else:
+                self._detached_avg_workers.append(worker)  # keep it alive
+            self._detached_avg_workers = [
+                w
+                for w in self._detached_avg_workers
+                if w.status in ("queued", "running")
+            ]
             self._retired_avg_jobs.add(worker.jid)
             self.avg_worker_active.pop(worker.jid, None)
             # messages already queued are dropped by update_avg_values; a job that
@@ -1732,6 +1829,8 @@ class ViewerKernel(FileLocator):
                         f"(Q-range and a, b refer to this unit; the file's own Q "
                         f"axis is {axis_name} in {axis_unit})\n"
                     )
+                    if fs.get("tauq_q_source"):  # q is not the file's axis value
+                        f.write(f"# Q source: {fs['tauq_q_source']}\n")
                     f.write(f"# Fit method: {method}\n")
                     for line in _DIFFUSION_PROVENANCE[method]:
                         f.write(f"# {line}\n")
@@ -1788,6 +1887,9 @@ class ViewerKernel(FileLocator):
                 for xf in written:
                     if has_placeholder_qmap(xf):
                         f.write(f"# {PLACEHOLDER_QMAP_WARNING}: {xf.label}\n")
+                    source = fits[id(xf)][0].get("tauq_q_source")
+                    if source:
+                        f.write(f"# Q source of {xf.label}: {source}\n")
                 for method in sorted({m for _, m in fits.values()}):
                     f.write(f"# Fit method {method}:\n")
                     for line in _DIFFUSION_PROVENANCE[method]:

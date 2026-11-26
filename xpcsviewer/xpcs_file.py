@@ -53,7 +53,11 @@ from .fileIO.hdf_reader import (
     read_metadata_to_dict,
 )
 from .fileIO.hdf_reader_enhanced import get_enhanced_hdf5_reader
-from .fileIO.qmap_utils import Q_UNIT_DISPLAY, get_qmap
+from .fileIO.qmap_utils import (
+    Q_UNIT_DISPLAY,
+    SaxsNormalizationRefused,
+    get_qmap,
+)
 from .module.twotime_utils import get_c2_stream, get_single_c2_from_hdf
 from .utils.export_guard import ExportGuard
 from .utils.lazy_loader import LazyHDF5Array, get_lazy_loader
@@ -1496,11 +1500,13 @@ class XpcsFile:
                 )
         if qrange is not None:
             q_roi = (q >= qrange[0]) * (q <= qrange[1])
-            if q_roi.sum() > 0:
-                q = q[q_roi]
-                Iq = Iq[:, q_roi]
-            else:
-                logger.warning("qrange is not applied because it is out of range")
+            q, Iq = q[q_roi], Iq[:, q_roi]
+            if q.size == 0:
+                # no bin in the range: an empty selection, never the whole curve
+                logger.warning(
+                    f"{self.label}: no Q bin lies in [{qrange[0]}, {qrange[1]}]"
+                )
+                return q, Iq, *self.norm_saxs_data(q, Iq, norm_method=None)[2:]
         if use_absolute_crosssection and self.abs_cross_section_scale is not None:
             Iq = (
                 Iq * self.abs_cross_section_scale
@@ -1534,6 +1540,14 @@ class XpcsFile:
         name, unit = self._static_axis()
         if norm_method is None:
             return q, Iq, f"{name} ({unit})", "Intensity"
+        if norm_method in ("q2", "q4") and name != "q":
+            # I*q^k is a radial-q weighting; on qx / x / pixels it is another
+            # quantity under the wrong label, so it is refused, never computed
+            raise SaxsNormalizationRefused(
+                f"I*{norm_method[0]}^{norm_method[1]} needs a radial "
+                f"'q' axis, this file's first axis is {name!r} ({unit}); "
+                "use no normalisation or I/I0"
+            )
         ylabel = "Intensity"
         if norm_method == "q2":
             Iq = Iq * np.square(q)
@@ -2388,67 +2402,7 @@ class XpcsFile:
                 self.fit_summary.update(cached_result)
                 return self.fit_summary
 
-        try:
-            x = self.fit_summary["q_val"]
-            fit_val = self.fit_summary["fit_val"]
-
-            # Ensure x is a numpy array (convert from list if necessary)
-            if not hasattr(x, "shape"):
-                x = np.array(x)
-
-            # Ensure fit_val is a numpy array (convert from list if necessary)
-            if not hasattr(fit_val, "shape"):
-                fit_val = np.array(fit_val)
-
-            # Validate array dimensions and ensure compatibility
-            if len(x.shape) > 1:
-                x = x.flatten()
-
-            # Ensure x and fit_val have compatible first dimension
-            min_length = min(len(x), fit_val.shape[0])
-            x = x[:min_length]
-            fit_val = fit_val[:min_length]
-
-            # Vectorized q-range filtering using boolean indexing
-            q_slice = (x >= q_range[0]) & (x <= q_range[1])
-
-            # Validate boolean index dimensions
-            if len(q_slice) != fit_val.shape[0]:
-                logger.warning(
-                    f"Boolean index size mismatch: q_slice={len(q_slice)}, fit_val={fit_val.shape[0]}. Adjusting."
-                )
-                min_slice_len = min(len(q_slice), fit_val.shape[0])
-                q_slice = q_slice[:min_slice_len]
-                fit_val = fit_val[:min_slice_len]
-
-            # Validate that we have data after filtering
-            if not np.any(q_slice):
-                logger.warning(f"No data points in q_range {q_range}")
-                tauq_result = _tauq_failure()
-                self._memory_manager.cache_put(
-                    tauq_full_cache_key, tauq_result, CacheType.COMPUTATION
-                )
-                self.fit_summary.update(tauq_result)
-                return self.fit_summary
-
-            # Only Q bins whose G2 fit succeeded are tau(q) observations.
-            from xpcsviewer.fitting.legacy import fit_success_mask
-
-            g2_ok = fit_success_mask({**self.fit_summary, "fit_val": fit_val})
-            g2_ok = g2_ok[: len(q_slice)]
-            n_failed = int(np.count_nonzero(q_slice & ~g2_ok))
-            if n_failed:
-                logger.warning(
-                    "fit_tauq: ignoring %d Q bin(s) whose G2 fit failed", n_failed
-                )
-            q_slice = q_slice & g2_ok
-
-            x = x[q_slice]
-            y = fit_val[q_slice, 0, 1]
-            sigma = fit_val[q_slice, 1, 1]
-
-        except (IndexError, KeyError, ValueError) as e:
-            logger.error(f"Array indexing error in fit_tauq: {e}")
+        def _fail():
             tauq_result = _tauq_failure()
             self._memory_manager.cache_put(
                 tauq_full_cache_key, tauq_result, CacheType.COMPUTATION
@@ -2456,45 +2410,43 @@ class XpcsFile:
             self.fit_summary.update(tauq_result)
             return self.fit_summary
 
-        # Optimized filtering: combine validity checks
-        valid_idx = (sigma > 0) & np.isfinite(y) & np.isfinite(sigma)
-        # a*q**b lives on the log-log domain: drop q<=0, tau<=0 and infinite q
-        # from the start values, the solver and the plot grid alike.
-        domain = np.isfinite(x) & (x > 0) & (y > 0)
-        n_dropped = int(np.count_nonzero(valid_idx & ~domain))
-        if n_dropped:
+        try:
+            # The one row selection (shared with the Bayesian launch): the range is
+            # applied in the file's native Q unit, then the rows are converted.
+            from xpcsviewer.module.tauq import tauq_rows
+
+            rows = tauq_rows(self.fit_summary, q_range)
+        except (IndexError, KeyError, ValueError) as e:
+            logger.error(f"Array indexing error in fit_tauq: {e}")
+            return _fail()
+
+        if rows.n_in_range == 0:
+            logger.warning(f"No data points in q_range {q_range}")
+            return _fail()
+        if rows.n_g2_failed:
+            logger.warning(
+                "fit_tauq: ignoring %d Q bin(s) whose G2 fit failed", rows.n_g2_failed
+            )
+        # a*q**b lives on the log-log domain: q<=0, tau<=0 and infinite q are
+        # dropped from the start values, the solver and the plot grid alike.
+        if rows.n_dropped:
             logger.warning(
                 "fit_tauq: dropped %d sample(s) with non-positive or non-finite "
                 "q or tau",
-                n_dropped,
+                rows.n_dropped,
             )
-        valid_idx &= domain
+        x_valid, y_valid, sigma_valid = rows.q, rows.tau, rows.err
 
-        if np.sum(valid_idx) == 0:
-            tauq_result = _tauq_failure()
-            self._memory_manager.cache_put(
-                tauq_full_cache_key, tauq_result, CacheType.COMPUTATION
-            )
-            self.fit_summary.update(tauq_result)
-            return self.fit_summary
+        if x_valid.size == 0:
+            return _fail()
 
         # a*q**b needs two distinct q to separate a from b; one q is rank-deficient.
-        if np.unique(x[valid_idx]).size < 2 and np.all(fit_flag):
+        if np.unique(x_valid).size < 2 and np.all(fit_flag):
             logger.warning(
                 "fit_tauq: fewer than 2 distinct positive q values; "
                 "cannot fit both parameters"
             )
-            tauq_result = _tauq_failure()
-            self._memory_manager.cache_put(
-                tauq_full_cache_key, tauq_result, CacheType.COMPUTATION
-            )
-            self.fit_summary.update(tauq_result)
-            return self.fit_summary
-
-        # Apply filtering efficiently
-        x_valid = x[valid_idx]
-        y_valid = y[valid_idx]
-        sigma_valid = sigma[valid_idx]
+            return _fail()
 
         # Reshape arrays more efficiently
         y_reshaped = y_valid[:, np.newaxis]

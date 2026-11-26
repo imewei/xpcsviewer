@@ -178,6 +178,43 @@ def _accept_coords(ref, path, coords):
     return True
 
 
+_COORD_MISMATCH = "delay/Q coordinates differ from the first accepted file"
+_SHAPE_MISMATCH = "data shape differs from the first accepted file"
+
+
+def check_baseline(g2_data, q_idx, avg_window, avg_blmin, avg_blmax):
+    """The baseline test of one file: ``(accepted, baseline, reason)``.
+
+    The one validation of the GUI worker and the standalone ``do_average``.
+    ``q_idx`` is a zero-based ordinal into THIS file's own Q-bin list: a file
+    without that bin is rejected (baseline NaN, ``reason`` names the bin count),
+    never tested on another bin, so it cannot set the reference grid. Two files
+    can hold different physical bins at one ordinal; ``_accept_coords`` refuses
+    the second of them against the reference.
+    """
+    n_bins = np.shape(g2_data)[1]
+    if not 0 <= q_idx < n_bins:
+        return (
+            False,
+            float("nan"),
+            f"has no Q bin {q_idx} (the file has {n_bins} Q bins)",
+        )
+    baseline = float(np.mean(g2_data[-avg_window:, q_idx]))
+    if avg_blmin <= baseline <= avg_blmax:
+        return True, baseline, None
+    return (
+        False,
+        baseline,
+        f"baseline {baseline:.4g} is outside [{avg_blmin}, {avg_blmax}]",
+    )
+
+
+def _note_rejection(rejected, name, why):
+    """Record (and log) that file ``name`` is left out of the average, and why."""
+    logger.warning("average: %s left out: %s", name, why)
+    rejected[str(name)] = why
+
+
 def _fresh_file_mode(directory):
     """Mode a newly created file gets under the current umask (thread-safe probe)."""
     probe = os.path.join(directory, f".avg-{uuid.uuid4().hex}.mode")
@@ -189,7 +226,7 @@ def _fresh_file_mode(directory):
         os.remove(probe)
 
 
-def _publish_average(template, save_path, result, input_paths):
+def _publish_average(template, save_path, result, input_paths, commit=None):
     """Write the average beside ``save_path`` and rename it into place.
 
     A failure at any step leaves a previous ``save_path`` untouched, and the
@@ -197,6 +234,10 @@ def _publish_average(template, save_path, result, input_paths):
     The staging file is private (0600) while written; the published file keeps
     an existing output's permission bits or gets the umask-derived mode of a
     freshly created file.
+
+    ``commit(publish)`` runs the final rename for a job that may have been
+    retired meanwhile: it returns False without renaming, the staging file is
+    removed and nothing is published (returns False).
     """
     out_dir = os.path.dirname(os.path.abspath(save_path))
     tmp = os.path.join(out_dir, f".avg-{uuid.uuid4().hex}.tmp")
@@ -209,13 +250,19 @@ def _publish_average(template, save_path, result, input_paths):
             copymode(save_path, tmp)
         else:
             os.chmod(tmp, _fresh_file_mode(out_dir))
-        os.replace(tmp, save_path)
+        if commit is None:
+            os.replace(tmp, save_path)
+        elif not commit(lambda: os.replace(tmp, save_path)):
+            with suppress(OSError):
+                os.remove(tmp)
+            return False
     except BaseException:
         with suppress(OSError):
             os.remove(tmp)
         raise
     # pooled read handles and cached reads still refer to the replaced file
     clear_connection_pool()
+    return True
 
 
 def _check_output_not_input(save_path, input_paths):
@@ -281,10 +328,35 @@ class AverageToolbox(QtCore.QRunnable):
         self.origin_path = os.path.join(self.work_dir, self.model[0])
 
         self.is_killed = threading.Event()
+        # held while the output is renamed into place: ``kill`` then waits for a
+        # commit in progress, and no commit starts after it has returned
+        self._commit_lock = threading.Lock()
         self.n_accepted = 0
+        #: file name -> why it was left out of the average (GUI and job info)
+        self.rejected: dict[str, str] = {}
+
+    @property
+    def destination(self):
+        """The output path this job was set up with (``None`` when unset)."""
+        kw = getattr(self, "kwargs", {})
+        args = getattr(self, "args", ())
+        return kw.get("save_path", args[1] if len(args) > 1 else None)
 
     def kill(self):
-        self.is_killed.set()
+        """Stop the job; once this returns it can no longer publish its output."""
+        with self._commit_lock:
+            self.is_killed.set()
+
+    def _commit(self, publish) -> bool:
+        """Run ``publish`` (the final rename) unless the job was killed."""
+        with self._commit_lock:
+            if self.is_killed.is_set():
+                return False
+            publish()
+            return True
+
+    def _reject(self, fname, why) -> None:
+        _note_rejection(self.rejected, fname, why)
 
     def __str__(self) -> str:
         return str(self.jid)
@@ -329,6 +401,7 @@ class AverageToolbox(QtCore.QRunnable):
         self.stime = time.strftime("%H:%M:%S")
         self.status = "running"
         self.n_accepted = 0
+        self.rejected = {}
         self._ref = {}  # first accepted file: template path and coordinates
         if save_path is not None:
             try:
@@ -345,16 +418,7 @@ class AverageToolbox(QtCore.QRunnable):
         mask = np.zeros(tot_num, dtype=np.int64)
 
         def validate_g2_baseline(g2_data, q_idx):
-            if q_idx >= g2_data.shape[1]:
-                idx = 0
-                logger.info("q_index is out of range; using 0 instead")
-            else:
-                idx = q_idx
-
-            g2_baseline = np.mean(g2_data[-avg_window:, idx])
-            if avg_blmax >= g2_baseline >= avg_blmin:
-                return True, g2_baseline
-            return False, g2_baseline
+            return check_baseline(g2_data, q_idx, avg_window, avg_blmin, avg_blmax)
 
         result = {}
         for key in fields:
@@ -437,15 +501,21 @@ class AverageToolbox(QtCore.QRunnable):
         logger.info(f"create file: {save_path}")
         # template = first accepted file, so metadata matches the averaged coordinates
         try:
-            _publish_average(
+            published = _publish_average(
                 self._ref.get("path", self.origin_path),
                 save_path,
                 result,
                 [os.path.join(self.work_dir, f) for f in self.model[:]],
+                commit=self._commit,
             )
         except Exception as e:
             logger.error("cannot write the average to %s: %s", save_path, e)
             self._finish(0)
+            return
+        if not published:
+            # removed or replaced while writing: the destination is not ours
+            logger.info("average job %s was retired; nothing is published", self.jid)
+            self.status = "killed"
             return
 
         # Final cleanup to release memory
@@ -516,16 +586,18 @@ class AverageToolbox(QtCore.QRunnable):
                 fname = self.model[m]
                 try:
                     xf = XF(os.path.join(self.work_dir, fname), fields=fields)
-                    flag, val = validate_g2_baseline(xf.g2, avg_qindex)
+                    flag, val, why = validate_g2_baseline(xf.g2, avg_qindex)
                     self.baseline[self.ptr] = val
                     self.ptr += 1
                 except Exception as e:
                     logger.error(f"Error in filtering baseline calculation: {e}")
                     traceback.print_exc()
-                    flag, val = False, 0
+                    flag, val, why = False, 0, f"is damaged or unreadable ({e})"
                     logger.error("file %s is damaged, skip", fname)
 
-                if flag:
+                if not flag:
+                    self._reject(fname, why)
+                else:
                     # Gather this file's fields, then include all-or-nothing so
                     # mask[m] reflects whether EVERY field was summed (consistent
                     # per-key normalization).
@@ -544,12 +616,10 @@ class AverageToolbox(QtCore.QRunnable):
                         os.path.join(self.work_dir, fname),
                         _coords_of(xf, fields),
                     ):
-                        logger.warning(
-                            f"delay/Q coordinates do not match, skipping {fname}"
-                        )
+                        self._reject(fname, _COORD_MISMATCH)
                         shapes_ok = False
                     elif not shapes_ok:
-                        logger.info(f"data shape does not match, skipping {fname}")
+                        self._reject(fname, _SHAPE_MISMATCH)
                     if shapes_ok:
                         _accumulate_into(result, fields, file_data)
                         mask[m] = 1
@@ -650,19 +720,13 @@ class AverageToolbox(QtCore.QRunnable):
                                 or result[key].shape == file_result[key].shape
                                 for key in fields
                             ):
-                                logger.info(
-                                    "data shape does not match, skipping %s",
-                                    self.model[m],
-                                )
+                                self._reject(self.model[m], _SHAPE_MISMATCH)
                             elif not _accept_coords(
                                 self._ref,
                                 os.path.join(self.work_dir, self.model[m]),
                                 file_result["_coords"],
                             ):
-                                logger.warning(
-                                    "delay/Q coordinates do not match, skipping %s",
-                                    self.model[m],
-                                )
+                                self._reject(self.model[m], _COORD_MISMATCH)
                             else:
                                 _accumulate_into(result, fields, file_result)
                                 # counted only after every field was summed
@@ -686,6 +750,7 @@ class AverageToolbox(QtCore.QRunnable):
                     # original index so ordering matches the successful path.
                     for _m in batch_indices:
                         self.baseline[_m] = 0
+                        self._reject(self.model[_m], f"its batch failed ({e})")
                         self.signals.values.emit((self.jid, 0))
 
         # Set ptr to tot_num after all batches complete so update_plot slices
@@ -706,10 +771,13 @@ class AverageToolbox(QtCore.QRunnable):
             fname = self.model[m]
             try:
                 xf = XF(os.path.join(self.work_dir, fname), fields=fields)
-                flag, val = validate_g2_baseline(xf.g2, avg_qindex)
+                flag, val, why = validate_g2_baseline(xf.g2, avg_qindex)
                 batch_baselines.append(val)
 
-                if flag:
+                if not flag:
+                    self._reject(fname, why)
+                    batch_results.append(None)
+                else:
                     file_result = {}
                     for key in fields:
                         if key != "saxs_1d":
@@ -718,8 +786,6 @@ class AverageToolbox(QtCore.QRunnable):
                             file_result[key] = getattr(xf, "saxs_1d")["data_raw"]
                     file_result["_coords"] = _coords_of(xf, fields)
                     batch_results.append(file_result)
-                else:
-                    batch_results.append(None)
 
                 # DEFECT 4: release XpcsFile memory immediately, mirroring the
                 # sequential path cleanup at lines 338-341.
@@ -728,6 +794,7 @@ class AverageToolbox(QtCore.QRunnable):
 
             except Exception as e:
                 logger.error(f"file {fname} is damaged or failed to load, skip: {e}")
+                self._reject(fname, f"is damaged or unreadable ({e})")
                 batch_results.append(None)
                 batch_baselines.append(0)
 
@@ -770,10 +837,20 @@ class AverageToolbox(QtCore.QRunnable):
                 data[key] = val
 
         # additional keys to describe the worker
-        add_keys = ["submit_time", "etime", "status", "baseline", "ptr", "eta", "size"]
+        add_keys = [
+            "submit_time",
+            "etime",
+            "status",
+            "baseline",
+            "ptr",
+            "eta",
+            "size",
+            "rejected",
+        ]
 
         for key in add_keys:
-            data[key] = self.__dict__[key]
+            value = self.__dict__[key]
+            data[key] = dict(value) if key == "rejected" else value  # worker writes
 
         if self.size > 20:
             data["first_10_datasets"] = self.model[0:10]
@@ -791,14 +868,11 @@ def _process_file_for_average(args):
     """Helper function for parallel file processing in do_average"""
     fname, work_dir, fields, avg_window, avg_qindex, avg_blmin, avg_blmax = args
 
-    def validate_g2_baseline(g2_data, q_idx):
-        idx = 0 if q_idx >= g2_data.shape[1] else q_idx
-        g2_baseline = np.mean(g2_data[-avg_window:, idx])
-        return avg_blmax >= g2_baseline >= avg_blmin, g2_baseline
-
     try:
         xf = XF(os.path.join(work_dir, fname), fields=fields)
-        flag, val = validate_g2_baseline(xf.g2, avg_qindex)
+        flag, val, why = check_baseline(
+            xf.g2, avg_qindex, avg_window, avg_blmin, avg_blmax
+        )
 
         if flag:
             result = {}
@@ -814,11 +888,11 @@ def _process_file_for_average(args):
 
             result["_coords"] = _coords_of(xf, fields)
             scale = xf.abs_cross_section_scale if "saxs_1d" in fields else 1.0
-            return True, val, result, scale if scale is not None else 1.0
-        return False, val, None, 1.0
+            return True, val, result, scale if scale is not None else 1.0, None
+        return False, val, None, 1.0, why
     except Exception as ec:
         logger.error(f"file {fname} is damaged, skip: {ec!s}")
-        return False, 0, None, 1.0
+        return False, 0, None, 1.0, f"is damaged or unreadable ({ec})"
 
 
 def do_average(
@@ -831,6 +905,7 @@ def do_average(
     avg_blmax=1.05,
     fields=None,
     n_jobs=None,
+    rejected=None,
 ):
     """Average multiple XPCS datasets with baseline filtering.
 
@@ -844,13 +919,16 @@ def do_average(
         work_dir: Directory containing the files. Defaults to ``"./"``
         save_path: Output file path. Defaults to ``"AVG" + flist[0]``.
         avg_window: Smoothing window size for baseline evaluation.
-        avg_qindex: Q-bin index used for baseline computation.
+        avg_qindex: Zero-based ordinal of the Q bin (in each file's own bin
+            list) used for the baseline; a file without it is rejected.
         avg_blmin: Minimum acceptable baseline value for inclusion.
         avg_blmax: Maximum acceptable baseline value for inclusion.
         fields: List of HDF5 field keys to average. Defaults to
             ``["saxs_2d", "saxs_1d", "g2", "g2_err"]``.
         n_jobs: Number of parallel workers. Defaults to
             ``min(len(flist), cpu_count())``.
+        rejected: Optional dict filled with ``{file name: reason}`` for every
+            file left out of the average.
 
     Returns:
         numpy.ndarray | None: Per-file baseline values as a 1-D array,
@@ -882,6 +960,7 @@ def do_average(
         result[key] = None
 
     ref = {}  # first accepted file: template path and coordinates
+    rej: dict[str, str] = {}  # file name -> why it is left out
 
     def _accumulate(result, m, file_result):
         # All-or-nothing: include this file only if every field is
@@ -891,16 +970,25 @@ def do_average(
             result[key] is None or result[key].shape == file_result[key].shape
             for key in fields
         ):
-            logger.info(f"data shape does not match, skipping {flist[m]}")
+            _note_rejection(rej, flist[m], _SHAPE_MISMATCH)
             return False
         if not _accept_coords(
             ref, os.path.join(work_dir, flist[m]), file_result["_coords"]
         ):
-            logger.warning(f"delay/Q coordinates do not match, skipping {flist[m]}")
+            _note_rejection(rej, flist[m], _COORD_MISMATCH)
             return False
         mask[m] = 1
         _accumulate_into(result, fields, file_result)
         return True
+
+    def _take(result, m, outcome):
+        nonlocal abs_cs_scale_tot
+        flag, val, file_result, scale, why = outcome
+        baseline[m] = val
+        if not flag or file_result is None:
+            _note_rejection(rej, flist[m], why)
+        elif _accumulate(result, m, file_result):
+            abs_cs_scale_tot += scale if "saxs_1d" in fields else 0.0
 
     # Determine number of workers
     if n_jobs is None:
@@ -927,15 +1015,8 @@ def do_average(
                 )
 
             # Process results from parallel execution
-            for m, (flag, val, file_result, scale) in enumerate(results_parallel):
-                baseline[m] = val
-
-                if (
-                    flag
-                    and file_result is not None
-                    and _accumulate(result, m, file_result)
-                ):
-                    abs_cs_scale_tot += scale if "saxs_1d" in fields else 0.0
+            for m, outcome in enumerate(results_parallel):
+                _take(result, m, outcome)
 
         except Exception as e:
             logger.warning(f"Parallel processing failed, falling back to serial: {e}")
@@ -945,8 +1026,31 @@ def do_average(
             mask[:] = 0
             abs_cs_scale_tot = 0.0
             ref.clear()
+            rej.clear()
             for m in trange(tot_num):
-                flag, val, file_result, scale = _process_file_for_average(
+                _take(
+                    result,
+                    m,
+                    _process_file_for_average(
+                        (
+                            flist[m],
+                            work_dir,
+                            fields,
+                            avg_window,
+                            avg_qindex,
+                            avg_blmin,
+                            avg_blmax,
+                        )
+                    ),
+                )
+    else:
+        # Sequential processing for small datasets
+        logger.info("Using sequential processing")
+        for m in trange(tot_num):
+            _take(
+                result,
+                m,
+                _process_file_for_average(
                     (
                         flist[m],
                         work_dir,
@@ -956,35 +1060,11 @@ def do_average(
                         avg_blmin,
                         avg_blmax,
                     )
-                )
-                baseline[m] = val
-
-                if (
-                    flag
-                    and file_result is not None
-                    and _accumulate(result, m, file_result)
-                ):
-                    abs_cs_scale_tot += scale if "saxs_1d" in fields else 0.0
-    else:
-        # Sequential processing for small datasets
-        logger.info("Using sequential processing")
-        for m in trange(tot_num):
-            flag, val, file_result, scale = _process_file_for_average(
-                (
-                    flist[m],
-                    work_dir,
-                    fields,
-                    avg_window,
-                    avg_qindex,
-                    avg_blmin,
-                    avg_blmax,
-                )
+                ),
             )
-            baseline[m] = val
 
-            if flag and file_result is not None and _accumulate(result, m, file_result):
-                abs_cs_scale_tot += scale if "saxs_1d" in fields else 0.0
-
+    if rejected is not None:
+        rejected.update(rej)
     if np.sum(mask) == 0:
         logger.info("no dataset is valid; check the baseline criteria.")
         return None

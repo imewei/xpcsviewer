@@ -34,7 +34,7 @@ from .backends._conversions import ensure_numpy
 from .constants import MIN_AVERAGING_FILES
 from .fileIO.g2_regroup import G2RegroupResult
 from .fileIO.hdf_reader import _file_identity
-from .fileIO.qmap_utils import Q_UNIT_DISPLAY, convert_q, map_axis, q_axis_label
+from .fileIO.qmap_utils import Q_UNIT_DISPLAY, map_axis, q_axis_label
 from .gui.g2_regroup_dialog import G2RegroupDialog, G2RegroupExportWorker
 from .gui.layout_helpers import apply_all_layout_improvements
 from .gui.shortcuts.shortcut_manager import ShortcutManager
@@ -63,7 +63,12 @@ from .threading.progress_manager import ProgressManager
 from .utils import get_logger, log_system_info, sanitize_path, setup_exception_logging
 from .utils.log_utils import RateLimitedLogger
 from .utils.qmap_notice import PLACEHOLDER_QMAP_WARNING, has_placeholder_qmap
-from .viewer_kernel import ViewerKernel
+from .viewer_kernel import (
+    ViewerKernel,
+    _diffusion_axis_problem,
+    _diffusion_fit,
+    _in_diffusion_unit,
+)
 from .viewer_ui import Ui_mainWindow as Ui
 
 if TYPE_CHECKING:  # the fitting package is imported lazily (JAX start-up cost)
@@ -154,6 +159,17 @@ def _get_index(widget):
     return widget.currentIndex()
 
 
+def _report_vanished_twotime_bin(viewer, kind, gone, fname, shown):
+    """Status-bar notice that a remembered two-time bin left the file (the first
+    bin is shown instead): never a silent substitution."""
+    bar = getattr(viewer, "statusbar", None)
+    if bar is not None:
+        bar.showMessage(
+            f"{kind} two-time bin {gone} is no longer in {fname}; showing bin {shown}",
+            10000,
+        )
+
+
 def _restore_twotime_bin(viewer, widget, source, bin_id):
     """Select the saved two-time bin by its absolute processed-bin ID in the file
     it was chosen on (a position would name another bin once the file is
@@ -162,6 +178,9 @@ def _restore_twotime_bin(viewer, widget, source, bin_id):
     if vk is None:
         return
     source = os.path.abspath(source)
+    # The restored identity is state of its own: a save made before the tab ever
+    # drew (the combo is still empty) writes it back unchanged.
+    viewer._twotime_restored_identity = (source, bin_id)
     row = next(
         (
             r
@@ -177,7 +196,14 @@ def _restore_twotime_bin(viewer, widget, source, bin_id):
     bins = tuple(np.ravel(getattr(xf, "c2_processed_bins", [])).tolist())
     if bin_id not in bins:
         logger.warning("saved two-time bin %s is not in %s: first bin", bin_id, source)
+        if bins:  # the user is told once; the choice (first bin) is unchanged
+            _report_vanished_twotime_bin(
+                viewer, "saved", bin_id, os.path.basename(source), bins[0]
+            )
     ordinal = bins.index(bin_id) if bin_id in bins else 0
+    if bins and bin_id not in bins:  # what is shown is the first bin: so is the key
+        viewer._twotime_restored_identity = (source, int(bins[0]))
+    viewer._twotime_restored_position = ordinal
     # the ordinal is recorded together with the bins it is a position in
     _remember_twotime_qbin(viewer._twotime_qbin_memory, xf.fname, ordinal)
     _remember_twotime_qbin(viewer._twotime_qbin_bins, xf.fname, bins)
@@ -197,6 +223,7 @@ def _set_twotime_q(viewer, widget, value):
         return
     if not isinstance(value, int) or value < 0:
         return
+    viewer._twotime_restored_position = value
     fname = viewer._current_twotime_fname()
     if fname is not None:
         _remember_twotime_qbin(viewer._twotime_qbin_memory, fname, value)
@@ -353,25 +380,15 @@ def _skipped_text(skipped) -> str:
 def _tauq_rows(fit_summary, q_range):
     """``(q, tau, tau_err)`` rows of the tau-q power-law fit for *q_range*.
 
-    Source of truth: ``XpcsFile.fit_tauq`` (xpcs_file.py).  This is the same
-    selection, kept identical on purpose (a test compares both on a real file):
-    only Q bins inside *q_range* whose G2 fit succeeded
-    (``fit_success_mask``), with finite positive q and tau and a positive finite
-    uncertainty.  ``fit_tauq`` and the Bayesian launch must never disagree about
-    which rows are observations.
+    Not a second implementation: ``module.tauq.tauq_rows``, the very function
+    ``XpcsFile.fit_tauq`` selects with (range applied in the file's native Q
+    unit, then the kept rows converted).  ``fit_tauq`` and the Bayesian launch
+    can therefore never disagree about which rows are observations.
     """
-    from .fitting.legacy import fit_success_mask
+    from .module.tauq import tauq_rows
 
-    x = np.asarray(fit_summary["q_val"]).ravel()
-    fit_val = np.asarray(fit_summary["fit_val"])
-    n = min(len(x), fit_val.shape[0])
-    x, fit_val = x[:n], fit_val[:n]
-    in_range = (x >= q_range[0]) & (x <= q_range[1])
-    in_range &= fit_success_mask({**fit_summary, "fit_val": fit_val})[:n]
-    q, tau, err = x[in_range], fit_val[in_range, 0, 1], fit_val[in_range, 1, 1]
-    valid = (err > 0) & np.isfinite(tau) & np.isfinite(err)
-    valid &= np.isfinite(q) & (q > 0) & (tau > 0)
-    return q[valid], tau[valid], err[valid]
+    rows = tauq_rows(fit_summary, q_range)
+    return rows.q, rows.tau, rows.err
 
 
 @dataclass(frozen=True)
@@ -470,6 +487,9 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
     >>> viewer = XpcsViewer(path="/path/to/data")
     >>> viewer.show()
     """
+
+    #: status-bar note of the last submit when the baseline Q index was lowered
+    _avg_qindex_note = ""
 
     def __init__(self, path=None, label_style=None, path_explicit=None):
         super().__init__()
@@ -603,6 +623,13 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         # the processed-bin tuple each remembered ordinal refers to (R6-11)
         self._twotime_qbin_bins: OrderedDict[str, tuple] = OrderedDict()
         self._twotime_last_fname = None
+        # (path, absolute bin ID) restored from the session and not yet
+        # superseded by a drawn two-time selection (see _twotime_session_identity)
+        self._twotime_restored_identity: tuple[str, int] | None = None
+        # the position that identity (or an older session) had in the combo
+        self._twotime_restored_position: int | None = None
+        # (path, revision, token) of the file the Mask Editor was last handed
+        self._simplemask_handoff: tuple[str, Any, object] | None = None
         self._init_twotime_tab()
         self.init_twotime_plot_handler()
 
@@ -1502,6 +1529,13 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             if widget is not None:
                 param_values[fld] = getter(widget)
         source, bin_id = self._twotime_session_identity()
+        if (
+            param_values.get("twotime_selected_q", 0) < 0
+            and self._twotime_restored_position is not None
+        ):
+            # the combo has not been filled since the restore: its position is
+            # the restored one, not -1 (same rule as the identity above)
+            param_values["twotime_selected_q"] = self._twotime_restored_position
         analysis_params = AnalysisParameters(
             **param_values, twotime_source_file=source, twotime_selected_bin=bin_id
         )
@@ -1526,7 +1560,9 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         bins = self._twotime_qbin_bins.get(fname) if fname is not None else None
         index = self.comboBox_twotime_selection.currentIndex()
         if bins is None or not 0 <= index < len(bins):
-            return "", -1
+            # the tab has not drawn since the restore: the restored identity
+            # (key: path + absolute bin ID) still stands
+            return self._twotime_restored_identity or ("", -1)
         return os.path.abspath(fname), int(bins[index])
 
     def _restore_session(self) -> None:
@@ -1914,6 +1950,7 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         from .module import saxs2d
 
         saxs2d.draw(self.pg_saxs, result["frame"], **result["display"])
+        self._sync_saxs2d_selection()
 
     def apply_g2_result(self, result):
         """Apply G2 plot result to the GUI.
@@ -2592,8 +2629,14 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             mouse_point = self.pg_saxs.getView().mapSceneToView(pos)
             # the pixel drawn there, through the item's own (possibly rotated) mapping
             x, y = self.pg_saxs.pixel_index_at(mouse_point.x(), mouse_point.y())
-            rows = self.get_selected_rows()
-            payload = self.vk.get_info_at_mouse(rows, x, y)
+            # the file the view RENDERS, not the highlighted row (the spinbox
+            # can draw another one)
+            rows = self._saxs2d_rendered_rows()
+            if not rows and self._saxs2d_rendered_row()[1]:
+                # not the last value of a file that has since been replaced
+                self.saxs2d_display.setText("file changed on disk")
+                return
+            payload = self.vk.get_info_at_mouse(rows, x, y) if rows else None
             if payload:
                 self.saxs2d_display.setText(payload)
                 self._rate_limited_logger.debug(f"SAXS 2D mouse at ({x}, {y})")
@@ -2604,6 +2647,57 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         # request (target rows) cannot tell it apart from this selection.
         self._retire_plot_operations("saxs_2d")
         self.plot_saxs_2d(selection=selection)
+        # The last recorded request (the highlighted rows) no longer describes
+        # what is drawn: forget it, so the next list click reaches the renderer.
+        self.plot_kwargs_record["saxs_2d"] = {}
+
+    def _saxs2d_rendered_rows(self) -> list[int]:
+        """Target row of the file the SAXS-2D view shows, as a one-item list
+        (empty if nothing is shown, or its file is gone / replaced since).
+
+        The identity is the rendered frame's (path, revision): the row is only
+        a position in the CURRENT target list, found by path. Cursor readout,
+        default ROI origin and the spinbox all use this and nothing else.
+        """
+        row, changed = self._saxs2d_rendered_row()
+        return [] if row is None or changed else [row]
+
+    def _saxs2d_rendered_row(self) -> tuple[int | None, bool]:
+        """``(row, changed)`` of the file the SAXS-2D view shows: its position in
+        the target list (``None`` if nothing is shown or the file left the list)
+        and whether the file on disk is no longer the revision that was drawn."""
+        frame = getattr(self.pg_saxs, "rendered_frame", None)
+        if frame is None or self.vk is None:
+            return None, False
+        for row, name in enumerate(self.vk.target):
+            full = os.path.normpath(os.path.join(self.vk.path, name))
+            if full == frame.path:
+                return row, _revision_of(full) != frame.revision
+        return None, False
+
+    def _sync_saxs2d_selection(self) -> None:
+        """Make the file spinbox / slider say which file the view shows.
+
+        They hold a row ORDINAL, so they follow the rendered file's row when
+        the list is reordered, shrunk or grown, and are clamped to the list
+        (never below 0, even for an empty list). Signals are blocked: this
+        reports a draw, it does not request one.
+        """
+        top = max(len(self.vk.target) - 1 if self.vk else 0, 0)
+        rows = self._saxs2d_rendered_rows()
+        value = rows[0] if rows else self.spinBox_saxs2d_selection.value()
+        value = min(max(value, 0), top)
+        for widget in (
+            self.spinBox_saxs2d_selection,
+            self.horizontalSlider_saxs2d_selection,
+        ):
+            widget.blockSignals(True)
+            try:
+                widget.setMinimum(0)
+                widget.setMaximum(top)
+                widget.setValue(value)
+            finally:
+                widget.blockSignals(False)
 
     def _current_twotime_fname(self):
         """Return fname of the currently selected Twotime file, or None."""
@@ -2663,6 +2757,7 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         if dryrun:
             return kwargs
         self.vk.plot_saxs_2d(pg_hdl=self.pg_saxs, **kwargs)
+        self._sync_saxs2d_selection()
         return None
 
     def saxs2d_roi_add(self):
@@ -2684,7 +2779,21 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         }
 
         logger.debug(f"GUI: Attempting to add ROI with kwargs: {kwargs}")
-        result = self.vk.add_roi(self.pg_saxs, rows=self.get_selected_rows(), **kwargs)
+        # the ROI starts at the beam centre of the file the view RENDERS
+        rows = self._saxs2d_rendered_rows()
+        if not rows:
+            if self._saxs2d_rendered_row()[1]:
+                message = (
+                    "The displayed SAXS 2D file changed on disk: re-plot it "
+                    "before adding an ROI"
+                )
+            else:
+                message = (
+                    "No SAXS 2D image is displayed: draw a file before adding an ROI"
+                )
+            self.statusbar.showMessage(message, 4000)
+            return
+        result = self.vk.add_roi(self.pg_saxs, rows=rows, **kwargs)
         if result is None:
             logger.warning(f"GUI: ROI addition failed for type '{kwargs['sl_type']}'")
         else:
@@ -3168,6 +3277,7 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         Returns:
             Tuple of (detector_image, metadata) or (None, None) if no data loaded
         """
+        self._simplemask_handoff = None
         if not self.vk or not self.vk.target or len(self.vk.target) == 0:
             logger.debug("No files loaded for SimpleMask")
             return None, None
@@ -3208,6 +3318,15 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
                 # long as it shows its data, whatever the viewer later does with it.
                 "source_file": str(xf.fname),
             }
+            # Identity of the editor's source: path AND on-disk revision, plus one
+            # token for this editor session (import_mask keys its per-target
+            # records on it). The editor sends the path only; the revision stays
+            # here, so a same-path file with another revision is not "the source".
+            self._simplemask_handoff = (
+                str(xf.fname),
+                _revision_of(str(xf.fname)),
+                object(),
+            )
             # The EFFECTIVE mask the viewer applies to this file right now (an
             # imported mask, else the file's own): the editor starts from it, so
             # an untouched "Apply to Viewer" changes nothing. 2-D, image shape,
@@ -3300,12 +3419,35 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             edits = ~keep  # no usable seed: an all-valid seed
             if seed is not None and np.shape(seed) == keep.shape:
                 edits = (np.asarray(seed) != 0) & ~keep
+            # Identity of "the source": the hand-off's (path, revision). Only an
+            # Apply that names that same path can use it (a caller that sends its
+            # own source path has no recorded revision: path alone, as before).
+            handoff = getattr(self, "_simplemask_handoff", None)
+            if handoff is not None and (
+                source is None or not _same_file(handoff[0], source)
+            ):
+                handoff = None
+            # One key per editor session for the per-target records: the hand-off
+            # token, else the seed array (a seedless Apply -> undo -> Apply is
+            # still one session).
+            session = handoff[2] if handoff is not None else seed
+            changed_on_disk: list[str] = []
             for xf in accepted:
                 canonical = getattr(getattr(xf, "qmap", None), "mask", None)
                 canonical = None if canonical is None else np.asarray(canonical) != 0
                 if canonical is not None and canonical.shape != np.shape(mask):
                     canonical = None
-                if source is None or _same_file(xf.fname, source):
+                is_source = source is None or _same_file(xf.fname, source)
+                if (
+                    is_source
+                    and handoff is not None
+                    and _revision_of(str(xf.fname)) != handoff[1]
+                ):
+                    # same path, other revision: the editor's mask holds the OLD
+                    # file's exclusions. Treat it like any other target.
+                    is_source = False
+                    changed_on_disk.append(os.path.basename(str(xf.fname)))
+                if is_source:
                     combined = np.asarray(mask) != 0
                     if canonical is not None:
                         narrowed = combined & canonical
@@ -3320,8 +3462,8 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
                 record = records.get(xf)
                 if (
                     record is not None
-                    and seed is not None
-                    and record[2] is seed
+                    and session is not None
+                    and record[2] is session
                     and xf.mask is record[1]
                 ):
                     base = record[0]
@@ -3331,7 +3473,7 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
                 if canonical is not None:
                     result &= canonical
                 xf.mask = result
-                records[xf] = (base, result, seed)
+                records[xf] = (base, result, session)
 
             logger.info(
                 f"Mask exported from SimpleMask: shape {mask.shape}, "
@@ -3343,6 +3485,13 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             )
             if skipped:
                 message += f". Skipped (other detector shape): {_skipped_text(skipped)}"
+            if changed_on_disk:
+                names = ", ".join(changed_on_disk)
+                logger.warning(f"Mask Editor source changed on disk: {names}")
+                message += (
+                    f". The editor's file changed on disk ({names}): it got only "
+                    "your edits, not the editor's whole mask"
+                )
             self.update_plot()
             # after the redraw: starting a plot writes its own status message
             self.statusbar.showMessage(message)
@@ -3597,11 +3746,27 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             )
         if xf_two is not None:
             bins_memory = self._twotime_qbin_bins
+            bins_memory_before = bins_memory.get(fname)
             resolved_sel, bins = _resolve_twotime_selection(
                 xf_two, current_selection, bins_memory.get(fname)
             )
             if bins is not None:
                 _remember_twotime_qbin(bins_memory, fname, bins)
+                before = bins_memory_before
+                if (
+                    resolved_sel is not None
+                    and before is not None
+                    and before != bins
+                    and 0 <= current_selection < len(before)
+                    and before[current_selection] not in bins
+                ):  # the remembered bin left the reloaded file: say what is shown
+                    _report_vanished_twotime_bin(
+                        self,
+                        "previously selected",
+                        before[current_selection],
+                        os.path.basename(fname),
+                        bins[resolved_sel],
+                    )
             no_c2_bins = resolved_sel is None
             if resolved_sel is not None and resolved_sel != current_selection:
                 current_selection = resolved_sel
@@ -3801,8 +3966,8 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
 
             g2_bounds, g2_fit_flag, g2_fit_func = self.check_g2_fitting_number()
             g2_params = self.check_g2_number()
-            g2_q_range = (
-                None if self.g2_qauto.isChecked() else (g2_params[0], g2_params[1])
+            g2_q_range = g2mod.effective_q_range(
+                self.g2_qauto.isChecked(), (g2_params[0], g2_params[1])
             )
             g2_t_range = (
                 None if self.g2_tauto.isChecked() else (g2_params[2], g2_params[3])
@@ -3913,6 +4078,27 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
                 save_name = "Avg" + self.vk.target[0]
                 self.avg_save_name.setText(save_name)
 
+    def _baseline_qindex_for_job(self) -> int:
+        """The baseline Q index of the job; lowered to the last bin of the selected
+        file with the fewest Q bins when the box asks for one beyond it (the
+        status-bar note is shown by ``submit_job`` once the list has refreshed)."""
+        index = self.avg_qindex.value()
+        self._avg_qindex_note = ""
+        counts = []
+        for xf in self.vk.get_xf_list(filter_atype="Multitau"):
+            g2 = getattr(xf, "g2", None)
+            if g2 is not None and np.ndim(g2) == 2:
+                counts.append(int(np.shape(g2)[1]))
+        if not counts or index < min(counts) or min(counts) < 1:
+            return index
+        fewest = min(counts)
+        self.avg_qindex.setValue(fewest - 1)
+        self._avg_qindex_note = (
+            f"baseline Q index lowered from {index} to {fewest - 1}: "
+            f"the selected files have {fewest} Q bins"
+        )
+        return fewest - 1
+
     def submit_job(self):
         if self.vk is None:
             self.statusbar.showMessage("No directory loaded", 2000)
@@ -3951,7 +4137,7 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             "chunk_size": int(self.cb_avg_chunk_size.currentText()),
             "avg_blmin": self.avg_blmin.value(),
             "avg_blmax": self.avg_blmax.value(),
-            "avg_qindex": self.avg_qindex.value(),
+            "avg_qindex": self._baseline_qindex_for_job(),
             "avg_window": self.avg_window.value(),
             "fields": avg_fields,
         }
@@ -3964,7 +4150,10 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         self.vk.submit_job(**kwargs)
         if not self.vk.target:
             self._close_g2_regroup()
+            self._clear_saxs2d_view()  # the list was emptied into the job
         self.update_box(self.vk.target, mode="target")
+        if self._avg_qindex_note:
+            self.statusbar.showMessage(self._avg_qindex_note, 8000)
 
     def update_avg_info(self):
         if self.vk is None:
@@ -3999,6 +4188,15 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             if worker.status == "finished" and worker.n_accepted == 0:
                 self.statusbar.showMessage(
                     "Averaging finished: no valid dataset; no output written", 8000
+                )
+            if worker.status == "finished" and worker.rejected:
+                # names every file left out and why (replaces the message above,
+                # which this one repeats when nothing was accepted)
+                self.vk.report_left_out(
+                    "Averaging (no output written)"
+                    if worker.n_accepted == 0
+                    else "Averaging",
+                    worker.rejected,
                 )
 
     def start_avg_job(self):
@@ -4153,7 +4351,7 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             "show_fit": False,  # G2 tab shows raw data only (fitting is on g2 fitting tab)
             "show_label": self.g2_show_label.isChecked(),
             "plot_type": self.g2_plot_type.currentText(),
-            "q_range": (p[0], p[1]),
+            "q_range": self._g2_q_range(),
             "t_range": (p[2], p[3]),
             "y_range": (p[4], p[5]),
             "y_auto": self.g2_yauto.isChecked(),
@@ -4200,7 +4398,7 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             "show_fit": True,  # Always show fit when refitting
             "show_label": self.g2_show_label.isChecked(),
             "plot_type": self.g2_plot_type.currentText(),
-            "q_range": (p[0], p[1]),
+            "q_range": self._g2_q_range(),
             "t_range": (p[2], p[3]),
             "y_range": (p[4], p[5]),
             "y_auto": self.g2_yauto.isChecked(),
@@ -4262,7 +4460,7 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             "show_fit": True,  # Always show fit on the fitting tab
             "show_label": self.g2_show_label.isChecked(),
             "plot_type": self.g2_plot_type.currentText(),
-            "q_range": (p[0], p[1]),
+            "q_range": self._g2_q_range(),
             "t_range": (p[2], p[3]),
             "y_range": (p[4], p[5]),
             "y_auto": self.g2_yauto.isChecked(),
@@ -4799,11 +4997,7 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             self.box_target.repaint()
             self.list_view_target.repaint()
             self._sync_bayesian_to_targets()
-            max_size = len(file_list) - 1
-            self.horizontalSlider_saxs2d_selection.setMaximum(max_size)
-            self.horizontalSlider_saxs2d_selection.setValue(0)
-            self.spinBox_saxs2d_selection.setMaximum(max_size)
-            self.spinBox_saxs2d_selection.setValue(0)
+            self._sync_saxs2d_selection()
         self.statusbar.showMessage("Target file list updated.", 1000)
         return
 
@@ -5019,6 +5213,7 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
                 self.list_view_target.setCurrentIndex(model.index(idx, 0))
         self.list_view_target.repaint()
         self.update_plot()
+        self._sync_saxs2d_selection()  # the rows moved; the drawn file did not
         return
 
     def remove_target(self):
@@ -5046,7 +5241,20 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         if self.vk.target in [[], None] or len(self.vk.target) == 0:
             logger.debug("remove_target: All files removed, resetting GUI")
             self.reset_gui()
+            self._clear_saxs2d_view()
         self.update_box(self.vk.target, mode="target")
+        if (
+            self.vk.target
+            and getattr(self.pg_saxs, "rendered_frame", None) is not None
+            and not self._saxs2d_rendered_rows()
+        ):
+            # the SAXS image on screen is of a file that just left the list
+            self.update_plot()
+
+    def _clear_saxs2d_view(self) -> None:
+        """Nothing is left to show: the SAXS-2D image and its rendered-frame record go."""
+        self._retire_plot_operations("saxs_2d")
+        self.pg_saxs.clear()
 
     def _retire_plot_operations(self, plot_type: str | None = None) -> None:
         """Cancel in-flight plot operations (all, or only those of *plot_type*).
@@ -5108,6 +5316,14 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         self.source_model = self.vk.source_search
         self.update_box(self.source_model, mode="source")
         self.list_view_source.selectAll()
+
+    def _g2_q_range(self):
+        """The Q range the G2 view is using: ``None`` (every bin) when the "auto"
+        box is checked, else the Q boxes. The one source of the G2 Q selection."""
+        from .module import g2mod
+
+        p = self.check_g2_number()
+        return g2mod.effective_q_range(self.g2_qauto.isChecked(), (p[0], p[1]))
 
     def check_g2_number(self, default_val=(0, 0.0092, 1e-8, 1, 0.95, 1.35)):
         keys = (
@@ -5264,8 +5480,7 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         from .fitting.bayesian_assembly import resolve_g2_bins
 
         try:
-            p = self.check_g2_number()
-            return xf_list[0].fname, resolve_g2_bins(xf_list[0], (p[0], p[1]))
+            return xf_list[0].fname, resolve_g2_bins(xf_list[0], self._g2_q_range())
         except Exception:
             logger.debug("Could not resolve the G2 Q-bin table", exc_info=True)
             return None
@@ -5307,7 +5522,7 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         from .module import g2mod
 
         p = self.check_g2_number()
-        q_range = (p[0], p[1])
+        q_range = self._g2_q_range()
         t_range = (p[2], p[3])
 
         result = g2mod.get_data(xf_list, q_range=q_range, t_range=t_range)
@@ -5326,7 +5541,7 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             )
             return None
 
-        bins = self._g2_resolved_bins(xf_list[0], p, q_arr)
+        bins = self._g2_resolved_bins(xf_list[0], q_range, q_arr)
         if bins is None:
             return None
         bin_id, _, label = bins[q_idx]
@@ -5359,12 +5574,12 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         )
         return bundle, q_idx
 
-    def _g2_resolved_bins(self, xf, p, q_arr):
+    def _g2_resolved_bins(self, xf, q_range, q_arr):
         """Absolute bin table of *xf* checked against the extracted columns."""
         from .fitting.bayesian_assembly import resolve_g2_bins
 
         try:
-            bins = resolve_g2_bins(xf, (p[0], p[1]))
+            bins = resolve_g2_bins(xf, q_range)
             ok = len(bins) == len(q_arr) and np.allclose([b[1] for b in bins], q_arr)
         except Exception:
             logger.debug("Could not resolve the G2 Q-bin table", exc_info=True)
@@ -5686,7 +5901,7 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         from .module import g2mod
 
         p = self.check_g2_number()
-        q_range = (p[0], p[1])
+        q_range = self._g2_q_range()
         t_range = (p[2], p[3])
 
         result = g2mod.get_data(xf_list, q_range=q_range, t_range=t_range)
@@ -5701,7 +5916,7 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
 
         _, _, fit_func_name = self.check_g2_fitting_number()
 
-        bins = self._g2_resolved_bins(xf_list[0], p, q_arr)
+        bins = self._g2_resolved_bins(xf_list[0], q_range, q_arr)
         if bins is None:
             return None
 
@@ -6324,7 +6539,11 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
                 f"({bundle.label}, bin {bundle.bin_id})"
             ),
             identity=DiagnosisIdentity(
-                bundle.fname, _revision_of(bundle.fname), bundle.bin_id, bundle
+                bundle.fname,
+                _revision_of(bundle.fname),
+                bundle.bin_id,
+                bundle,
+                placeholder_qmap=self._has_placeholder_qmap_file(bundle.fname),
             ),
         )
         win.show()
@@ -6358,7 +6577,9 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             return None
 
         xf = xf_list[0]
-        if not hasattr(xf, "fit_summary") or xf.fit_summary is None:
+        # the very G2 summary the diffusion plot shows and fits (_diffusion_fit)
+        g2_summary = _diffusion_fit(xf)[0]
+        if g2_summary is None:
             self.statusbar.showMessage("Run G2 fitting first (no fit_summary)", 3000)
             return None
 
@@ -6370,17 +6591,15 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
         except (ValueError, AttributeError):
             self.statusbar.showMessage("Invalid Q range for the diffusion fit", 3000)
             return None
-        # the Q-range boxes and D are in inverse angstrom, like the NLSQ tau-q fit
-        try:
-            q_val = convert_q(
-                xf.fit_summary["q_val"],
-                map_axis(getattr(xf, "qmap", None), 0)[1],
-                Q_UNIT_DISPLAY,
-            )
-        except ValueError as exc:
-            self.statusbar.showMessage(f"Bayesian diffusion refused: {exc}", 6000)
+        # the Q-range boxes and D are in inverse angstrom, like the NLSQ tau-q fit:
+        # the file is shown exactly as the NLSQ path shows it (axis check, |q| of
+        # a Cartesian pair, native values kept), then the rows are selected
+        problem = _diffusion_axis_problem(xf)
+        if problem is not None:
+            self.statusbar.showMessage(f"Bayesian diffusion refused: {problem}", 6000)
             return None
-        q, tau, tau_err = _tauq_rows({**xf.fit_summary, "q_val": q_val}, q_range)
+        shown = _in_diffusion_unit(xf, dict(g2_summary))
+        q, tau, tau_err = _tauq_rows(shown, q_range)
 
         if q.size == 0:
             self.statusbar.showMessage("No valid diffusion data in Q-range", 2000)
@@ -6407,6 +6626,8 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             tau,
             tau_err,
             q_range=q_range,
+            # a Cartesian pair is fitted on |q|: say so in the bundle's own text
+            q_axis=("|q|", Q_UNIT_DISPLAY) if "tauq_q_source" in shown else None,
         )
 
     def _fit_diff_bayesian(self):
@@ -6604,7 +6825,11 @@ class XpcsViewer(QtWidgets.QMainWindow, Ui):
             yerr=tau_err,
             title=f"Diffusion Bayesian Diagnosis - Power Law ({bundle.fname})",
             identity=DiagnosisIdentity(
-                bundle.fname, _revision_of(bundle.fname), None, bundle
+                bundle.fname,
+                _revision_of(bundle.fname),
+                None,
+                bundle,
+                placeholder_qmap=self._has_placeholder_qmap_file(bundle.fname),
             ),
         )
         win.show()

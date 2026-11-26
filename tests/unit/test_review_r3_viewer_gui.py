@@ -105,6 +105,7 @@ def _viewer(xf, *, q_range=(0.0, 1.0), q_idx=1):
         get_selected_rows=lambda: [0],
         _guard_no_data=lambda _t: True,
         check_g2_fitting_number=lambda: (None, None, "single"),
+        g2_qauto=SimpleNamespace(isChecked=lambda: False),  # a typed Q range
         _g2_bayesian_store={},
         _g2_bayesian_launch=None,
         _g2_bayesian_launch_revision=None,  # "A.h5" does not exist: no revision
@@ -121,6 +122,7 @@ def _viewer(xf, *, q_range=(0.0, 1.0), q_idx=1):
     return _bind(
         st,
         "_g2_bin_table",
+        "_g2_q_range",
         "_g2_first_axis",
         "_g2_current_bundle",
         "_extract_g2_for_bayesian",
@@ -513,6 +515,7 @@ def _batch_viewer(xf, q_range):
         get_selected_rows=lambda: [0],
         _guard_no_data=lambda _t: True,
         check_g2_fitting_number=lambda: (None, None, "single"),
+        g2_qauto=SimpleNamespace(isChecked=lambda: False),  # a typed Q range
         check_g2_number=lambda: (q_range[0], q_range[1], 1e-4, 1.0),
         _g2_bayesian_store={},
         _g2_batch_coordinator=None,
@@ -526,6 +529,7 @@ def _batch_viewer(xf, q_range):
     return _bind(
         st,
         "_g2_bin_table",
+        "_g2_q_range",
         "_g2_current_bundle",
         "_g2_resolved_bins",
         "_extract_g2_all_for_bayesian",

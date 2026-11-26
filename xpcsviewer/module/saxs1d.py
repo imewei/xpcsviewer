@@ -16,7 +16,12 @@ import numpy as np
 import pyqtgraph as pg
 
 from xpcsviewer.backends._conversions import ensure_numpy
-from xpcsviewer.fileIO.qmap_utils import axis_mismatch, convert_q, convert_q_range
+from xpcsviewer.fileIO.qmap_utils import (
+    SaxsNormalizationRefused,
+    axis_mismatch,
+    convert_q,
+    convert_q_range,
+)
 from xpcsviewer.utils.logging_config import get_logger
 
 from ..plothandler.plot_constants import get_color_marker
@@ -386,6 +391,10 @@ def pg_plot(
                 if axis[1] != display[1]:
                     scale = float(convert_q(1.0, axis[1], display[1]))
                     q_range = convert_q_range(q_range, display[1], axis[1])
+            if display is None:
+                # the FIRST selected file owns the axis, whether or not it has a
+                # bin in range: the Q boxes are typed in its unit
+                display = axis
             q, Iq, xlabel, ylabel = fi.get_saxs1d_data(
                 bkg_xf=bkg_file,
                 bkg_weight=weight,
@@ -394,8 +403,13 @@ def pg_plot(
                 norm_method=norm_method,
                 use_absolute_crosssection=absolute_crosssection,
             )
-            if display is None:
-                display = axis
+            if np.size(q) == 0:
+                # nothing of this file lies in the range: leave it out of the plot
+                # and say so
+                unit = (display or axis or ("", ""))[1]
+                left_out[fi.label] = f"no Q bin in [{qmin:g}, {qmax:g}] {unit}".rstrip()
+                logger.warning(f"SAXS 1D: skipping {fi.label}: {left_out[fi.label]}")
+                continue
             if scale != 1.0:
                 # q is stored in the file's unit; Iq*q^k was weighted with it too
                 q = q * scale
@@ -409,6 +423,11 @@ def pg_plot(
 
             plot_data.append((q, Iq, fi, n))
 
+        except SaxsNormalizationRefused as e:
+            # shown on the status bar through ``left_out``, not only logged
+            left_out[fi.label] = str(e)
+            logger.warning(f"SAXS 1D: skipping {fi.label}: {left_out[fi.label]}")
+            continue
         except Exception as e:
             logger.warning(f"Failed to extract data for file {fi.label}: {e}")
             continue

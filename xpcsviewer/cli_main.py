@@ -309,19 +309,25 @@ def main():
         type=float,
         help="Q-value to process (saves images at all phi angles for this q), "
         "in inverse angstrom unless --q-unit says otherwise; it is converted "
-        "to each file's own Q unit",
+        "to each file's own Q unit. The nearest bin is used only if the value "
+        "lies within half a bin spacing of it (inside the file's axis range "
+        "extended by half a bin; within 5%% of the value for a single-bin axis; "
+        "the same rule applies to --phi and --q-phi, angles on the circle); "
+        "otherwise the file is skipped with a warning naming the nearest value",
     )
     selection_group.add_argument(
         "--phi",
         type=float,
-        help="Phi-value to process (saves images at this phi angle for all q values)",
+        help="Phi-value in DEGREES to process (saves images at this phi angle for "
+        "all q values); a file that stores radians is converted, and the "
+        "'_phi' token of the image names is in degrees",
     )
     selection_group.add_argument(
         "--q-phi",
         type=str,
         help="Specific q-phi pair as 'q,phi' (saves single image for this exact "
         "combination); q is in the --q-unit unit (inverse angstrom by default), "
-        "phi in degrees",
+        "phi in degrees (a file that stores radians is converted)",
     )
     twotime_parser.add_argument(
         "--q-unit",

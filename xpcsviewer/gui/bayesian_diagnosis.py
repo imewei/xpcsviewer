@@ -38,6 +38,7 @@ from xpcsviewer.gui.qt_compat import (
     QWidget,
 )
 from xpcsviewer.utils.export_guard import ExportCollisionError, ExportGuard
+from xpcsviewer.utils.qmap_notice import PLACEHOLDER_QMAP_WARNING
 
 if TYPE_CHECKING:
     from xpcsviewer.fitting.results import FitDiagnostics, FitResult
@@ -70,6 +71,8 @@ class DiagnosisIdentity:
     revision: tuple[int, ...] | None
     bin_id: Hashable | None
     bundle: Any = None
+    #: the file runs on the placeholder Q map (``has_placeholder_qmap``), set at launch
+    placeholder_qmap: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -318,6 +321,17 @@ class BayesianDiagnosisWindow(QMainWindow):
         self._set_exports_enabled(False)
         self.setWindowTitle(title)
 
+    def _placeholder_note(self) -> bool:
+        ident = getattr(self, "_identity", None)  # the title is first set in __init__
+        return ident is not None and ident.placeholder_qmap
+
+    def setWindowTitle(self, title: str) -> None:
+        """Every title (also the viewer's own retitling) carries the placeholder-Q
+        warning exactly while the shown file runs on the placeholder map."""
+        suffix = f" — {PLACEHOLDER_QMAP_WARNING}"
+        title = title.removesuffix(suffix)
+        super().setWindowTitle(title + suffix if self._placeholder_note() else title)
+
     def _q_text(self, q_value: float | None) -> str:
         """``q_value`` with the axis name and unit it is on (``Q = v`` if unknown)."""
         if q_value is None:
@@ -376,10 +390,8 @@ class BayesianDiagnosisWindow(QMainWindow):
             The file axis ``q_value`` is on; it is named wherever the value is
             shown or exported.
         """
-        if title is not None:
-            self.setWindowTitle(title)
-
         self._identity = identity
+        self.setWindowTitle(self.windowTitle() if title is None else title)
         self._set_exports_enabled(True)
         self._result = result
         self._model_func = model_func
@@ -550,16 +562,26 @@ class BayesianDiagnosisWindow(QMainWindow):
         if not self._claim(self._new_guard(), path, "fit plot"):
             return
         fig = self._pp_canvas.figure
-        note = None
+        notes = []
         if self._result is not None and not self._result.diagnostics.converged:
             # a posterior that did not converge is not a measurement
-            note = fig.text(
-                0.5, 0.995, "NOT CONVERGED - not a measurement", color="red", va="top"
+            notes.append(
+                fig.text(
+                    0.5,
+                    0.995,
+                    "NOT CONVERGED - not a measurement",
+                    color="red",
+                    va="top",
+                )
+            )
+        if self._placeholder_note():  # the figure shows this file's Q value
+            notes.append(
+                fig.text(0.5, 0.005, PLACEHOLDER_QMAP_WARNING, color="red", va="bottom")
             )
         try:
             fig.savefig(path, dpi=300, bbox_inches="tight")
         finally:
-            if note is not None:
+            for note in notes:
                 note.remove()
         logger.info("Exported fit plot to %s", path)
 
@@ -608,6 +630,8 @@ class BayesianDiagnosisWindow(QMainWindow):
         with Path(path).open("w", newline="") as f:
             writer = csv.writer(f)
             # Header with metadata comment
+            if self._placeholder_note():
+                f.write(f"# {PLACEHOLDER_QMAP_WARNING}\n")
             if self._q_value is not None:
                 unit = f" {self._q_axis[1]}" if self._q_axis else ""
                 name = self._q_axis[0] if self._q_axis else "Q"
@@ -691,6 +715,9 @@ class BayesianDiagnosisWindow(QMainWindow):
             attrs["q_value"] = float(self._q_value)
             if self._q_axis is not None:  # the value is meaningless without these
                 attrs["axis0_name"], attrs["axis0_unit"] = self._q_axis
+        if self._placeholder_note():  # as the All-Q writer (fitting.viz) marks it
+            attrs["q_map_is_placeholder"] = 1
+            attrs["q_map_warning"] = PLACEHOLDER_QMAP_WARNING
         data = _tagged(self._result.arviz_data, attrs)
         if getattr(data, "attrs", {}).get("bin_status") != attrs["bin_status"]:
             # the posterior could not be tagged: never write an unmarked file

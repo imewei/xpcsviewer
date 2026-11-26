@@ -17,11 +17,13 @@ Functions:
     plot: ``draw(render_frame(...))`` for the synchronous path.
 """
 
+import os
 from dataclasses import dataclass
 
 import numpy as np
 
 from xpcsviewer.backends._conversions import ensure_numpy
+from xpcsviewer.fileIO.hdf_reader import _file_identity
 from xpcsviewer.utils.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -48,6 +50,12 @@ class Saxs2dFrame:
             be placed with the same orientation.
         center: ``(bcx, bcy)``, the calibrated beam centre in the pixel-INDEX
             frame (the centre of pixel i is at coordinate i).
+        path: Normalised path of the file the frame was made from.
+        revision: ``_file_identity`` of that file when the frame was made.
+            ``(path, revision, rotate)`` is the identity of what a view shows;
+            :func:`draw` leaves the frame on the view as ``rendered_frame``
+            and every reader of "what is displayed" (cursor readout, default
+            ROI origin, spinbox) goes through it.
     """
 
     label: str
@@ -56,6 +64,8 @@ class Saxs2dFrame:
     rotate: bool
     transform: tuple[float, float, float, float, float, float]
     center: tuple[float, float]
+    path: str = ""
+    revision: tuple[int, ...] | None = None
 
     @property
     def display_shape(self) -> tuple[int, int]:
@@ -90,6 +100,8 @@ def render_frame(xfile, plot_type="log", rotate=False):
     """
     img = ensure_numpy(xfile.saxs_2d_log if plot_type == "log" else xfile.saxs_2d)
     rotate = bool(rotate)
+    fname = getattr(xfile, "fname", None)
+    path = "" if fname is None else os.path.normpath(str(fname))
     return Saxs2dFrame(
         label=str(getattr(xfile, "label", getattr(xfile, "fname", "unknown file"))),
         image=img,
@@ -97,6 +109,8 @@ def render_frame(xfile, plot_type="log", rotate=False):
         rotate=rotate,
         transform=_orientation(img.shape, rotate),
         center=(float(xfile.bcx), float(xfile.bcy)),
+        path=path,
+        revision=_file_identity(path) if path else None,
     )
 
 
@@ -181,6 +195,8 @@ def draw(
     pg_hdl.add_roi(
         sl_type="Center", center=pg_hdl.pixel_centre(*frame.center), label="Center"
     )
+    # THE record of what this view renders (file path + revision + rotate)
+    pg_hdl.rendered_frame = frame
     logger.info("SAXS2D frame drawn successfully")
 
 

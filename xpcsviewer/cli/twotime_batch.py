@@ -15,9 +15,12 @@ import numpy as np
 from xpcsviewer.fileIO.hdf_reader import clear_connection_pool
 from xpcsviewer.fileIO.qmap_utils import (
     Q_UNIT_DISPLAY,
+    angular_difference,
     convert_q,
+    is_angle_unit,
     map_axis,
     normalize_unit,
+    to_degrees,
 )
 from xpcsviewer.utils.export_guard import ExportCollisionError, ExportGuard
 from xpcsviewer.utils.logging_config import get_logger
@@ -61,7 +64,105 @@ def parse_q_phi_pair(q_phi_str: str) -> tuple[float, float]:
 
 def _angular_diff(a: float, b: float) -> float:
     """Absolute angular difference in degrees on the circle, in [0, 180]."""
-    return abs((a - b + 180.0) % 360.0 - 180.0)
+    return float(angular_difference(a, b))  # the one implementation, in qmap_utils
+
+
+#: A single-value axis has no spacing: the request must be within this fraction of
+#: the value (of the full circle, 360 degrees, for an angle).
+SINGLE_BIN_TOLERANCE = 0.05
+#: Floor of that tolerance, for a single-value axis at 0 where "5 percent of the
+#: value" collapses to an exact match. 1e-6 is far below any real Q resolution
+#: (inverse angstrom or nm, 1e-2..1e0) and still absorbs float round-off.
+SINGLE_BIN_ABS_TOLERANCE = 1e-6
+
+
+def _near_enough(values, matched, target, circle: bool = False) -> bool:
+    """Whether ``target`` is close enough to the nearest bin ``matched``.
+
+    THE tolerance rule of every ``--q`` / ``--phi`` / ``--q-phi`` selection: the
+    nearest bin is accepted only when the request lies within HALF THE LOCAL BIN
+    SPACING of it (the larger gap to a neighbouring distinct value of the axis,
+    ``values``), i.e. inside the axis range extended by half a bin at each end.
+    A single-value axis has no spacing: within a relative ``SINGLE_BIN_TOLERANCE``
+    (of 360 degrees for an angle). ``circle``: angles in degrees, compared by the
+    shortest way round; the gap across 0/360 counts as a spacing only when it is
+    no larger than the largest gap between sampled angles (a hole in the sector
+    coverage is not a bin).
+    """
+    vals = np.unique(np.round(np.asarray(values, dtype=np.float64), 12))
+    if circle:
+        vals = np.unique(vals % 360.0)
+        diff = float(angular_difference(matched, target))
+    else:
+        diff = abs(float(matched) - float(target))
+    if len(vals) < 2:
+        base = 360.0 if circle else abs(float(matched))
+        return diff <= max(SINGLE_BIN_TOLERANCE * base, SINGLE_BIN_ABS_TOLERANCE)
+    ref = float(matched) % 360.0 if circle else float(matched)
+    j = int(np.argmin(np.abs(vals - ref)))
+    gaps = []
+    if j > 0:
+        gaps.append(vals[j] - vals[j - 1])
+    if j < len(vals) - 1:
+        gaps.append(vals[j + 1] - vals[j])
+    if circle and (j == 0 or j == len(vals) - 1):
+        wrap = vals[0] + 360.0 - vals[-1]
+        if wrap <= np.max(np.diff(vals)):
+            gaps.append(wrap)
+    return diff <= 0.5 * max(gaps) * (1 + 1e-9) + 1e-12
+
+
+def _map_axis_values(qmap, axis: int) -> list[float]:
+    """Every value of the map's dynamic axis ``axis`` (0 or 1), processed or not.
+
+    Read through ``_bin_coords`` so q / phi are in the same unit and spelling as
+    the processed-bin values they are compared with. Empty when the map has no
+    such axis (or cannot be read): the caller then falls back to ``values``.
+    """
+    try:
+        n0, n1 = len(qmap.dqlist), int(qmap.dynamic_num_pts[1])
+        if axis == 0:
+            found = [_bin_coords(qmap, k * n1)[0] for k in range(n0)]
+        elif n1 > 1:
+            found = [_bin_coords(qmap, j)[1] for j in range(n1)]
+        else:
+            found = []
+    except (AttributeError, IndexError, TypeError, ValueError):
+        return []
+    return [v for v in found if v is not None and math.isfinite(v)]
+
+
+def _refuse_far(
+    xfile, what: str, target, matched, unit: str, values, circle=False, axis=None
+):
+    """True (after one WARNING naming file, request and nearest bin) if too far.
+
+    The tolerance is the spacing of the file's FULL dynamic axis (``axis``: 0 q,
+    1 phi), not of the processed bins, which are a sparse subset: ``matched``
+    (the nearest processed bin) is accepted only when it is also the nearest bin
+    of the map. A request nearer to an unprocessed map bin is refused.
+    """
+    full = _map_axis_values(xfile.qmap, axis) if axis is not None else []
+    full = full if len(full) else list(values)
+    dist = _angular_diff if circle else lambda a, b: abs(a - b)
+    near_map = min(full, key=lambda v: dist(v, target))
+    if dist(matched, target) <= dist(near_map, target) * (1 + 1e-9) + 1e-12:
+        # the nearest processed bin is also (one of) the nearest map bin(s)
+        if _near_enough(full, matched, target, circle):
+            return False
+    elif _near_enough(full, near_map, target, circle):
+        logger.warning(
+            f"{getattr(xfile, 'fname', xfile)}: the requested bin {what}={near_map:g} "
+            f"{unit} exists in the map but was not processed (the nearest processed "
+            f"bin is {what}={matched:g} {unit}); skipping this file"
+        )
+        return True
+    logger.warning(
+        f"{getattr(xfile, 'fname', xfile)}: no bin matches {what}={target:g} {unit} "
+        f"(nearest available {what}={matched:g} {unit} is farther than half a bin "
+        f"spacing); skipping this file"
+    )
+    return True
 
 
 def _bin_coords(qmap, absolute: int) -> tuple[float | None, float | None]:
@@ -73,6 +174,11 @@ def _bin_coords(qmap, absolute: int) -> tuple[float | None, float | None]:
     point on axis 1) has no phi. A map with neither name (e.g. Cartesian ``x`` /
     ``y``) returns its first and second axis values positionally: they are named
     by ``_plain_axes`` / ``map_axis``, not by these variable names.
+
+    ``phi`` is returned in DEGREES whatever angle unit the file stores (the
+    ``--phi`` / ``--q-phi`` selectors and the ``_phi`` file-name token are
+    degrees); a ``phi`` axis in a unit that is not an angle is returned as stored
+    and refused by the angle modes (``_qbins_with_phi``), not by ``--q``.
     """
     if absolute < 0:
         raise IndexError(absolute)
@@ -88,6 +194,9 @@ def _bin_coords(qmap, absolute: int) -> tuple[float | None, float | None]:
         first, second = [*coords.values(), None][:2]
         return float(first), None if second is None else float(second)
     q, phi = coords.get("q"), coords.get("phi")
+    unit = map_axis(qmap, names.index("phi"))[1] if phi is not None else None
+    if phi is not None and is_angle_unit(unit):
+        phi = float(to_degrees(phi, unit))
     return (None if q is None else float(q)), (None if phi is None else float(phi))
 
 
@@ -175,14 +284,18 @@ def _collect_valid_qbins(
 def _qbins_with_phi(xfile: XpcsFile) -> list[tuple[int, str, float, float]]:
     """Qbins that have both q and phi (the angle-based modes need phi).
 
-    A map whose second axis is not an angle (Cartesian ``y`` in pixels) has none:
-    matching it on the circle would pair unrelated pixel rows.
+    A map whose second axis is not an angle (Cartesian ``y`` in pixels, or a
+    ``phi`` in a unit that is neither degrees nor radians) has none: matching it
+    on the circle would pair unrelated numbers.
     """
     qmap = xfile.qmap
-    if int(qmap.dynamic_num_pts[1]) != 1 and map_axis(qmap, 1)[0] != "phi":
+    second = map_axis(qmap, 1)
+    if int(qmap.dynamic_num_pts[1]) != 1 and (
+        second[0] != "phi" or not is_angle_unit(second[1])
+    ):
         logger.warning(
-            "Angle selection needs a phi axis; this file's map is "
-            f"{map_axis(qmap, 0)[0]} / {map_axis(qmap, 1)[0]}"
+            "Angle selection needs a phi axis in degrees or radians; this file's "
+            f"map is {map_axis(qmap, 0)[0]} / {second[0]} [{second[1]}]"
         )
         return []
     return [
@@ -217,6 +330,10 @@ def find_qbins_for_q(
     q_values = [qbin[2] for qbin in valid_qbins]
     closest_q = min(q_values, key=lambda q: abs(q - target_q))
     closest_q_diff = abs(closest_q - target_q)
+    if _refuse_far(
+        xfile, "q", target_q, closest_q, map_axis(xfile.qmap, 0)[1], q_values, axis=0
+    ):
+        return []
 
     # Get all qbins with the closest q-value
     tolerance = 1e-10  # Use tight tolerance for exact match
@@ -266,6 +383,17 @@ def find_qbins_for_phi(
     phi_values = [qbin[3] for qbin in valid_qbins]
     closest_phi = min(phi_values, key=lambda phi: _angular_diff(phi, target_phi))
     closest_phi_diff = _angular_diff(closest_phi, target_phi)
+    if _refuse_far(
+        xfile,
+        "phi",
+        target_phi,
+        closest_phi,
+        "degrees",
+        phi_values,
+        circle=True,
+        axis=1,
+    ):
+        return []
 
     # Get all qbins with the closest phi-value
     phi_tolerance = 1e-10  # Use tight tolerance for exact match
@@ -333,6 +461,21 @@ def find_qbin_for_qphi(
             best_distance = distance
             best_match = (i, label, q_value, phi_value)
 
+    if best_match and (
+        _refuse_far(
+            xfile,
+            "q",
+            target_q,
+            best_match[2],
+            map_axis(xfile.qmap, 0)[1],
+            q_values,
+            axis=0,
+        )
+        or _refuse_far(
+            xfile, "phi", target_phi, best_match[3], "degrees", phi_values, True, 1
+        )
+    ):
+        return None
     if best_match:
         q_diff = abs(best_match[2] - target_q)
         phi_diff = _angular_diff(best_match[3], target_phi)
@@ -469,6 +612,7 @@ def process_single_file(
     args,
     guard: ExportGuard | None = None,
     refused: list[str] | None = None,
+    unmatched: list[str] | None = None,
 ) -> int:
     """
     Process a single HDF file and generate twotime images.
@@ -487,6 +631,8 @@ def process_single_file(
             the run. Defaults to a gate whose only input is ``file_path``.
         refused: Descriptions of images refused by the guard. Appended to in
             place.
+        unmatched: Paths of files skipped because no bin matched the selection
+            (``_near_enough``). Appended to in place.
 
     Returns:
         Number of images generated
@@ -546,10 +692,14 @@ def process_single_file(
                     qbins_to_process = [qbin_match]
         except ValueError as exc:
             logger.error(f"{file_path}: the Q selection cannot be applied: {exc}")
+            if unmatched is not None:
+                unmatched.append(file_path)  # skipped, so named in the summary
             return 0
 
         if not qbins_to_process:
             logger.warning(f"No matching qbins found for file {file_path}")
+            if unmatched is not None:
+                unmatched.append(file_path)
             return 0
 
         # Create output directory if it doesn't exist
@@ -657,7 +807,12 @@ def find_hdf_files(directory: str) -> list[str]:
     return sorted(hdf_files)
 
 
-def process_directory(directory: str, args, refused: list[str] | None = None) -> int:
+def process_directory(
+    directory: str,
+    args,
+    refused: list[str] | None = None,
+    unmatched: list[str] | None = None,
+) -> int:
     """
     Process all HDF files in directory.
 
@@ -687,7 +842,9 @@ def process_directory(directory: str, args, refused: list[str] | None = None) ->
         logger.info(f"Processing file {i}/{len(hdf_files)}: {file_path}")
 
         try:
-            images_count = process_single_file(file_path, args, guard, refused)
+            images_count = process_single_file(
+                file_path, args, guard, refused, unmatched
+            )
             total_images += images_count
             if images_count > 0:
                 successful_files += 1
@@ -764,15 +921,22 @@ def run_twotime_batch(args) -> int:
 
         # Process input (file or directory)
         refused: list[str] = []
+        unmatched: list[str] = []
         if os.path.isfile(args.input):
             images_generated = process_single_file(
-                args.input, args, ExportGuard([args.input]), refused
+                args.input, args, ExportGuard([args.input]), refused, unmatched
             )
         elif os.path.isdir(args.input):
-            images_generated = process_directory(args.input, args, refused)
+            images_generated = process_directory(args.input, args, refused, unmatched)
         else:
             logger.error(f"Input path is neither file nor directory: {args.input}")
             return 1
+
+        if unmatched:
+            logger.warning(
+                f"{len(unmatched)} file(s) had no matching bin and were skipped: "
+                + ", ".join(unmatched)
+            )
 
         if refused:
             logger.error(

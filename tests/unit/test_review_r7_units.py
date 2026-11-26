@@ -637,7 +637,11 @@ _RANGE_ALLOWED = {
         "viewer_kernel.py",
         "plot_tauq",
         "fit_tauq",
-    ): "tau-q is inverse angstrom: summaries are converted by _in_diffusion_unit",
+    ): (
+        "the range is in the diffusion unit (inverse angstrom); fit_tauq converts "
+        "it to the file's unit inside module.tauq.tauq_rows (round 8: "
+        "test_review_r8_axes.py checks fit_tauq and _tauq_rows both go through it)"
+    ),
     (
         "fitting/bayesian_assembly.py",
         "resolve_g2_bins",
